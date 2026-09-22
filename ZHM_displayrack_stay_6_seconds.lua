@@ -10,45 +10,63 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
--- SAFE LIVE INSTANT PROXIMITY
--- Lightweight version designed to avoid lag/bugs:
---   1) Set existing prompts to zero hold once.
---   2) Set newly-created prompts to zero hold once.
---   3) Re-apply when a prompt is shown.
--- No RenderStepped loop, no property locking, no forced input, no ClickablePrompt changes.
+-- ADAPTIVE LIVE INSTANT PROXIMITY
+-- PC keeps the current safe live behavior.
+-- Mobile uses a lighter PromptShown-only method to avoid touch UI glitches.
+local IS_MOBILE_DEVICE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 
 local function makePromptInstantSafe(prompt)
     if not prompt or not prompt:IsA("ProximityPrompt") then return end
+
     pcall(function()
         prompt.HoldDuration = 0
     end)
 end
 
--- Apply once to prompts already in Workspace.
-for _, obj in ipairs(Workspace:GetDescendants()) do
-    if obj:IsA("ProximityPrompt") then
-        makePromptInstantSafe(obj)
+if IS_MOBILE_DEVICE then
+    ------------------------------------------------------------------------
+    -- MOBILE MODE
+    -- Do NOT scan/edit every prompt in Workspace.
+    -- Only modify a prompt when Roblox actually displays it to this player.
+    -- This prevents large batches of prompt-property updates from fighting
+    -- with the mobile touch ProximityPrompt UI.
+    ------------------------------------------------------------------------
+    ProximityPromptService.PromptShown:Connect(function(prompt)
+        makePromptInstantSafe(prompt)
+    end)
+
+else
+    ------------------------------------------------------------------------
+    -- PC MODE
+    -- Preserve the version that was already working well on desktop.
+    ------------------------------------------------------------------------
+
+    -- Existing prompts.
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("ProximityPrompt") then
+            makePromptInstantSafe(obj)
+        end
     end
+
+    -- Newly-created prompts.
+    Workspace.DescendantAdded:Connect(function(obj)
+        if obj:IsA("ProximityPrompt") then
+            makePromptInstantSafe(obj)
+
+            -- Some games configure HoldDuration just after parenting.
+            task.delay(0.05, function()
+                if obj and obj.Parent then
+                    makePromptInstantSafe(obj)
+                end
+            end)
+        end
+    end)
+
+    -- Re-apply whenever a prompt becomes visible.
+    ProximityPromptService.PromptShown:Connect(function(prompt)
+        makePromptInstantSafe(prompt)
+    end)
 end
-
--- Apply once to prompts created later.
-Workspace.DescendantAdded:Connect(function(obj)
-    if obj:IsA("ProximityPrompt") then
-        makePromptInstantSafe(obj)
-
-        -- Some games finish configuring the prompt shortly after parenting it.
-        task.delay(0.05, function()
-            if obj and obj.Parent then
-                makePromptInstantSafe(obj)
-            end
-        end)
-    end
-end)
-
--- Re-apply only when Roblox actually shows a prompt to the player.
-ProximityPromptService.PromptShown:Connect(function(prompt)
-    makePromptInstantSafe(prompt)
-end)
 
 --------------------------------------------------------------------------------
 -- ZHM HUB - SHARED UI / COMPATIBILITY HELPERS
