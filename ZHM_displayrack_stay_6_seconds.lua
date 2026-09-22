@@ -2,7 +2,6 @@
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
-local TweenService = game:GetService("TweenService")
 local CoreGui = game:GetService("CoreGui")
 local UserInputService = game:GetService("UserInputService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
@@ -321,8 +320,9 @@ local function findMyPlot()
 end
 
 --------------------------------------------------------------------------------
--- SMOOTH AUTO-WALK / RACK MOVEMENT
--- Uses CFrame:Lerp on Heartbeat instead of TweenService.
+-- INSTANT TP / RACK MOVEMENT
+-- No tween / Lerp movement. Each rack hop teleports instantly.
+-- BakingRack TP delay: 1.5 seconds. DisplayRack stay: 10 seconds.
 --------------------------------------------------------------------------------
 local function getPartFromContainer(container)
     if not container then return nil end
@@ -367,49 +367,20 @@ local function getAllBakingRacks(plot)
     return racks
 end
 
-local function moveToPosition(targetPos, speed)
+local TP_DELAY = 1.5
+local DISPLAY_RACK_STAY = 10
+
+local function teleportToPosition(targetPos)
     local char = player.Character
     if not char then return false end
 
     local rootPart = char:FindFirstChild("HumanoidRootPart")
-    local humanoid = char:FindFirstChildOfClass("Humanoid")
-    if not rootPart or not humanoid then return false end
+    if not rootPart then return false end
 
-    speed = speed or 28
-
-    local startCFrame = rootPart.CFrame
-    local targetCFrame = CFrame.new(targetPos) * startCFrame.Rotation
-    local flatStart = Vector3.new(startCFrame.Position.X, 0, startCFrame.Position.Z)
-    local flatTarget = Vector3.new(targetPos.X, 0, targetPos.Z)
-    local distance = (flatStart - flatTarget).Magnitude
-    local duration = distance / math.max(speed, 1)
-
-    if duration <= 0.05 then
-        rootPart.CFrame = targetCFrame
-        return true
-    end
-
-    local elapsed = 0
-    humanoid.PlatformStand = true
-
-    while elapsed < duration do
-        if not running("ZHM_AutoWalk") then break end
-
-        local currentChar = player.Character
-        local currentRoot = currentChar and currentChar:FindFirstChild("HumanoidRootPart")
-        if currentRoot ~= rootPart then break end
-
-        local dt = RunService.Heartbeat:Wait()
-        elapsed += dt
-        local alpha = math.clamp(elapsed / duration, 0, 1)
-        rootPart.CFrame = startCFrame:Lerp(targetCFrame, alpha)
-    end
-
-    if humanoid and humanoid.Parent then
-        humanoid.PlatformStand = false
-    end
-
-    return elapsed >= duration
+    -- Preserve the player's current rotation while teleporting instantly.
+    local currentRotation = rootPart.CFrame.Rotation
+    rootPart.CFrame = CFrame.new(targetPos) * currentRotation
+    return true
 end
 
 local function startAutoWalk()
@@ -443,22 +414,20 @@ local function startAutoWalk()
                         local nextRack = unvisitedRacks[1]
                         visitedRacks[nextRack.instance] = true
 
-                        report("AutoWalk", "Moving to BakingRack: " .. nextRack.instance.Name)
-                        moveToPosition(nextRack.position + Vector3.new(0, 2.5, 0), 28)
-
-                        if running("ZHM_AutoWalk") then
-                            task.wait(0.3)
+                        report("AutoWalk", "TP to BakingRack: " .. nextRack.instance.Name)
+                        if teleportToPosition(nextRack.position + Vector3.new(0, 2.5, 0))
+                            and running("ZHM_AutoWalk") then
+                            task.wait(TP_DELAY)
                         end
                     else
                         local displayPos = getDisplayRackPos(myPlot)
 
                         if displayPos then
-                            report("AutoWalk", "Moving to DisplayRack...")
-                            moveToPosition(displayPos + Vector3.new(0, 2.5, 0), 28)
-
-                            if running("ZHM_AutoWalk") then
-                                -- Stay at the DisplayRack for 6 seconds before restarting the rack route.
-                                task.wait(6)
+                            report("AutoWalk", "TP to DisplayRack...")
+                            if teleportToPosition(displayPos + Vector3.new(0, 2.5, 0))
+                                and running("ZHM_AutoWalk") then
+                                -- DisplayRack uses a longer hold than the normal 1.5-second TP delay.
+                                task.wait(DISPLAY_RACK_STAY)
                             end
                         else
                             task.wait(0.5)
@@ -3110,4 +3079,3 @@ task.delay(0.45, function()
 end)
 
 print("[ZHM Simple UI] Loaded: optimized UI + existing automation")
-
