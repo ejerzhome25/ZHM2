@@ -629,7 +629,11 @@ local function pressNearestClickableInteraction(interaction)
             interaction.MaxActivationDistance = math.max(interaction.MaxActivationDistance, AUTO_NEAREST_RADIUS)
         end)
 
-        local ok = pcall(function() fireproximityprompt(interaction, 0) end)
+        -- Try the most aggressive instant form first, then executor-compatible fallbacks.
+        local ok = pcall(function() fireproximityprompt(interaction, 0, true) end)
+        if not ok then
+            ok = pcall(function() fireproximityprompt(interaction, 0) end)
+        end
         if not ok then
             ok = pcall(function() fireproximityprompt(interaction) end)
         end
@@ -651,10 +655,17 @@ local function pressNearestClickableInteraction(interaction)
     return false
 end
 
+local function autoNearestPromptEnabled()
+    -- IMPORTANT: do not use running() here. running() intentionally pauses jobs
+    -- while ZHM_SweepActive is true, but nearest prompt pressing must stay alive
+    -- during night sweeping so sweep/nearby prompts can still fire instantly.
+    return isCurrent() and ENV.ZHM_AutoNearestPrompt == true
+end
+
 local function startAutoNearestPrompt()
     task.spawn(function()
         while isCurrent() do
-            if running("ZHM_AutoNearestPrompt") then
+            if autoNearestPromptEnabled() then
                 local interaction = getNearestClickableInteraction()
                 if interaction then
                     pressNearestClickableInteraction(interaction)
@@ -1933,7 +1944,7 @@ do
     local SWEEP_SCAN_INTERVAL = 0.15
     local SWEEP_TP_HEIGHT_OFFSET = 2.5
     local SWEEP_TP_BACK_OFFSET = 1.5
-    local SWEEP_PROMPT_FIRE_DELAY = 0.08
+    local SWEEP_PROMPT_FIRE_DELAY = 0 -- fire immediately after each sweep TP
     local SWEEP_LOOP_DELAY = TP_DELAY
 
     local function guiObjectActive(obj)
@@ -2073,7 +2084,15 @@ do
         makePromptInstant(prompt)
 
         if type(fireproximityprompt) == "function" then
-            local ok = pcall(function() fireproximityprompt(prompt) end)
+            -- Force an instant prompt during sweeping. Different executors support
+            -- different fireproximityprompt signatures, so try all common forms.
+            local ok = pcall(function() fireproximityprompt(prompt, 0, true) end)
+            if not ok then
+                ok = pcall(function() fireproximityprompt(prompt, 0) end)
+            end
+            if not ok then
+                ok = pcall(function() fireproximityprompt(prompt) end)
+            end
             return ok
         end
 
@@ -2100,7 +2119,11 @@ do
                         end
 
                         if prompt and prompt.Parent and prompt.Enabled and teleportToPrompt(prompt) then
-                            task.wait(SWEEP_PROMPT_FIRE_DELAY)
+                            -- Fire immediately on arrival, then enforce the requested
+                            -- 1-second delay before the next sweep teleport.
+                            if SWEEP_PROMPT_FIRE_DELAY > 0 then
+                                task.wait(SWEEP_PROMPT_FIRE_DELAY)
+                            end
                             if not isNight() then break end
                             fireSweepPrompt(prompt)
                             task.wait(SWEEP_LOOP_DELAY)
@@ -3064,7 +3087,7 @@ local rackMovementToggle = createToggle(movePage, "Auto Rack Movement", "Instant
 createToggle(movePage, "Auto Press Nearest Prompt", "Press nearest ProximityPrompt / ClickDetector within 18 studs", "ZHM_AutoNearestPrompt", true)
 createInfoCard(movePage, "Live Movement", function()
     if ENV.ZHM_SweepActive then
-        return "Sweep active • rack/prompt movement paused"
+        return "Sweep active • rack paused • instant prompts ACTIVE"
     elseif ENV.ZHM_NPCBusy then
         return "NPC TP active • rack movement paused"
     elseif ENV.ZHM_AutoWalk then
