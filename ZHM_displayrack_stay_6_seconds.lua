@@ -29,6 +29,7 @@ ENV.ZHM_SweepActive = false
 ENV.ZHM_NPCBusy = false
 ENV.ZHM_NPCStatus = "Swing scanner idle"
 ENV.ZHM_SweepStatus = "Waiting"
+ENV.ZHM_SwingRollingPinNow = nil -- refreshed later by the Rolling Pin module
 if type(ENV.CashierAutoAccept) == "table" then
     ENV.CashierAutoAccept.Enabled = false
     ENV.CashierAutoAccept = nil
@@ -380,6 +381,48 @@ local function getPrepTablePos(plot)
     return nil
 end
 
+-- Cashier destination used after the Dough PrepTable.
+local function getCashierPos(plot)
+    if not plot then return nil end
+
+    -- Prefer known objects inside the plot Position folder.
+    local position = plot:FindFirstChild("Position") or plot:FindFirstChild("Positions")
+    if position then
+        for _, wanted in ipairs({
+            "Cashier", "CashierPosition", "CashierCounter",
+            "CashRegister", "Register", "RegisterPosition"
+        }) do
+            local obj = position:FindFirstChild(wanted) or position:FindFirstChild(wanted, true)
+            if obj then
+                local part = getPartFromContainer(obj) or getPartFromContainer(obj.Parent)
+                if part then return part.Position end
+            end
+        end
+    end
+
+    -- Compatibility fallback for renamed/nested cashier/register objects.
+    for _, desc in ipairs(plot:GetDescendants()) do
+        local lowerName = string.lower(desc.Name or "")
+        if lowerName:find("cashier", 1, true)
+            or lowerName:find("cashregister", 1, true)
+            or lowerName == "register"
+            or lowerName:find("registerposition", 1, true) then
+
+            local part = getPartFromContainer(desc) or getPartFromContainer(desc.Parent)
+            if part then return part.Position end
+        end
+    end
+
+    -- Final fallback: use CashierPrompt's parent.
+    local prompt = plot:FindFirstChild("CashierPrompt", true)
+    if prompt then
+        local part = getPartFromContainer(prompt.Parent)
+        if part then return part.Position end
+    end
+
+    return nil
+end
+
 local function getAllBakingRacks(plot)
     if not plot then return {} end
     local equipment = plot:FindFirstChild("Equipment") or plot
@@ -467,6 +510,33 @@ local function startAutoWalk()
                                         if teleportToPosition(prepPos + Vector3.new(0, 2.5, 0))
                                             and running("ZHM_AutoWalk") then
                                             task.wait(TP_DELAY)
+
+                                            -- Next stop: Cashier, then force one Rolling Pin swing.
+                                            if running("ZHM_AutoWalk") then
+                                                local cashierPos = getCashierPos(myPlot)
+                                                if cashierPos then
+                                                    report("AutoWalk", "PrepTable complete • TP to Cashier...")
+                                                    if teleportToPosition(cashierPos + Vector3.new(0, 2.5, 0))
+                                                        and running("ZHM_AutoWalk") then
+                                                        task.wait(TP_DELAY)
+
+                                                        local swingNow = ENV.ZHM_SwingRollingPinNow
+                                                        if type(swingNow) == "function" then
+                                                            local ok, swung = pcall(swingNow)
+                                                            if ok and swung then
+                                                                report("AutoWalk", "Cashier reached • Rolling Pin swung.")
+                                                            else
+                                                                report("AutoWalk", "Cashier reached • Rolling Pin swing was not ready.")
+                                                            end
+                                                        else
+                                                            report("AutoWalk", "Cashier reached • waiting for Rolling Pin module.")
+                                                        end
+                                                    end
+                                                else
+                                                    report("AutoWalk", "Cashier not found; restarting rack route.")
+                                                    task.wait(0.25)
+                                                end
+                                            end
                                         end
                                     else
                                         report("AutoWalk", "Dough PrepTable not found; restarting rack route.")
@@ -479,7 +549,8 @@ local function startAutoWalk()
                         end
 
                         -- Full route repeats:
-                        -- BakingRacks -> DisplayRack (10s) -> Dough PrepTable -> BakingRacks...
+                        -- BakingRacks -> DisplayRack (10s) -> Dough PrepTable -> Cashier
+                        -- -> Rolling Pin swing -> BakingRacks...
                         visitedRacks = {}
                     end
                 else
@@ -2663,6 +2734,26 @@ do
             task.wait(NPC_CLICK_HOLD_TIME)
             VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
         end)
+    end
+
+    -- Shared one-shot swing used by the movement route when it reaches the Cashier.
+    ENV.ZHM_SwingRollingPinNow = function()
+        if not isCurrent()
+            or ENV.ZHM_NPCAutoSwing ~= true
+            or ENV.ZHM_SweepActive == true then
+            return false
+        end
+
+        -- Reuse the existing slot-1 equip logic if the Rolling Pin is not equipped yet.
+        if not rollingPinEquippedThisCharacter and not equipInProgress then
+            equipRollingPinOnce()
+        end
+
+        if not rollingPinEquippedThisCharacter then
+            return false
+        end
+
+        return clickGameplayToSwing()
     end
 
     task.spawn(function()
