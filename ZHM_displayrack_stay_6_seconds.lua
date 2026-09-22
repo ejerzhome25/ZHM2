@@ -1548,9 +1548,8 @@ local function collectEquipmentPrompts()
     local seenPrompts = {}
     local otherPrompts = {}
 
-    -- First pass: group every valid collect prompt under its own BakingRack.
-    -- Non-rack collect prompts are kept too so the old Auto Collect behavior
-    -- (DisplayRack / other equipment collection) still works.
+    -- Keep the original reliable grouping behavior: collect ALL valid prompts from
+    -- each BakingRack. A rack can expose more than one pickup prompt at the same time.
     for _, obj in ipairs(equipment:GetDescendants()) do
         if not farming("ZHM_AutoCollect") then return end
 
@@ -1568,24 +1567,23 @@ local function collectEquipmentPrompts()
                     rackGroups[rack][#rackGroups[rack] + 1] = obj
                 end
             elseif not seenPrompts[obj] then
+                -- Preserve DisplayRack / other supported equipment collection.
                 seenPrompts[obj] = true
                 otherPrompts[#otherPrompts + 1] = obj
             end
         end
     end
 
-    -- Some game builds place the prompt beside the named BakingRack model instead
-    -- of inside it. Use getAllBakingRacks() as a fallback and inspect each rack's
-    -- local container without double-firing prompts already grouped above.
+    -- Compatibility pass for prompts that are descendants of a BakingRack but were
+    -- missed during the main Equipment scan because of streaming/reparenting timing.
     for _, rackInfo in ipairs(getAllBakingRacks(plot)) do
         if not farming("ZHM_AutoCollect") then return end
 
         local rack = rackInfo.instance
-        if rack and rack.Parent and not rackGroups[rack] then
-            local prompts = {}
-
-            if rack:IsA("ProximityPrompt") and isRackCollectPrompt(rack) then
-                prompts[#prompts + 1] = rack
+        if rack and rack.Parent then
+            local prompts = rackGroups[rack]
+            if not prompts then
+                prompts = {}
             end
 
             for _, obj in ipairs(rack:GetDescendants()) do
@@ -1597,14 +1595,14 @@ local function collectEquipmentPrompts()
                 end
             end
 
-            if #prompts > 0 then
+            if #prompts > 0 and not rackGroups[rack] then
                 rackGroups[rack] = prompts
                 rackOrder[#rackOrder + 1] = rack
             end
         end
     end
 
-    -- Stable rack order prevents random skipping/reordering between scans.
+    -- Stable rack order avoids one rack randomly getting priority every scan.
     table.sort(rackOrder, function(a, b)
         local okA, fullA = pcall(function() return a:GetFullName() end)
         local okB, fullB = pcall(function() return b:GetFullName() end)
@@ -1614,6 +1612,9 @@ local function collectEquipmentPrompts()
     local racksProcessed = 0
     local promptsFired = 0
 
+    -- IMPORTANT: fire EVERY valid prompt on the rack. Do not choose only one.
+    -- Prompts are fired as a burst, then yield only once after that rack. This is much
+    -- faster than yielding after every bread while still giving the server a frame to update.
     for _, rack in ipairs(rackOrder) do
         if not farming("ZHM_AutoCollect") then return end
 
@@ -1625,17 +1626,25 @@ local function collectEquipmentPrompts()
                 if not farming("ZHM_AutoCollect") then return end
 
                 if prompt and prompt.Parent and prompt.Enabled and isRackCollectPrompt(prompt) then
+                    -- Keep the same firing method that already worked in the original script.
+                    -- Only make the prompt instant/easier to reach before firing it.
+                    pcall(function() prompt.HoldDuration = 0 end)
+                    pcall(function() prompt.RequiresLineOfSight = false end)
+                    pcall(function()
+                        prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, 40)
+                    end)
+
                     if firePromptSafe(prompt, "Collect") then
                         promptsFired += 1
                         firedThisRack = true
                     end
-                    task.wait()
                 end
             end
         end
 
         if firedThisRack then
             racksProcessed += 1
+            RunService.Heartbeat:Wait()
         end
     end
 
@@ -1643,12 +1652,22 @@ local function collectEquipmentPrompts()
     local extraPromptsFired = 0
     for _, prompt in ipairs(otherPrompts) do
         if not farming("ZHM_AutoCollect") then return end
+
         if prompt and prompt.Parent and prompt.Enabled and isRackCollectPrompt(prompt) then
+            pcall(function() prompt.HoldDuration = 0 end)
+            pcall(function() prompt.RequiresLineOfSight = false end)
+            pcall(function()
+                prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, 40)
+            end)
+
             if firePromptSafe(prompt, "Collect") then
                 extraPromptsFired += 1
             end
-            task.wait()
         end
+    end
+
+    if extraPromptsFired > 0 then
+        RunService.Heartbeat:Wait()
     end
 
     if racksProcessed > 0 or extraPromptsFired > 0 then
