@@ -292,7 +292,7 @@ end
 ENV.ZHM_AutoFarm = ENV.ZHM_AutoFarm == true
 ENV.ZHM_AutoBuy = ENV.ZHM_AutoBuy == true
 ENV.ZHM_AutoUpgrade = ENV.ZHM_AutoUpgrade == true
-for _, key in ipairs({ "ZHM_AutoAccept", "ZHM_AutoPrepareDough", "ZHM_AutoBake", "ZHM_AutoCollect", "ZHM_AutoCollectTip", "ZHM_AutoGiveOrder", "ZHM_AutoEnableBreads", "ZHM_HidePopups" }) do
+for _, key in ipairs({ "ZHM_AutoAccept", "ZHM_AutoPrepareDough", "ZHM_AutoBake", "ZHM_AutoCollect", "ZHM_AutoCollectTip", "ZHM_AutoGiveOrder", "ZHM_AutoPayCashier", "ZHM_AutoEnableBreads", "ZHM_HidePopups" }) do
     if ENV[key] == nil then ENV[key] = true end
 end
 ENV.ZHM_PlotName = ENV.ZHM_PlotName or "Plot4"
@@ -2149,6 +2149,89 @@ local function autoBuyMarket()
     task.wait(MARKET_PASS_WAIT)
 end
 
+--------------------------------------------------------------------------------
+-- AUTO PAY CASHIER / WORKER SALARY
+-- Uses the logged Bakery worker PaySalary button.
+--------------------------------------------------------------------------------
+local function getBakeryWorkerItems()
+    return ui({ "MainUI", "Bakery", "Frame", "ScrollingFrame", "Worker", "Items" })
+end
+
+local function tryInitializeBakeryWorkerUI()
+    local items = getBakeryWorkerItems()
+    if items then return items end
+
+    -- Exact launcher family from the user's action log.
+    local bakeryButton =
+        ui({ "SideButtons", "Box", "RightColumn", "BakeryButton" })
+        or playerGui:FindFirstChild("BakeryButton", true)
+
+    if bakeryButton and bakeryButton:IsA("GuiButton") then
+        pcall(function()
+            triggerButton(bakeryButton, "PayCashier")
+        end)
+        task.wait(0.05)
+    end
+
+    return getBakeryWorkerItems()
+end
+
+local function autoPayCashier()
+    if not farming("ZHM_AutoPayCashier") then return end
+
+    local items = tryInitializeBakeryWorkerUI()
+    if not items then
+        report("PayCashier", "Cashier/worker salary controls unavailable.")
+        return
+    end
+
+    local buttons = {}
+    local seen = {}
+
+    -- Prefer the exact WorkerTemplate path when present.
+    local workerTemplate = items:FindFirstChild("WorkerTemplate")
+    if workerTemplate then
+        local exactButton = resolve(workerTemplate, { "Main_Frame", "Buttons", "PaySalary" })
+        if exactButton and exactButton:IsA("GuiButton") then
+            seen[exactButton] = true
+            buttons[#buttons + 1] = exactButton
+        end
+    end
+
+    -- Also support cloned/multiple worker rows.
+    for _, obj in ipairs(items:GetDescendants()) do
+        if obj:IsA("GuiButton")
+            and string.lower(obj.Name or "") == "paysalary"
+            and not seen[obj] then
+            seen[obj] = true
+            buttons[#buttons + 1] = obj
+        end
+    end
+
+    if #buttons == 0 then
+        report("PayCashier", "PaySalary button not found yet.")
+        return
+    end
+
+    local paid = 0
+    for _, button in ipairs(buttons) do
+        if not farming("ZHM_AutoPayCashier") then return end
+
+        -- Fire the game's actual PaySalary GUI callback.
+        local ok, fired = pcall(function()
+            return triggerButton(button, "PayCashier")
+        end)
+
+        if ok and fired then
+            paid += 1
+        end
+    end
+
+    if paid > 0 then
+        report("PayCashier", "PaySalary dispatched on " .. tostring(paid) .. " worker button(s).")
+    end
+end
+
 local function autoUpgradeBakery()
     local items = ui({ "MainUI", "Bakery", "Frame", "ScrollingFrame", "Upgrade", "Items" })
     if not items then report("Upgrade", "Upgrade Money controls unavailable."); return end
@@ -2166,6 +2249,7 @@ local farmJobs = {
     { Key = "ZHM_AutoCollect", Name = "Collect", Interval = 0.05, Run = collectEquipmentPrompts },
     { Key = "ZHM_AutoCollectTip", Name = "Tip", Interval = 0.08, Run = autoCollectTip },
     { Key = "ZHM_AutoGiveOrder", Name = "GiveOrder", Interval = 0.05, Run = autoGiveOrder },
+    { Key = "ZHM_AutoPayCashier", Name = "PayCashier", Interval = 0.25, Run = autoPayCashier },
     { Key = "ZHM_AutoEnableBreads", Name = "Breads", Interval = 0.2, Run = autoEnableBreads },
 }
 
@@ -3014,6 +3098,7 @@ for _, featureKey in ipairs({
     "ZHM_AutoCollect",
     "ZHM_AutoCollectTip",
     "ZHM_AutoGiveOrder",
+    "ZHM_AutoPayCashier",
     "ZHM_AutoEnableBreads",
     "ZHM_HidePopups",
     "ZHM_AutoSweep",
@@ -3352,6 +3437,7 @@ local farmChildren = {
     createToggle(farmPage, "Auto Collect", "Collect from every different BakingRack", "ZHM_AutoCollect", true, "ZHM_AutoFarm"),
     createToggle(farmPage, "Auto Collect Tip", "Collect available money from the Tip Jar", "ZHM_AutoCollectTip", true, "ZHM_AutoFarm"),
     createToggle(farmPage, "Auto Give Order", "Deliver finished orders at the DisplayRack", "ZHM_AutoGiveOrder", true, "ZHM_AutoFarm"),
+    createToggle(farmPage, "Auto Pay Cashier", "Automatically press the Bakery worker PaySalary button", "ZHM_AutoPayCashier", true, "ZHM_AutoFarm"),
     createToggle(farmPage, "Enable Breads", "Enable bread options", "ZHM_AutoEnableBreads", true, "ZHM_AutoFarm"),
 }
 masterFarmToggle.Switch.Activated:Connect(function()
