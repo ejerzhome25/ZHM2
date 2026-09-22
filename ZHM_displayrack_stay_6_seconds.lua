@@ -10,6 +10,19 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
+--------------------------------------------------------------------------------
+-- FOV CHANGER CORE
+-- No separate FOV GUI. Controls are installed directly inside ZHM HUB -> EXTRA.
+--------------------------------------------------------------------------------
+-- Clean up the old standalone FOV window if a previous version is still loaded.
+if playerGui:FindFirstChild("FOVChanger") then
+    playerGui:FindFirstChild("FOVChanger"):Destroy()
+end
+
+
+-- MAIN ZHM SCOPE
+-- Keeps this very large module from exhausting Luau's 200-local-register limit.
+do
 -- ADAPTIVE LIVE INSTANT PROXIMITY
 -- PC keeps the current safe live behavior.
 -- Mobile uses a lighter PromptShown-only method to avoid touch UI glitches.
@@ -72,6 +85,34 @@ end
 -- ZHM HUB - SHARED UI / COMPATIBILITY HELPERS
 --------------------------------------------------------------------------------
 local ENV = (getgenv and getgenv()) or _G
+
+-- Integrated FOV state. Every fresh execution starts at 120.
+ENV.ZHM_FOV = 120
+ENV.ZHM_ApplyFOV = function(value)
+    value = tonumber(value)
+    if not value then return false end
+
+    value = math.clamp(value, 1, 120)
+    ENV.ZHM_FOV = value
+
+    local camera = Workspace.CurrentCamera
+    if camera then
+        camera.FieldOfView = value
+    end
+
+    return true
+end
+
+ENV.ZHM_ApplyFOV(120)
+
+-- Re-apply the selected FOV if Roblox replaces CurrentCamera.
+Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    task.wait()
+    if ENV.ZHM_ApplyFOV then
+        ENV.ZHM_ApplyFOV(ENV.ZHM_FOV or 120)
+    end
+end)
+
 local controller = { CancelGeneration = 0 }
 ENV.ZHM_Controller = controller
 ENV.ZHM_AutoWalk = true
@@ -3571,6 +3612,147 @@ createSection(extraPage, "Extra Automation")
 createToggle(extraPage, "Auto Buy All Market", "Buy all GUI Market items + world Buy prompts", "ZHM_AutoBuy", true)
 createToggle(extraPage, "Auto Upgrade", "Upgrade bakery items", "ZHM_AutoUpgrade", true)
 createToggle(extraPage, "Hide Popups", "Suppress known notifications", "ZHM_HidePopups", true)
+
+createSection(extraPage, "Camera / FOV")
+
+-- Build the FOV changer inside the existing ZHM UI.
+-- Kept inside its own function so the large hub does not approach Luau's local-register limit.
+ENV.ZHM_BuildFOVControl = function(parent)
+    local card = Instance.new("Frame")
+    card.Name = "FOVControl"
+    card.Size = UDim2.new(1, 0, 0, 126)
+    card.BackgroundColor3 = UI_PANEL
+    card.BorderSizePixel = 0
+    card.Parent = parent
+    addCorner(card, 8)
+    addStroke(card, UI_STROKE, 1, 0.45)
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.55, 0, 0, 20)
+    label.Position = UDim2.new(0, 10, 0, 7)
+    label.BackgroundTransparency = 1
+    label.Text = "Field of View"
+    label.TextColor3 = UI_TEXT
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 10
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = card
+
+    local current = Instance.new("TextLabel")
+    current.Size = UDim2.new(0.45, -10, 0, 20)
+    current.Position = UDim2.new(0.55, 0, 0, 7)
+    current.BackgroundTransparency = 1
+    current.Text = "Current: " .. tostring(ENV.ZHM_FOV or 120)
+    current.TextColor3 = UI_MUTED
+    current.Font = Enum.Font.Gotham
+    current.TextSize = 8
+    current.TextXAlignment = Enum.TextXAlignment.Right
+    current.Parent = card
+
+    local input = Instance.new("TextBox")
+    input.Name = "FOVInput"
+    input.Size = UDim2.new(1, -100, 0, 30)
+    input.Position = UDim2.new(0, 10, 0, 32)
+    input.BackgroundColor3 = UI_PANEL_2
+    input.BorderSizePixel = 0
+    input.ClearTextOnFocus = false
+    input.PlaceholderText = "FOV 1-120"
+    input.Text = tostring(ENV.ZHM_FOV or 120)
+    input.TextColor3 = UI_TEXT
+    input.PlaceholderColor3 = UI_MUTED
+    input.Font = Enum.Font.GothamMedium
+    input.TextSize = 10
+    input.Parent = card
+    addCorner(input, 7)
+
+    local apply = Instance.new("TextButton")
+    apply.Name = "ApplyFOV"
+    apply.Size = UDim2.new(0, 74, 0, 30)
+    apply.Position = UDim2.new(1, -84, 0, 32)
+    apply.BackgroundColor3 = UI_ACCENT
+    apply.BorderSizePixel = 0
+    apply.Text = "APPLY"
+    apply.TextColor3 = Color3.fromRGB(255, 255, 255)
+    apply.Font = Enum.Font.GothamBold
+    apply.TextSize = 9
+    apply.Parent = card
+    addCorner(apply, 7)
+
+    local quickLabel = Instance.new("TextLabel")
+    quickLabel.Size = UDim2.new(1, -20, 0, 16)
+    quickLabel.Position = UDim2.new(0, 10, 0, 67)
+    quickLabel.BackgroundTransparency = 1
+    quickLabel.Text = "Quick Select"
+    quickLabel.TextColor3 = UI_MUTED
+    quickLabel.Font = Enum.Font.GothamBold
+    quickLabel.TextSize = 8
+    quickLabel.TextXAlignment = Enum.TextXAlignment.Left
+    quickLabel.Parent = card
+
+    local quickHolder = Instance.new("Frame")
+    quickHolder.Size = UDim2.new(1, -20, 0, 30)
+    quickHolder.Position = UDim2.new(0, 10, 0, 87)
+    quickHolder.BackgroundTransparency = 1
+    quickHolder.Parent = card
+
+    local quickLayout = Instance.new("UIListLayout")
+    quickLayout.FillDirection = Enum.FillDirection.Horizontal
+    quickLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    quickLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+    quickLayout.Padding = UDim.new(0, 4)
+    quickLayout.Parent = quickHolder
+
+    local function setFOV(value)
+        value = tonumber(value)
+        if not value or value < 1 or value > 120 then
+            input.Text = "1-120 only"
+            return
+        end
+
+        if ENV.ZHM_ApplyFOV and ENV.ZHM_ApplyFOV(value) then
+            input.Text = tostring(value)
+            current.Text = "Current: " .. tostring(value)
+        end
+    end
+
+    apply.Activated:Connect(function()
+        setFOV(input.Text)
+    end)
+
+    input.FocusLost:Connect(function(enterPressed)
+        if enterPressed then
+            setFOV(input.Text)
+        end
+    end)
+
+    for _, value in ipairs({70, 80, 90, 100, 110, 120}) do
+        local button = Instance.new("TextButton")
+        button.Size = UDim2.new(0, 45, 0, 26)
+        button.BackgroundColor3 = value == ENV.ZHM_FOV and UI_ACCENT or UI_PANEL_2
+        button.BorderSizePixel = 0
+        button.Text = tostring(value)
+        button.TextColor3 = UI_TEXT
+        button.Font = Enum.Font.GothamBold
+        button.TextSize = 8
+        button.Parent = quickHolder
+        addCorner(button, 6)
+
+        button.Activated:Connect(function()
+            setFOV(value)
+            for _, child in ipairs(quickHolder:GetChildren()) do
+                if child:IsA("TextButton") then
+                    child.BackgroundColor3 = tonumber(child.Text) == value and UI_ACCENT or UI_PANEL_2
+                end
+            end
+        end)
+    end
+
+    return card
+end
+
+ENV.ZHM_BuildFOVControl(extraPage)
+ENV.ZHM_BuildFOVControl = nil
+
 createInfoCard(extraPage, "Status", function()
     local latestFeature, latestMessage
     for feature, message in pairs(ENV.ZHM_FeatureStatus) do
@@ -3647,6 +3829,7 @@ task.delay(0.45, function()
 end)
 
 print("[ZHM Simple UI] Loaded: optimized UI + existing automation")
+end -- MAIN ZHM SCOPE
 
 --// ==================== MERGED: STABLE NPC HITBOX + ESP ====================
 --// =========================================================
