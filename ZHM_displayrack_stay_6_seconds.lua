@@ -10,54 +10,154 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
--- LIVE INSTANT PROXIMITY
--- Forces every existing/new ProximityPrompt to have zero hold time,
--- and continuously reapplies it in case the game changes it back.
+-- LIVE INSTANT PROXIMITY V2
+-- Stronger version:
+--   1) Applies to every existing and newly-created ProximityPrompt.
+--   2) Locks HoldDuration at 0 with a property-change listener.
+--   3) Re-applies every render frame if the game changes it back.
+--   4) If a non-zero hold somehow begins, instantly completes it.
+-- Disabled prompts are NOT force-enabled.
 local liveInstantPrompts = setmetatable({}, { __mode = "k" })
+local liveInstantConnections = setmetatable({}, { __mode = "k" })
 
-local function makePromptInstant(prompt)
-    if not prompt or not prompt:IsA("ProximityPrompt") then return end
-    liveInstantPrompts[prompt] = true
+local function forcePromptInstant(prompt)
+    if not prompt or not prompt.Parent or not prompt:IsA("ProximityPrompt") then
+        return
+    end
 
     pcall(function()
-        prompt.HoldDuration = 0
+        if prompt.HoldDuration ~= 0 then
+            prompt.HoldDuration = 0
+        end
+
+        -- Makes desktop prompts clickable too; does not force disabled prompts on.
+        if prompt.ClickablePrompt ~= true then
+            prompt.ClickablePrompt = true
+        end
     end)
 end
 
--- Apply instantly to every prompt that already exists.
-for _, obj in ipairs(Workspace:GetDescendants()) do
-    if obj:IsA("ProximityPrompt") then
-        makePromptInstant(obj)
+local function registerLiveInstantPrompt(prompt)
+    if not prompt or not prompt:IsA("ProximityPrompt") then return end
+
+    liveInstantPrompts[prompt] = true
+    forcePromptInstant(prompt)
+
+    -- Avoid stacking duplicate property listeners.
+    if not liveInstantConnections[prompt] then
+        local ok, connection = pcall(function()
+            return prompt:GetPropertyChangedSignal("HoldDuration"):Connect(function()
+                if prompt.Parent and prompt.HoldDuration ~= 0 then
+                    -- Defer avoids fighting the setter in the same property-change callback.
+                    task.defer(function()
+                        if prompt and prompt.Parent then
+                            forcePromptInstant(prompt)
+                        end
+                    end)
+                end
+            end)
+        end)
+
+        if ok and connection then
+            liveInstantConnections[prompt] = connection
+        end
     end
 end
 
--- Apply instantly to prompts created later.
+local function unregisterLiveInstantPrompt(prompt)
+    liveInstantPrompts[prompt] = nil
+
+    local connection = liveInstantConnections[prompt]
+    if connection then
+        pcall(function()
+            connection:Disconnect()
+        end)
+        liveInstantConnections[prompt] = nil
+    end
+end
+
+-- Register every prompt already present in Workspace.
+for _, obj in ipairs(Workspace:GetDescendants()) do
+    if obj:IsA("ProximityPrompt") then
+        registerLiveInstantPrompt(obj)
+    end
+end
+
+-- Register prompts created dynamically by the game.
 Workspace.DescendantAdded:Connect(function(obj)
     if obj:IsA("ProximityPrompt") then
-        makePromptInstant(obj)
+        registerLiveInstantPrompt(obj)
+
+        -- Some games configure the prompt one frame after parenting it.
+        task.defer(function()
+            if obj and obj.Parent then
+                forcePromptInstant(obj)
+            end
+        end)
     end
 end)
 
 Workspace.DescendantRemoving:Connect(function(obj)
-    liveInstantPrompts[obj] = nil
+    if liveInstantPrompts[obj] or liveInstantConnections[obj] then
+        unregisterLiveInstantPrompt(obj)
+    end
 end)
 
--- Also catch prompts the moment Roblox shows them.
+-- The moment a prompt becomes visible, force it to instant again.
 ProximityPromptService.PromptShown:Connect(function(prompt)
-    makePromptInstant(prompt)
+    registerLiveInstantPrompt(prompt)
+    forcePromptInstant(prompt)
 end)
 
--- Live enforcement: if the game restores HoldDuration, set it back to 0.
-RunService.Heartbeat:Connect(function()
-    for prompt in pairs(liveInstantPrompts) do
-        if prompt and prompt.Parent then
-            if prompt.HoldDuration ~= 0 then
+-- Failsafe: if the game restores a non-zero hold and the player starts holding,
+-- immediately force zero and trigger it using the executor path already used by this script.
+ProximityPromptService.PromptButtonHoldBegan:Connect(function(prompt, playerWhoTriggered)
+    if playerWhoTriggered and playerWhoTriggered ~= player then
+        return
+    end
+
+    registerLiveInstantPrompt(prompt)
+    forcePromptInstant(prompt)
+
+    task.defer(function()
+        if not prompt or not prompt.Parent or not prompt.Enabled then return end
+
+        if type(fireproximityprompt) == "function" then
+            local ok = pcall(function()
+                fireproximityprompt(prompt, 0, true)
+            end)
+
+            if not ok then
+                ok = pcall(function()
+                    fireproximityprompt(prompt, 0)
+                end)
+            end
+
+            if not ok then
                 pcall(function()
-                    prompt.HoldDuration = 0
+                    fireproximityprompt(prompt)
                 end)
             end
         else
-            liveInstantPrompts[prompt] = nil
+            -- Native fallback: finish the current input immediately.
+            pcall(function()
+                prompt:InputHoldBegin()
+                prompt:InputHoldEnd()
+            end)
+        end
+    end)
+end)
+
+-- Render-step enforcement is faster for local UI/input than a slower polling loop.
+-- Only writes when a property was actually changed back by the game.
+RunService.RenderStepped:Connect(function()
+    for prompt in pairs(liveInstantPrompts) do
+        if prompt and prompt.Parent then
+            if prompt.HoldDuration ~= 0 or prompt.ClickablePrompt ~= true then
+                forcePromptInstant(prompt)
+            end
+        else
+            unregisterLiveInstantPrompt(prompt)
         end
     end
 end)
@@ -572,18 +672,46 @@ local function startAutoWalk()
                                                     report("AutoWalk", "PrepTable complete • TP to Cashier...")
                                                     if teleportToPosition(cashierPos + Vector3.new(0, 2.5, 0))
                                                         and running("ZHM_AutoWalk") then
-                                                        task.wait(TP_DELAY)
 
-                                                        local swingNow = ENV.ZHM_SwingRollingPinNow
-                                                        if type(swingNow) == "function" then
-                                                            local ok, swung = pcall(swingNow)
-                                                            if ok and swung then
-                                                                report("AutoWalk", "Cashier reached • Rolling Pin swung.")
-                                                            else
-                                                                report("AutoWalk", "Cashier reached • Rolling Pin swing was not ready.")
+                                                        -- Immediately spam Rolling Pin swings for 2 seconds
+                                                        -- after teleporting to the Cashier.
+                                                        local swingEnd = os.clock() + 2
+                                                        local swingAttempts = 0
+                                                        local successfulSwings = 0
+
+                                                        while isCurrent()
+                                                            and running("ZHM_AutoWalk")
+                                                            and os.clock() < swingEnd do
+
+                                                            -- Refresh every pass in case the Rolling Pin module
+                                                            -- replaces/rebinds the function while the script runs.
+                                                            local swingNow = ENV.ZHM_SwingRollingPinNow
+                                                            if type(swingNow) == "function" then
+                                                                swingAttempts += 1
+                                                                local ok, swung = pcall(swingNow)
+                                                                if ok and swung then
+                                                                    successfulSwings += 1
+                                                                end
                                                             end
+
+                                                            -- No artificial delay: spam once per simulation frame.
+                                                            RunService.Heartbeat:Wait()
+                                                        end
+
+                                                        if swingAttempts > 0 then
+                                                            report(
+                                                                "AutoWalk",
+                                                                "Cashier reached • Rolling Pin spammed for 2s ("
+                                                                    .. tostring(successfulSwings)
+                                                                    .. "/"
+                                                                    .. tostring(swingAttempts)
+                                                                    .. " successful)."
+                                                            )
                                                         else
-                                                            report("AutoWalk", "Cashier reached • waiting for Rolling Pin module.")
+                                                            report(
+                                                                "AutoWalk",
+                                                                "Cashier reached • Rolling Pin module was not ready during 2s spam."
+                                                            )
                                                         end
                                                     end
                                                 else
@@ -604,7 +732,7 @@ local function startAutoWalk()
 
                         -- Full route repeats:
                         -- BakingRacks -> DisplayRack (15s) -> Dough PrepTable -> Cashier
-                        -- -> Rolling Pin swing -> BakingRacks...
+                        -- -> Rolling Pin spam (2s) -> BakingRacks...
                         visitedRacks = {}
                     end
                 else
