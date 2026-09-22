@@ -18,6 +18,7 @@ ENV.ZHM_Controller = controller
 ENV.ZHM_AutoWalk = true 
 ENV.ZHM_AutoFarm = false
 ENV.ZHM_AutoBuy = false
+ENV.ZHM_AutoBuyBakingRack = false
 ENV.ZHM_AutoUpgrade = false
 -- Combined side-job modules. Defaults preserve the two standalone scripts.
 if ENV.ZHM_AutoSweep == nil then ENV.ZHM_AutoSweep = true end
@@ -228,6 +229,7 @@ end
 --------------------------------------------------------------------------------
 ENV.ZHM_AutoFarm = ENV.ZHM_AutoFarm == true
 ENV.ZHM_AutoBuy = ENV.ZHM_AutoBuy == true
+ENV.ZHM_AutoBuyBakingRack = ENV.ZHM_AutoBuyBakingRack == true
 ENV.ZHM_AutoUpgrade = ENV.ZHM_AutoUpgrade == true
 for _, key in ipairs({ "ZHM_AutoAccept", "ZHM_AutoPrepareDough", "ZHM_AutoBake", "ZHM_AutoCollect", "ZHM_AutoCollectTip", "ZHM_AutoGiveOrder", "ZHM_AutoEnableBreads", "ZHM_HidePopups" }) do
     if ENV[key] == nil then ENV[key] = true end
@@ -1025,35 +1027,27 @@ local function collectEquipmentPrompts()
     end
 end
 
--- AUTO BUY ALL MARKET V2
--- Robust Market GUI discovery + category cycling + scrolling + world Buy fallback.
-local MARKET_OPEN_WAIT = 0.12
-local MARKET_CATEGORY_WAIT = 0.10
-local MARKET_SCROLL_WAIT = 0.035
-local MARKET_BUY_WAIT = 0.01
-local MARKET_PASS_WAIT = 0.15
-local MARKET_MAX_REBUILDS = 24
-local WORLD_BUY_RADIUS = 160
-local WORLD_BUY_COOLDOWN = 0.30
-
-local worldBuyLastFire = setmetatable({}, { __mode = "k" })
+-- AUTO BUY ALL MARKET V3
+-- GUI-ONLY Market buyer. Kept fully separate from the Baking Rack world buyer.
+-- It opens/finds the Market UI, scans categories and scrolling item rows, and
+-- clicks likely Buy/Money/Purchase controls even when the game uses generic ImageButtons.
+local MARKET_OPEN_WAIT = 0.15
+local MARKET_CATEGORY_WAIT = 0.12
+local MARKET_SCROLL_WAIT = 0.05
+local MARKET_BUY_WAIT = 0.03
+local MARKET_PASS_WAIT = 0.20
+local MARKET_MAX_REBUILDS = 32
+local MARKET_ROW_SCAN_DEPTH = 6
 
 local function compactMarketText(value)
     return string.lower(tostring(value or "")):gsub("[%s_%-%./%(%)%[%]:]+", "")
 end
 
-local function buttonTextBlob(obj, depth)
+local function marketTextBlob(obj, depth)
     if not obj then return "" end
-    depth = depth or 3
+    depth = depth or 4
 
-    local values = { obj.Name or "" }
-
-    if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
-        values[#values + 1] = obj.Text or ""
-    elseif obj:IsA("StringValue") then
-        values[#values + 1] = tostring(obj.Value or "")
-    end
-
+    local values = { tostring(obj.Name or "") }
     local queue = { { object = obj, level = 0 } }
     local head = 1
 
@@ -1061,18 +1055,18 @@ local function buttonTextBlob(obj, depth)
         local entry = queue[head]
         head += 1
 
+        local current = entry.object
+        if current:IsA("TextLabel")
+            or current:IsA("TextButton")
+            or current:IsA("TextBox") then
+            values[#values + 1] = tostring(current.Text or "")
+        elseif current:IsA("StringValue") then
+            values[#values + 1] = tostring(current.Value or "")
+        end
+
         if entry.level < depth then
-            for _, child in ipairs(entry.object:GetChildren()) do
-                values[#values + 1] = child.Name or ""
-
-                if child:IsA("TextLabel")
-                    or child:IsA("TextButton")
-                    or child:IsA("TextBox") then
-                    values[#values + 1] = child.Text or ""
-                elseif child:IsA("StringValue") then
-                    values[#values + 1] = tostring(child.Value or "")
-                end
-
+            for _, child in ipairs(current:GetChildren()) do
+                values[#values + 1] = tostring(child.Name or "")
                 queue[#queue + 1] = {
                     object = child,
                     level = entry.level + 1,
@@ -1084,33 +1078,7 @@ local function buttonTextBlob(obj, depth)
     return string.lower(table.concat(values, " "))
 end
 
-local function getMarketRoot()
-    local mainUI = playerGui:FindFirstChild("MainUI")
-
-    -- Known path first.
-    if mainUI then
-        local market = mainUI:FindFirstChild("Market")
-            or mainUI:FindFirstChild("Market", true)
-        if market then return market end
-    end
-
-    -- Compatibility fallback for renamed Market / Shop / Store containers.
-    for _, obj in ipairs(playerGui:GetDescendants()) do
-        local name = compactMarketText(obj.Name)
-        if (name == "market"
-            or name == "shop"
-            or name == "store"
-            or name:find("marketui", 1, true)
-            or name:find("shopui", 1, true))
-            and (obj:IsA("GuiObject") or obj:IsA("ScreenGui")) then
-            return obj
-        end
-    end
-
-    return nil
-end
-
-local function guiIsActuallyVisible(obj)
+local function marketGuiVisible(obj)
     if not obj then return false end
 
     local current = obj
@@ -1126,6 +1094,80 @@ local function guiIsActuallyVisible(obj)
     return true
 end
 
+local function marketRootScore(obj)
+    if not obj or not (obj:IsA("GuiObject") or obj:IsA("ScreenGui")) then
+        return -math.huge
+    end
+
+    local name = compactMarketText(obj.Name)
+    local score = 0
+
+    if name == "market" then score += 120 end
+    if name == "marketui" then score += 110 end
+    if name == "marketframe" then score += 100 end
+    if name == "shop" or name == "shopui" then score += 75 end
+    if name == "store" or name == "storeui" then score += 60 end
+    if name:find("market", 1, true) then score += 45 end
+    if name:find("shop", 1, true) then score += 25 end
+
+    local buttonCount = 0
+    local scrollingCount = 0
+    for _, d in ipairs(obj:GetDescendants()) do
+        if d:IsA("GuiButton") then buttonCount += 1 end
+        if d:IsA("ScrollingFrame") then scrollingCount += 1 end
+    end
+
+    score += math.min(buttonCount, 25)
+    score += math.min(scrollingCount * 6, 24)
+
+    local blob = compactMarketText(marketTextBlob(obj, 2))
+    if blob:find("equipment", 1, true)
+        or blob:find("furniture", 1, true)
+        or blob:find("decor", 1, true)
+        or blob:find("bakery", 1, true)
+        or blob:find("price", 1, true)
+        or blob:find("money", 1, true) then
+        score += 20
+    end
+
+    if marketGuiVisible(obj) then score += 10 end
+
+    return score
+end
+
+local function getMarketRoot()
+    local mainUI = playerGui:FindFirstChild("MainUI")
+
+    if mainUI then
+        for _, wanted in ipairs({ "Market", "MarketUI", "Shop", "Store" }) do
+            local direct = mainUI:FindFirstChild(wanted)
+                or mainUI:FindFirstChild(wanted, true)
+            if direct then
+                return direct
+            end
+        end
+    end
+
+    local best, bestScore = nil, -math.huge
+
+    for _, obj in ipairs(playerGui:GetDescendants()) do
+        if obj:IsA("GuiObject") or obj:IsA("ScreenGui") then
+            local name = compactMarketText(obj.Name)
+            if name:find("market", 1, true)
+                or name:find("shop", 1, true)
+                or name:find("store", 1, true) then
+                local score = marketRootScore(obj)
+                if score > bestScore then
+                    best = obj
+                    bestScore = score
+                end
+            end
+        end
+    end
+
+    return best
+end
+
 local function getMarketFrame()
     local market = getMarketRoot()
     if not market then return nil end
@@ -1134,22 +1176,56 @@ local function getMarketFrame()
         return market
     end
 
+    local bestFrame = nil
+    local bestButtons = -1
+
+    for _, child in ipairs(market:GetChildren()) do
+        if child:IsA("GuiObject") then
+            local count = 0
+            for _, d in ipairs(child:GetDescendants()) do
+                if d:IsA("GuiButton") then count += 1 end
+            end
+            if count > bestButtons then
+                bestFrame = child
+                bestButtons = count
+            end
+        end
+    end
+
     return market:FindFirstChild("Frame")
         or market:FindFirstChild("Frame", true)
+        or bestFrame
         or market
 end
 
-local function getClickable(container)
+local function getMarketClickable(container)
     if not container then return nil end
     if container:IsA("GuiButton") then return container end
-    return container:FindFirstChildWhichIsA("GuiButton", true)
+
+    local preferred = nil
+    for _, d in ipairs(container:GetDescendants()) do
+        if d:IsA("GuiButton") then
+            local n = compactMarketText(d.Name)
+            local t = d:IsA("TextButton") and compactMarketText(d.Text) or ""
+            if n:find("buy", 1, true)
+                or n:find("money", 1, true)
+                or n:find("purchase", 1, true)
+                or t:find("buy", 1, true)
+                or t:find("purchase", 1, true) then
+                return d
+            end
+            preferred = preferred or d
+        end
+    end
+
+    return preferred
 end
 
-local function fireGuiControl(container)
-    local button = getClickable(container)
-    if not button then return false end
+local function fireMarketGuiControl(container)
+    local button = getMarketClickable(container)
+    if not button or not button.Parent then return false end
 
-    -- Direct callback path. Works even if the Market panel itself is hidden.
+    -- First try exposed Roblox event connections.
     if type(getconnections) == "function" then
         for _, eventName in ipairs({
             "Activated",
@@ -1157,19 +1233,22 @@ local function fireGuiControl(container)
             "MouseButton1Up",
             "MouseButton1Down",
         }) do
-            local signal = button[eventName]
-            if signal then
-                local ok, connections = pcall(getconnections, signal)
-                if ok and connections then
+            local okSignal, signal = pcall(function()
+                return button[eventName]
+            end)
+
+            if okSignal and signal then
+                local okConnections, connections = pcall(getconnections, signal)
+                if okConnections and connections then
                     local fired = false
 
                     for _, connection in ipairs(connections) do
-                        if connection.Enabled ~= false
+                        if connection
+                            and connection.Enabled ~= false
                             and connection.ForeignState ~= true
                             and connection.LuaConnection ~= false
                             and type(connection.Fire) == "function" then
-
-                            local success = pcall(function()
+                            local okFire = pcall(function()
                                 if eventName == "Activated" then
                                     connection:Fire(nil, 1)
                                 elseif eventName == "MouseButton1Down"
@@ -1181,8 +1260,7 @@ local function fireGuiControl(container)
                                     connection:Fire()
                                 end
                             end)
-
-                            fired = fired or success
+                            fired = fired or okFire
                         end
                     end
 
@@ -1192,34 +1270,50 @@ local function fireGuiControl(container)
         end
     end
 
+    -- Then try firesignal if the executor exposes it.
     if type(firesignal) == "function" then
-        for _, eventName in ipairs({ "Activated", "MouseButton1Click" }) do
-            local signal = button[eventName]
-            if signal then
+        for _, eventName in ipairs({
+            "Activated",
+            "MouseButton1Click",
+            "MouseButton1Up",
+            "MouseButton1Down",
+        }) do
+            local okSignal, signal = pcall(function()
+                return button[eventName]
+            end)
+
+            if okSignal and signal then
                 local ok = pcall(function()
                     if eventName == "Activated" then
                         firesignal(signal, nil, 1)
+                    elseif eventName == "MouseButton1Down"
+                        or eventName == "MouseButton1Up" then
+                        local center =
+                            button.AbsolutePosition + button.AbsoluteSize / 2
+                        firesignal(signal, center.X, center.Y)
                     else
                         firesignal(signal)
                     end
                 end)
+
                 if ok then return true end
             end
         end
     end
 
-    -- Executor-independent fallback: actual mouse click if visible on screen.
-    if guiIsActuallyVisible(button)
+    -- Last fallback: actual click while the Market is visible.
+    if marketGuiVisible(button)
         and button.AbsoluteSize.X > 1
         and button.AbsoluteSize.Y > 1 then
-
         local center = button.AbsolutePosition + button.AbsoluteSize / 2
         local x = math.floor(center.X)
         local y = math.floor(center.Y)
 
         local ok = pcall(function()
-            VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+            VirtualInputManager:SendMouseMoveEvent(x, y, game)
             RunService.Heartbeat:Wait()
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+            task.wait(0.015)
             VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
         end)
 
@@ -1233,90 +1327,69 @@ local function looksLikeMarketLauncher(button, marketRoot)
     if not button or not button:IsA("GuiButton") then return false end
     if marketRoot and button:IsDescendantOf(marketRoot) then return false end
 
-    local compact = compactMarketText(buttonTextBlob(button, 2))
-    return compact == "market"
-        or compact == "shop"
-        or compact == "store"
-        or compact:find("openmarket", 1, true) ~= nil
-        or compact:find("marketbutton", 1, true) ~= nil
-        or compact:find("shopbutton", 1, true) ~= nil
+    local blob = compactMarketText(marketTextBlob(button, 3))
+
+    if blob:find("close", 1, true)
+        or blob:find("back", 1, true) then
+        return false
+    end
+
+    return blob == "market"
+        or blob == "shop"
+        or blob == "store"
+        or blob:find("openmarket", 1, true) ~= nil
+        or blob:find("marketbutton", 1, true) ~= nil
+        or blob:find("shopbutton", 1, true) ~= nil
+        or blob:find("market", 1, true) ~= nil
 end
 
 local function tryOpenMarket()
     local market = getMarketRoot()
 
-    if market and guiIsActuallyVisible(market) then
+    if market and marketGuiVisible(market) then
         return market
     end
 
-    -- Try the game's actual Market launcher first.
+    -- Fire likely Market launcher controls.
     for _, obj in ipairs(playerGui:GetDescendants()) do
         if obj:IsA("GuiButton") and looksLikeMarketLauncher(obj, market) then
-            fireGuiControl(obj)
+            fireMarketGuiControl(obj)
             task.wait(MARKET_OPEN_WAIT)
 
             market = getMarketRoot()
-            if market then return market end
-        end
-    end
-
-    -- Last fallback: locally expose the Market tree so real click fallback can work.
-    market = getMarketRoot()
-    if market then
-        local current = market
-        while current and current ~= playerGui do
-            pcall(function()
-                if current:IsA("GuiObject") then
-                    current.Visible = true
-                elseif current:IsA("ScreenGui") then
-                    current.Enabled = true
-                end
-            end)
-            current = current.Parent
-        end
-    end
-
-    return market
-end
-
-local function getCategoryRoot(frame)
-    if not frame then return nil end
-
-    for _, wanted in ipairs({
-        "Category", "Categories", "Tabs", "Tab", "Buttons",
-    }) do
-        local found = frame:FindFirstChild(wanted)
-            or frame:FindFirstChild(wanted, true)
-        if found then
-            local compact = compactMarketText(found.Name)
-            if compact:find("categor", 1, true)
-                or compact:find("tab", 1, true)
-                or wanted == "Category"
-                or wanted == "Categories" then
-                return found
+            if market and marketGuiVisible(market) then
+                return market
             end
         end
     end
 
-    return nil
+    -- Some executors can fire hidden callbacks even if the panel is not visibly open.
+    return getMarketRoot()
 end
 
-local function isLikelyCategoryButton(button, categoryRoot)
+local function isMarketCategoryButton(button, frame)
     if not button or not button:IsA("GuiButton") then return false end
 
-    if categoryRoot and button:IsDescendantOf(categoryRoot) then
-        return true
+    local blob = compactMarketText(marketTextBlob(button, 3))
+
+    if blob:find("close", 1, true)
+        or blob:find("back", 1, true)
+        or blob:find("buy", 1, true)
+        or blob:find("purchase", 1, true)
+        or blob:find("money", 1, true)
+        or blob:find("price", 1, true) then
+        return false
     end
 
-    local compact = compactMarketText(buttonTextBlob(button, 2))
-
-    return compact:find("equipment", 1, true) ~= nil
-        or compact:find("furniture", 1, true) ~= nil
-        or compact:find("decor", 1, true) ~= nil
-        or compact:find("decoration", 1, true) ~= nil
-        or compact:find("bakery", 1, true) ~= nil
-        or compact:find("other", 1, true) ~= nil
-        or compact:find("misc", 1, true) ~= nil
+    return blob:find("equipment", 1, true) ~= nil
+        or blob:find("furniture", 1, true) ~= nil
+        or blob:find("decor", 1, true) ~= nil
+        or blob:find("decoration", 1, true) ~= nil
+        or blob:find("bakery", 1, true) ~= nil
+        or blob:find("other", 1, true) ~= nil
+        or blob:find("misc", 1, true) ~= nil
+        or blob:find("category", 1, true) ~= nil
+        or blob:find("tab", 1, true) ~= nil
 end
 
 local function collectMarketCategories(frame)
@@ -1324,25 +1397,33 @@ local function collectMarketCategories(frame)
     local seen = {}
     if not frame then return result end
 
-    local categoryRoot = getCategoryRoot(frame)
+    -- Prefer buttons inside category/tab named containers.
+    for _, container in ipairs(frame:GetDescendants()) do
+        local n = compactMarketText(container.Name)
+        if n:find("categor", 1, true)
+            or n == "tabs"
+            or n == "tab"
+            or n:find("tablist", 1, true) then
+            if container:IsA("GuiButton") and not seen[container] then
+                seen[container] = true
+                result[#result + 1] = container
+            end
 
-    if categoryRoot then
-        if categoryRoot:IsA("GuiButton") then
-            seen[categoryRoot] = true
-            result[#result + 1] = categoryRoot
-        end
-
-        for _, obj in ipairs(categoryRoot:GetDescendants()) do
-            if obj:IsA("GuiButton") and not seen[obj] then
-                seen[obj] = true
-                result[#result + 1] = obj
+            for _, obj in ipairs(container:GetDescendants()) do
+                if obj:IsA("GuiButton") and not seen[obj] then
+                    seen[obj] = true
+                    result[#result + 1] = obj
+                end
             end
         end
-    else
+    end
+
+    -- Fallback: infer categories from their text.
+    if #result == 0 then
         for _, obj in ipairs(frame:GetDescendants()) do
             if obj:IsA("GuiButton")
                 and not seen[obj]
-                and isLikelyCategoryButton(obj, nil) then
+                and isMarketCategoryButton(obj, frame) then
                 seen[obj] = true
                 result[#result + 1] = obj
             end
@@ -1356,21 +1437,90 @@ local function collectMarketCategories(frame)
     return result
 end
 
-local function hasPurchaseAncestor(button, frame)
-    local current = button
+local function marketButtonLooksUnsafe(button)
+    local blob = compactMarketText(marketTextBlob(button, 2))
 
-    for _ = 1, 8 do
+    return blob:find("close", 1, true) ~= nil
+        or blob:find("back", 1, true) ~= nil
+        or blob:find("cancel", 1, true) ~= nil
+        or blob:find("exit", 1, true) ~= nil
+        or blob:find("equip", 1, true) ~= nil
+        or blob:find("unequip", 1, true) ~= nil
+        or blob:find("owned", 1, true) ~= nil
+        or blob:find("selected", 1, true) ~= nil
+end
+
+local function rowLooksPurchasable(row)
+    if not row then return false end
+
+    local raw = marketTextBlob(row, 3)
+    local compact = compactMarketText(raw)
+
+    local hasPrice =
+        raw:find("₱", 1, true) ~= nil
+        or raw:find("$", 1, true) ~= nil
+        or compact:find("price", 1, true) ~= nil
+        or compact:find("cost", 1, true) ~= nil
+        or compact:find("money", 1, true) ~= nil
+        or compact:find("cash", 1, true) ~= nil
+
+    local hasPurchase =
+        compact:find("buy", 1, true) ~= nil
+        or compact:find("purchase", 1, true) ~= nil
+        or compact:find("money", 1, true) ~= nil
+        or compact:find("cash", 1, true) ~= nil
+
+    return hasPrice or hasPurchase
+end
+
+local function looksLikeMarketPurchaseButton(button, frame, categorySet)
+    if not button or not button:IsA("GuiButton") or not button.Parent then
+        return false
+    end
+
+    if categorySet and categorySet[button] then return false end
+    if marketButtonLooksUnsafe(button) then return false end
+
+    local name = compactMarketText(button.Name)
+    local ownText = button:IsA("TextButton")
+        and compactMarketText(button.Text)
+        or ""
+    local blob = compactMarketText(marketTextBlob(button, 3))
+
+    if name == "buy"
+        or name == "money"
+        or name == "purchase"
+        or name == "cash"
+        or ownText == "buy"
+        or ownText == "purchase"
+        or ownText == "money"
+        or name:find("buybutton", 1, true)
+        or name:find("purchasebutton", 1, true)
+        or name:find("moneybutton", 1, true)
+        or blob:find("buynow", 1, true)
+        or blob:find("purchase", 1, true)
+        or blob:find("buy", 1, true) then
+        return true
+    end
+
+    -- Generic ImageButton fallback: if its nearby row contains a price/currency,
+    -- treat the clickable control as a purchase button.
+    local current = button.Parent
+    for _ = 1, MARKET_ROW_SCAN_DEPTH do
         if not current or current == frame then break end
 
-        local compact = compactMarketText(current.Name)
-        if compact == "buy"
-            or compact == "money"
-            or compact == "purchase"
-            or compact == "cash"
-            or compact:find("buybutton", 1, true)
-            or compact:find("purchasebutton", 1, true)
-            or compact:find("moneybutton", 1, true) then
-            return true
+        if rowLooksPurchasable(current) then
+            local buttonsInRow = {}
+            for _, d in ipairs(current:GetDescendants()) do
+                if d:IsA("GuiButton") and not (categorySet and categorySet[d]) then
+                    buttonsInRow[#buttonsInRow + 1] = d
+                end
+            end
+
+            -- Most Market item rows have one or two actionable controls.
+            if #buttonsInRow <= 3 then
+                return true
+            end
         end
 
         current = current.Parent
@@ -1379,73 +1529,28 @@ local function hasPurchaseAncestor(button, frame)
     return false
 end
 
-local function looksLikePurchaseButton(button, frame, categoryRoot)
-    if not button or not button:IsA("GuiButton") then return false end
-    if categoryRoot and button:IsDescendantOf(categoryRoot) then return false end
-
-    local ownName = compactMarketText(button.Name)
-    local ownText = button:IsA("TextButton")
-        and compactMarketText(button.Text)
-        or ""
-    local blob = compactMarketText(buttonTextBlob(button, 3))
-
-    if ownName == "buy"
-        or ownName == "money"
-        or ownName == "purchase"
-        or ownName == "cash"
-        or ownText == "buy"
-        or ownText == "purchase"
-        or ownName:find("buybutton", 1, true)
-        or ownName:find("purchasebutton", 1, true)
-        or ownName:find("moneybutton", 1, true)
-        or blob:find("buynow", 1, true)
-        or hasPurchaseAncestor(button, frame) then
-        return true
-    end
-
-    -- Common structure: generic ImageButton inside a row/Frame containing
-    -- Money / Price / Cost text or a peso sign.
-    local parent = button.Parent
-    for _ = 1, 4 do
-        if not parent or parent == frame then break end
-
-        local parentBlob = string.lower(buttonTextBlob(parent, 2))
-        local compactParent = compactMarketText(parentBlob)
-
-        local hasMoney =
-            compactParent:find("money", 1, true) ~= nil
-            or compactParent:find("price", 1, true) ~= nil
-            or compactParent:find("cost", 1, true) ~= nil
-            or parentBlob:find("₱", 1, true) ~= nil
-            or parentBlob:find("$", 1, true) ~= nil
-
-        if hasMoney then
-            return true
-        end
-
-        parent = parent.Parent
-    end
-
-    return false
-end
-
-local function collectPurchaseButtons(frame)
+local function collectMarketPurchaseButtons(frame)
     local result = {}
     local seen = {}
     if not frame then return result end
 
-    local categoryRoot = getCategoryRoot(frame)
+    local categories = collectMarketCategories(frame)
+    local categorySet = {}
+    for _, b in ipairs(categories) do categorySet[b] = true end
 
     for _, obj in ipairs(frame:GetDescendants()) do
         if obj:IsA("GuiButton")
             and not seen[obj]
-            and looksLikePurchaseButton(obj, frame, categoryRoot) then
+            and looksLikeMarketPurchaseButton(obj, frame, categorySet) then
             seen[obj] = true
             result[#result + 1] = obj
         end
     end
 
     table.sort(result, function(a, b)
+        local ay = a.AbsolutePosition.Y
+        local by = b.AbsolutePosition.Y
+        if math.abs(ay - by) > 2 then return ay < by end
         return a:GetFullName() < b:GetFullName()
     end)
 
@@ -1462,36 +1567,37 @@ local function getMarketScrollFrames(frame)
         end
     end
 
+    table.sort(result, function(a, b)
+        return a.AbsoluteCanvasSize.Y > b.AbsoluteCanvasSize.Y
+    end)
+
     return result
 end
 
-local function buyVisibleMaterializedRows(frame)
+local function buyCurrentMarketRows(frame)
     local total = 0
-    local rebuilds = 0
     local attempted = setmetatable({}, { __mode = "k" })
 
-    while running("ZHM_AutoBuy") and rebuilds < MARKET_MAX_REBUILDS do
-        rebuilds += 1
+    for rebuild = 1, MARKET_MAX_REBUILDS do
+        if not running("ZHM_AutoBuy") then break end
+
         frame = getMarketFrame() or frame
         if not frame then break end
 
-        local buttons = collectPurchaseButtons(frame)
+        local buttons = collectMarketPurchaseButtons(frame)
         local foundNew = false
 
         for _, button in ipairs(buttons) do
             if not running("ZHM_AutoBuy") then break end
 
-            if button
-                and button.Parent
-                and not attempted[button] then
+            if button and button.Parent and not attempted[button] then
                 attempted[button] = true
                 foundNew = true
 
-                if fireGuiControl(button) then
+                if fireMarketGuiControl(button) then
                     total += 1
+                    task.wait(MARKET_BUY_WAIT)
                 end
-
-                task.wait(MARKET_BUY_WAIT)
             end
         end
 
@@ -1506,38 +1612,43 @@ local function scanAllMarketScrollPositions(frame)
     local total = 0
     if not frame then return total end
 
-    local scrollFrames = getMarketScrollFrames(frame)
+    total += buyCurrentMarketRows(frame)
 
-    -- Buy currently materialized rows first.
-    total += buyVisibleMaterializedRows(frame)
-
-    for _, scrolling in ipairs(scrollFrames) do
+    for _, scrolling in ipairs(getMarketScrollFrames(frame)) do
         if not running("ZHM_AutoBuy") then break end
         if scrolling and scrolling.Parent then
             local original = scrolling.CanvasPosition
+
             local maxY = math.max(
                 0,
                 scrolling.AbsoluteCanvasSize.Y - scrolling.AbsoluteWindowSize.Y
             )
 
             local stepY = math.max(
-                scrolling.AbsoluteWindowSize.Y * 0.75,
-                120
+                scrolling.AbsoluteWindowSize.Y * 0.65,
+                90
             )
 
-            local y = 0
-            while running("ZHM_AutoBuy") and y <= maxY + 1 do
+            local positions = { 0 }
+            local y = stepY
+            while y < maxY do
+                positions[#positions + 1] = y
+                y += stepY
+            end
+            if maxY > 0 then positions[#positions + 1] = maxY end
+
+            for _, targetY in ipairs(positions) do
+                if not running("ZHM_AutoBuy") then break end
+
                 pcall(function()
-                    scrolling.CanvasPosition = Vector2.new(original.X, y)
+                    scrolling.CanvasPosition = Vector2.new(original.X, targetY)
                 end)
 
                 RunService.Heartbeat:Wait()
                 task.wait(MARKET_SCROLL_WAIT)
 
                 frame = getMarketFrame() or frame
-                total += buyVisibleMaterializedRows(frame)
-
-                y += stepY
+                total += buyCurrentMarketRows(frame)
             end
 
             pcall(function()
@@ -1552,25 +1663,24 @@ end
 local function buyAllMarketGui()
     if not running("ZHM_AutoBuy") then return 0 end
 
-    tryOpenMarket()
+    local market = tryOpenMarket()
     task.wait(MARKET_OPEN_WAIT)
 
     local frame = getMarketFrame()
     if not frame then
-        report("Market", "Market UI not found yet; waiting for it to load.")
+        report("Market", "Market UI not found. Open Market once so the GUI can load.")
         return 0
     end
 
     local total = 0
 
-    -- Current category/page.
+    -- Scan the page/category currently loaded.
     total += scanAllMarketScrollPositions(frame)
 
-    -- Every category/tab.
+    -- Cycle all detected Market categories/tabs and scan each one.
     local initialCategories = collectMarketCategories(frame)
-    local count = #initialCategories
 
-    for index = 1, count do
+    for index = 1, #initialCategories do
         if not running("ZHM_AutoBuy") then break end
 
         frame = getMarketFrame() or frame
@@ -1578,7 +1688,7 @@ local function buyAllMarketGui()
         local category = liveCategories[index] or initialCategories[index]
 
         if category and category.Parent then
-            fireGuiControl(category)
+            fireMarketGuiControl(category)
             task.wait(MARKET_CATEGORY_WAIT)
             RunService.Heartbeat:Wait()
 
@@ -1587,12 +1697,115 @@ local function buyAllMarketGui()
         end
     end
 
+    -- One final pass catches rows rebuilt after the last category click.
+    frame = getMarketFrame() or frame
+    total += buyCurrentMarketRows(frame)
+
     return total
 end
 
--- Generic world Buy/Purchase fallback. This catches Market items implemented as
--- ProximityPrompts instead of GUI buttons.
-local function getPromptPart(prompt)
+local function autoBuyMarket()
+    if not running("ZHM_AutoBuy") then return end
+
+    local guiBought = buyAllMarketGui()
+
+    if guiBought > 0 then
+        report("Market", "Market purchase controls fired: " .. tostring(guiBought))
+    else
+        report(
+            "Market",
+            "Scanning Market GUI • categories • price rows • Buy/Money buttons."
+        )
+    end
+
+    task.wait(MARKET_PASS_WAIT)
+end
+
+
+--------------------------------------------------------------------------------
+-- AUTO BUY BAKING RACK - SEPARATE WORLD PROMPT BUYER
+-- No fixed price check. It buys any enabled Buy/Purchase prompt that clearly
+-- identifies the product as BakingRack / NormalBakingRack.
+--------------------------------------------------------------------------------
+local RACK_BUY_SCAN_INTERVAL = 0.08
+local RACK_BUY_RESCAN_INTERVAL = 0.20
+local RACK_BUY_FIRE_COOLDOWN = 0.18
+local RACK_BUY_MAX_WORLD_DISTANCE = 180
+
+local rackBuyCache = {}
+local rackBuyCacheUntil = 0
+local rackBuyLastFire = setmetatable({}, { __mode = "k" })
+
+local function normalizeRackBuyText(value)
+    return string.lower(tostring(value or "")):gsub("[%s_%-%./%(%)%[%]:]+", "")
+end
+
+local function objectOrAncestorLooksLikeBakingRack(obj)
+    local current = obj
+
+    for _ = 1, 10 do
+        if not current or current == Workspace then break end
+
+        local compactName = normalizeRackBuyText(current.Name)
+        if compactName:find("bakingrack", 1, true)
+            or compactName:find("normalbakingrack", 1, true) then
+            return true
+        end
+
+        local ok, attributes = pcall(function()
+            return current:GetAttributes()
+        end)
+
+        if ok and attributes then
+            for attrName, attrValue in pairs(attributes) do
+                local attrNameText = normalizeRackBuyText(attrName)
+                local attrValueText = normalizeRackBuyText(attrValue)
+
+                if attrNameText:find("bakingrack", 1, true)
+                    or attrNameText:find("normalbakingrack", 1, true)
+                    or attrValueText:find("bakingrack", 1, true)
+                    or attrValueText:find("normalbakingrack", 1, true) then
+                    return true
+                end
+            end
+        end
+
+        current = current.Parent
+    end
+
+    return false
+end
+
+local function isBakingRackBuyPrompt(prompt)
+    if not prompt
+        or not prompt:IsA("ProximityPrompt")
+        or not prompt.Enabled then
+        return false
+    end
+
+    local name = normalizeRackBuyText(prompt.Name)
+    local action = normalizeRackBuyText(prompt.ActionText)
+    local objectText = normalizeRackBuyText(prompt.ObjectText)
+
+    local isBuy =
+        action == "buy"
+        or action:find("buy", 1, true) ~= nil
+        or action:find("purchase", 1, true) ~= nil
+        or name:find("buyprompt", 1, true) ~= nil
+        or name:find("purchaseprompt", 1, true) ~= nil
+
+    if not isBuy then
+        return false
+    end
+
+    return objectText:find("bakingrack", 1, true) ~= nil
+        or objectText:find("normalbakingrack", 1, true) ~= nil
+        or name:find("bakingrack", 1, true) ~= nil
+        or name:find("normalbakingrack", 1, true) ~= nil
+        or objectOrAncestorLooksLikeBakingRack(prompt.Parent)
+end
+
+local function getRackBuyPromptPart(prompt)
     if not prompt then return nil end
 
     local current = prompt.Parent
@@ -1617,114 +1830,126 @@ local function getPromptPart(prompt)
     return nil
 end
 
-local function isWorldBuyPrompt(prompt)
-    if not prompt
-        or not prompt:IsA("ProximityPrompt")
-        or not prompt.Enabled then
+local function refreshRackBuyCache()
+    local now = os.clock()
+
+    if now < rackBuyCacheUntil then
+        local valid = true
+        for _, prompt in ipairs(rackBuyCache) do
+            if not prompt or not prompt.Parent or not isBakingRackBuyPrompt(prompt) then
+                valid = false
+                break
+            end
+        end
+        if valid then return rackBuyCache end
+    end
+
+    rackBuyCacheUntil = now + RACK_BUY_RESCAN_INTERVAL
+    rackBuyCache = {}
+
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("ProximityPrompt") and isBakingRackBuyPrompt(obj) then
+            rackBuyCache[#rackBuyCache + 1] = obj
+        end
+    end
+
+    return rackBuyCache
+end
+
+local function getBestBakingRackBuyPrompt()
+    local character = player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root then return nil, math.huge end
+
+    local myPlot = findMyPlot()
+    local bestPrompt = nil
+    local bestDistance = math.huge
+    local bestPriority = math.huge
+
+    for _, prompt in ipairs(refreshRackBuyCache()) do
+        if prompt and prompt.Parent and isBakingRackBuyPrompt(prompt) then
+            local part = getRackBuyPromptPart(prompt)
+            if part then
+                local distance = (root.Position - part.Position).Magnitude
+
+                if distance <= RACK_BUY_MAX_WORLD_DISTANCE then
+                    local priority = 1
+                    if myPlot and prompt:IsDescendantOf(myPlot) then
+                        priority = 0
+                    end
+
+                    if priority < bestPriority
+                        or (priority == bestPriority and distance < bestDistance) then
+                        bestPriority = priority
+                        bestDistance = distance
+                        bestPrompt = prompt
+                    end
+                end
+            end
+        end
+    end
+
+    return bestPrompt, bestDistance
+end
+
+local function fireBakingRackBuyPrompt(prompt)
+    if not running("ZHM_AutoBuyBakingRack") then return false end
+    if not prompt or not prompt.Parent or not isBakingRackBuyPrompt(prompt) then
         return false
     end
 
-    local action = compactMarketText(prompt.ActionText)
-    local name = compactMarketText(prompt.Name)
-
-    return action == "buy"
-        or action:find("buy", 1, true) ~= nil
-        or action:find("purchase", 1, true) ~= nil
-        or name:find("buyprompt", 1, true) ~= nil
-        or name:find("purchaseprompt", 1, true) ~= nil
-end
-
-local function fireAllNearbyWorldBuyPrompts()
-    if not running("ZHM_AutoBuy") then return 0 end
-
-    local character = player.Character
-    local root = character and character:FindFirstChild("HumanoidRootPart")
-    if not root then return 0 end
-
-    local candidates = {}
-
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("ProximityPrompt") and isWorldBuyPrompt(obj) then
-            local part = getPromptPart(obj)
-            if part then
-                local distance = (root.Position - part.Position).Magnitude
-                if distance <= WORLD_BUY_RADIUS then
-                    candidates[#candidates + 1] = {
-                        prompt = obj,
-                        distance = distance,
-                    }
-                end
-            end
-        end
+    local now = os.clock()
+    local lastFire = rackBuyLastFire[prompt] or 0
+    if now - lastFire < RACK_BUY_FIRE_COOLDOWN then
+        return false
     end
+    rackBuyLastFire[prompt] = now
 
-    table.sort(candidates, function(a, b)
-        return a.distance < b.distance
+    pcall(function() prompt.HoldDuration = 0 end)
+    pcall(function() prompt.RequiresLineOfSight = false end)
+    pcall(function()
+        prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, 60)
     end)
 
-    local total = 0
-
-    for _, entry in ipairs(candidates) do
-        if not running("ZHM_AutoBuy") then break end
-
-        local prompt = entry.prompt
-        local now = os.clock()
-        local last = worldBuyLastFire[prompt] or 0
-
-        if now - last >= WORLD_BUY_COOLDOWN then
-            worldBuyLastFire[prompt] = now
-
-            pcall(function() prompt.HoldDuration = 0 end)
-            pcall(function() prompt.RequiresLineOfSight = false end)
-            pcall(function()
-                prompt.MaxActivationDistance =
-                    math.max(prompt.MaxActivationDistance, 60)
-            end)
-
-            if type(fireproximityprompt) == "function" then
-                local ok = pcall(function()
-                    fireproximityprompt(prompt, 0)
-                end)
-
-                if not ok then
-                    ok = pcall(function()
-                        fireproximityprompt(prompt)
-                    end)
-                end
-
-                if ok then total += 1 end
-            end
-        end
+    if type(fireproximityprompt) ~= "function" then
+        report("RackBuy", "fireproximityprompt unavailable.")
+        return false
     end
 
-    return total
+    local ok = pcall(function()
+        fireproximityprompt(prompt, 0)
+    end)
+
+    if not ok then
+        ok = pcall(function()
+            fireproximityprompt(prompt)
+        end)
+    end
+
+    return ok
 end
 
-local function autoBuyMarket()
-    if not running("ZHM_AutoBuy") then return end
+local function autoBuyBakingRack()
+    if not running("ZHM_AutoBuyBakingRack") then return end
 
-    local guiBought = buyAllMarketGui()
+    local prompt, distance = getBestBakingRackBuyPrompt()
 
-    if not running("ZHM_AutoBuy") then return end
+    if not prompt then
+        report("RackBuy", "Scanning for Baking Rack Buy prompt.")
+        task.wait(RACK_BUY_SCAN_INTERVAL)
+        return
+    end
 
-    local worldBought = fireAllNearbyWorldBuyPrompts()
-
-    if guiBought > 0 or worldBought > 0 then
+    if fireBakingRackBuyPrompt(prompt) then
+        local label = tostring(prompt.ObjectText or "")
+        if label == "" then label = "Baking Rack" end
         report(
-            "Market",
-            "Auto Buy All • GUI "
-                .. tostring(guiBought)
-                .. " • World "
-                .. tostring(worldBought)
-        )
-    else
-        report(
-            "Market",
-            "Scanning all Market categories, scroll rows, and nearby Buy prompts."
+            "RackBuy",
+            "Buy fired: " .. label .. " • " .. string.format("%.1f", distance) .. " studs"
         )
     end
 
-    task.wait(MARKET_PASS_WAIT)
+    task.wait(RACK_BUY_SCAN_INTERVAL)
 end
 
 local function autoUpgradeBakery()
@@ -1762,6 +1987,7 @@ local function startAutomation()
         end
     end)
     for _, definition in ipairs({
+        { Key = "ZHM_AutoBuyBakingRack", Name = "RackBuy", Run = autoBuyBakingRack },
         { Key = "ZHM_AutoBuy", Name = "Market", Run = autoBuyMarket },
         { Key = "ZHM_AutoUpgrade", Name = "Upgrade", Run = autoUpgradeBakery },
     }) do
@@ -2553,6 +2779,7 @@ for _, featureKey in ipairs({
     "ZHM_AutoWalk",
     "ZHM_AutoFarm",
     "ZHM_AutoBuy",
+    "ZHM_AutoBuyBakingRack",
     "ZHM_AutoUpgrade",
     "ZHM_AutoAccept",
     "ZHM_AutoPrepareDough",
@@ -2909,7 +3136,8 @@ masterFarmToggle.Switch.Activated:Connect(function()
 end)
 createInfoCard(farmPage, "Bakery Status", function()
     return "Farm: " .. (ENV.ZHM_AutoFarm and "Enabled" or "Disabled")
-        .. "\nBuy: " .. (ENV.ZHM_AutoBuy and "Enabled" or "Disabled")
+        .. "\nRack Buy: " .. (ENV.ZHM_AutoBuyBakingRack and "Enabled" or "Disabled")
+        .. "\nMarket Buy: " .. (ENV.ZHM_AutoBuy and "Enabled" or "Disabled")
         .. "\nUpgrade: " .. (ENV.ZHM_AutoUpgrade and "Enabled" or "Disabled")
 end, 66)
 
@@ -3000,7 +3228,8 @@ createInfoCard(sidePage, "Live Scanner", function()
 end, 64)
 
 createSection(extraPage, "Extra Automation")
-createToggle(extraPage, "Auto Buy All Market", "Buy all GUI Market items + world Buy prompts", "ZHM_AutoBuy", true)
+createToggle(extraPage, "Auto Buy Baking Rack", "Buy Baking Rack world prompt regardless of price", "ZHM_AutoBuyBakingRack", true)
+createToggle(extraPage, "Auto Buy All Market", "Buy all items inside the Market GUI", "ZHM_AutoBuy", true)
 createToggle(extraPage, "Auto Upgrade", "Upgrade bakery items", "ZHM_AutoUpgrade", true)
 createToggle(extraPage, "Hide Popups", "Suppress known notifications", "ZHM_HidePopups", true)
 createInfoCard(extraPage, "Status", function()
