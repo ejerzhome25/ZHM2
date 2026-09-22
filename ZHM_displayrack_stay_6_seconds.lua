@@ -574,8 +574,8 @@ end
 -- usable interaction anywhere in Workspace, choosing the closest to the player.
 --------------------------------------------------------------------------------
 local AUTO_NEAREST_ACTIVATION_DISTANCE = 1000000000 -- practical unlimited range
-local AUTO_NEAREST_SCAN_DELAY = 0.08
-local AUTO_NEAREST_COOLDOWN = 0.35
+local AUTO_NEAREST_SCAN_DELAY = 0 -- no artificial scan delay; loop runs every frame
+local AUTO_NEAREST_COOLDOWN = 0 -- no refire cooldown
 
 local nearestInteractions = setmetatable({}, { __mode = "k" })
 local nearestLastFire = setmetatable({}, { __mode = "k" })
@@ -665,9 +665,7 @@ local function pressNearestClickableInteraction(interaction)
     if not interaction or not interaction.Parent then return false end
 
     local now = os.clock()
-    if now - (nearestLastFire[interaction] or 0) < AUTO_NEAREST_COOLDOWN then
-        return false
-    end
+    -- No artificial cooldown: nearest interaction may fire again on the next frame.
 
     if interaction:IsA("ProximityPrompt") then
         if not interaction.Enabled or type(fireproximityprompt) ~= "function" then
@@ -726,7 +724,7 @@ local function startAutoNearestPrompt()
                     pressNearestClickableInteraction(interaction)
                 end
             end
-            task.wait(AUTO_NEAREST_SCAN_DELAY)
+            RunService.Heartbeat:Wait() -- fastest safe loop: once per rendered/simulation frame
         end
     end)
 end
