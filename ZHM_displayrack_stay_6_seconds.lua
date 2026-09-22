@@ -21,6 +21,7 @@ ENV.ZHM_AutoBuy = false
 ENV.ZHM_AutoUpgrade = false
 local TP_DELAY = 1 -- 1 second between movement teleports.
 if ENV.ZHM_AutoNearestPrompt == nil then ENV.ZHM_AutoNearestPrompt = false end -- Day default; night controller enables it automatically.
+if ENV.ZHM_SpamDisplayRackPrompts == nil then ENV.ZHM_SpamDisplayRackPrompts = true end -- Spam all prompts around DisplayRack while standing near it.
 -- Combined side-job modules. Defaults preserve the two standalone scripts.
 if ENV.ZHM_AutoSweep == nil then ENV.ZHM_AutoSweep = true end
 ENV.ZHM_NPCAutoTP = false -- Auto TP removed; scanner is used only for Rolling Pin swing.
@@ -801,6 +802,59 @@ local function startAutoNearestPrompt()
 end
 
 startAutoNearestPrompt()
+
+--------------------------------------------------------------------------------
+-- DISPLAYRACK: SPAM ALL NEARBY PROXIMITY PROMPTS
+-- While the player is standing near the DisplayRack, fire EVERY enabled
+-- ProximityPrompt around the rack every Heartbeat with no artificial delay.
+--------------------------------------------------------------------------------
+local DISPLAY_RACK_PLAYER_RADIUS = 15
+local DISPLAY_RACK_PROMPT_RADIUS = 30
+
+local function startDisplayRackPromptSpam()
+    task.spawn(function()
+        while isCurrent() do
+            if ENV.ZHM_SpamDisplayRackPrompts == true and running("ZHM_AutoWalk") then
+                local plot = findMyPlot()
+                local displayPos = plot and getDisplayRackPos(plot)
+
+                local char = player.Character
+                local rootPart = char and char:FindFirstChild("HumanoidRootPart")
+
+                if displayPos and rootPart then
+                    local playerDistance = (rootPart.Position - displayPos).Magnitude
+
+                    if playerDistance <= DISPLAY_RACK_PLAYER_RADIUS then
+                        for interaction in pairs(nearestInteractions) do
+                            if not isCurrent() then return end
+
+                            if interaction
+                                and interaction.Parent
+                                and interaction:IsA("ProximityPrompt")
+                                and interaction.Enabled then
+
+                                local interactionPart = getNearestInteractionPart(interaction)
+                                if interactionPart then
+                                    local rackDistance = (interactionPart.Position - displayPos).Magnitude
+
+                                    if rackDistance <= DISPLAY_RACK_PROMPT_RADIUS then
+                                        -- Reuse the instant/no-hold firing path. There is intentionally
+                                        -- no cooldown, so every valid prompt can fire again next Heartbeat.
+                                        pressNearestClickableInteraction(interaction)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+
+            RunService.Heartbeat:Wait()
+        end
+    end)
+end
+
+startDisplayRackPromptSpam()
 
 local function sortedChildren(container)
     local children = container:GetChildren()
