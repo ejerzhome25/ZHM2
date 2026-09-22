@@ -2,6 +2,7 @@
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
 local CoreGui = game:GetService("CoreGui")
 local UserInputService = game:GetService("UserInputService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
@@ -237,6 +238,12 @@ end
 ENV.ZHM_PlotName = ENV.ZHM_PlotName or "Plot4"
 ENV.ZHM_FeatureStatus = {}
 
+-- Auto Dough + Auto Bake settings (based on the supplied standalone script).
+ENV.ZHM_BakeIds = ENV.ZHM_BakeIds or { "100", "101", "102" }
+ENV.ZHM_PrepareInterval = tonumber(ENV.ZHM_PrepareInterval) or 5
+ENV.ZHM_BakeInterval = tonumber(ENV.ZHM_BakeInterval) or 3
+if ENV.ZHM_AllowBakePrompt == nil then ENV.ZHM_AllowBakePrompt = false end
+
 local function isCurrent()
     return ENV.ZHM_Controller == controller
 end
@@ -318,13 +325,20 @@ local function findMyPlot()
         end
     end
 
-    return shops:FindFirstChild(ENV.ZHM_PlotName) or closestPlot
+    -- If ownership markers are unavailable, prefer the plot physically nearest
+    -- to the player. This avoids a stale/default PlotName (for example Plot4)
+    -- sending dough/rack automation to the wrong shop while the player is on Plot3.
+    if closestPlot then return closestPlot end
+    return shops:FindFirstChild(ENV.ZHM_PlotName)
 end
 
 --------------------------------------------------------------------------------
--- INSTANT TP / RACK MOVEMENT
--- All rack-route tween/Lerp movement has been replaced with direct CFrame TP.
+-- ADAPTIVE RACK MOVEMENT
+-- Outside own plot = instant TP. Inside own plot = smooth TweenService movement.
 --------------------------------------------------------------------------------
+local TWEEN_MOVE_SPEED = 28
+local PLOT_INSIDE_MARGIN = 3
+
 local function getPartFromContainer(container)
     if not container then return nil end
     if container:IsA("BasePart") then return container end
@@ -368,15 +382,114 @@ local function getAllBakingRacks(plot)
     return racks
 end
 
-local function teleportToPosition(targetPos)
-    if not running("ZHM_AutoWalk") then return false end
+local function getPlotBoundaryParts(plot)
+    if not plot then return {} end
+
+    local root = plot:FindFirstChild("Position") or plot:FindFirstChild("Positions")
+    local parts = {}
+
+    if root then
+        if root:IsA("BasePart") then
+            parts[#parts + 1] = root
+        end
+        for _, obj in ipairs(root:GetDescendants()) do
+            if obj:IsA("BasePart") then
+                parts[#parts + 1] = obj
+            end
+        end
+    end
+
+    return parts
+end
+
+local function isPositionInsidePlot(position, plot)
+    if not position or not plot then return false end
+
+    local parts = getPlotBoundaryParts(plot)
+    for _, part in ipairs(parts) do
+        if part and part.Parent then
+            local localPoint = part.CFrame:PointToObjectSpace(position)
+            local half = part.Size * 0.5
+            if math.abs(localPoint.X) <= half.X + PLOT_INSIDE_MARGIN
+                and math.abs(localPoint.Z) <= half.Z + PLOT_INSIDE_MARGIN then
+                return true
+            end
+        end
+    end
+
+    -- Fallback for plots whose Position folder has no physical boundary parts.
+    if #parts == 0 and plot:IsA("Model") then
+        local ok, boxCFrame, boxSize = pcall(function()
+            local cf, size = plot:GetBoundingBox()
+            return cf, size
+        end)
+        if ok and boxCFrame and boxSize then
+            local localPoint = boxCFrame:PointToObjectSpace(position)
+            local half = boxSize * 0.5
+            return math.abs(localPoint.X) <= half.X + PLOT_INSIDE_MARGIN
+                and math.abs(localPoint.Z) <= half.Z + PLOT_INSIDE_MARGIN
+        end
+    end
+
+    return false
+end
+
+local function tweenRootToCFrame(rootPart, targetCFrame, canContinue)
+    if not rootPart or not rootPart.Parent then return false end
+
+    local distance = (rootPart.Position - targetCFrame.Position).Magnitude
+    local duration = distance / math.max(TWEEN_MOVE_SPEED, 1)
+    if duration <= 0.05 then
+        rootPart.CFrame = targetCFrame
+        return true
+    end
+
+    local tween = TweenService:Create(
+        rootPart,
+        TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
+        { CFrame = targetCFrame }
+    )
+
+    local finished = false
+    local connection
+    connection = tween.Completed:Connect(function()
+        finished = true
+    end)
+
+    tween:Play()
+    while not finished do
+        if canContinue and not canContinue() then
+            tween:Cancel()
+            if connection then connection:Disconnect() end
+            return false
+        end
+        RunService.Heartbeat:Wait()
+    end
+
+    if connection then connection:Disconnect() end
+    return true
+end
+
+local function moveRackToPosition(targetPos, plot)
+    if not running("ZHM_AutoWalk") then return false, "stopped" end
 
     local char = player.Character
     local rootPart = char and char:FindFirstChild("HumanoidRootPart")
-    if not rootPart then return false end
+    if not rootPart then return false, "missing" end
 
-    rootPart.CFrame = CFrame.new(targetPos) * rootPart.CFrame.Rotation
-    return true
+    local targetCFrame = CFrame.new(targetPos) * rootPart.CFrame.Rotation
+
+    if isPositionInsidePlot(rootPart.Position, plot) then
+        local ok = tweenRootToCFrame(rootPart, targetCFrame, function()
+            return running("ZHM_AutoWalk")
+                and player.Character == char
+                and rootPart.Parent ~= nil
+        end)
+        return ok, "tween"
+    end
+
+    rootPart.CFrame = targetCFrame
+    return true, "tp"
 end
 
 local function startAutoWalk()
@@ -410,18 +523,18 @@ local function startAutoWalk()
                         local nextRack = unvisitedRacks[1]
                         visitedRacks[nextRack.instance] = true
 
-                        report("AutoWalk", "TP to BakingRack: " .. nextRack.instance.Name)
-                        if teleportToPosition(nextRack.position + Vector3.new(0, 2.5, 0))
-                            and running("ZHM_AutoWalk") then
+                        local moved, mode = moveRackToPosition(nextRack.position + Vector3.new(0, 2.5, 0), myPlot)
+                        report("AutoWalk", (mode == "tween" and "Tween to BakingRack: " or "TP to BakingRack: ") .. nextRack.instance.Name)
+                        if moved and running("ZHM_AutoWalk") then
                             task.wait(TP_DELAY)
                         end
                     else
                         local displayPos = getDisplayRackPos(myPlot)
 
                         if displayPos then
-                            report("AutoWalk", "TP to DisplayRack...")
-                            if teleportToPosition(displayPos + Vector3.new(0, 2.5, 0))
-                                and running("ZHM_AutoWalk") then
+                            local moved, mode = moveRackToPosition(displayPos + Vector3.new(0, 2.5, 0), myPlot)
+                            report("AutoWalk", mode == "tween" and "Tween to DisplayRack..." or "TP to DisplayRack...")
+                            if moved and running("ZHM_AutoWalk") then
                                 -- Stay at the DisplayRack for exactly 10 seconds before restarting the rack route.
                                 task.wait(10)
                             end
@@ -520,9 +633,9 @@ end
 --------------------------------------------------------------------------------
 -- AUTO PRESS NEAREST CLICKABLE PROMPT
 -- Supports both ProximityPrompt and ClickDetector and only fires the nearest
--- usable interaction around the player's current position.
+-- usable interaction anywhere in Workspace, choosing the closest to the player.
 --------------------------------------------------------------------------------
-local AUTO_NEAREST_RADIUS = 18
+local AUTO_NEAREST_ACTIVATION_DISTANCE = 1000000000 -- practical unlimited range
 local AUTO_NEAREST_SCAN_DELAY = 0.08
 local AUTO_NEAREST_COOLDOWN = 0.35
 
@@ -569,7 +682,7 @@ end
 
 local function nearestInteractionAllowed(interaction, distance)
     if not interaction or not interaction.Parent then return false end
-    if distance > AUTO_NEAREST_RADIUS then return false end
+    -- No distance cap: the nearest valid interaction can be anywhere in Workspace.
 
     if interaction:IsA("ProximityPrompt") then
         return interaction.Enabled == true
@@ -626,7 +739,7 @@ local function pressNearestClickableInteraction(interaction)
         pcall(function() interaction.HoldDuration = 0 end)
         pcall(function() interaction.RequiresLineOfSight = false end)
         pcall(function()
-            interaction.MaxActivationDistance = math.max(interaction.MaxActivationDistance, AUTO_NEAREST_RADIUS)
+            interaction.MaxActivationDistance = math.max(interaction.MaxActivationDistance, AUTO_NEAREST_ACTIVATION_DISTANCE)
         end)
 
         -- Try the most aggressive instant form first, then executor-compatible fallbacks.
@@ -644,6 +757,10 @@ local function pressNearestClickableInteraction(interaction)
         end
     elseif interaction:IsA("ClickDetector") then
         if type(fireclickdetector) ~= "function" then return false end
+
+        pcall(function()
+            interaction.MaxActivationDistance = math.max(interaction.MaxActivationDistance, AUTO_NEAREST_ACTIVATION_DISTANCE)
+        end)
 
         local ok = pcall(function() fireclickdetector(interaction) end)
         if ok then
@@ -706,31 +823,155 @@ local function autoAccept()
     if triggerButton(accept, "Accept") then report("Accept", "Accept handler dispatched.") end
 end
 
+local function doughPromptScore(prompt, myPlot)
+    if not prompt or not prompt:IsA("ProximityPrompt") or not prompt.Enabled then
+        return -math.huge
+    end
+
+    local name = string.lower(tostring(prompt.Name or ""))
+    local action = string.lower(tostring(prompt.ActionText or ""))
+    local objectText = string.lower(tostring(prompt.ObjectText or ""))
+    local score = 0
+
+    if name == "preptableprompt" then score += 100 end
+    if name:find("prep", 1, true) then score += 25 end
+    if name:find("dough", 1, true) then score += 35 end
+    if action:find("prepare dough", 1, true) then score += 100 end
+    if action:find("dough", 1, true) then score += 45 end
+    if action:find("prepare", 1, true) then score += 20 end
+    if objectText:find("dough", 1, true) then score += 30 end
+    if objectText:find("prep", 1, true) then score += 15 end
+
+    local current = prompt.Parent
+    local depth = 0
+    while current and current ~= myPlot and depth < 8 do
+        local ancestorName = string.lower(tostring(current.Name or ""))
+        if ancestorName:find("preptable", 1, true) then score += 70 end
+        if ancestorName:find("prep", 1, true) then score += 15 end
+        if ancestorName:find("dough", 1, true) then score += 20 end
+        current = current.Parent
+        depth += 1
+    end
+
+    return score
+end
+
+local function findPrepareDoughPrompt(myPlot)
+    if not myPlot then return nil end
+
+    -- Known/expected path first.
+    local prompt = resolve(myPlot, { "Position", "PrepTable", "PrepTablePrompt" })
+    if prompt and prompt:IsA("ProximityPrompt") then
+        return prompt
+    end
+
+    -- Compatibility with game builds where PrepTablePrompt moved deeper.
+    prompt = myPlot:FindFirstChild("PrepTablePrompt", true)
+    if prompt and prompt:IsA("ProximityPrompt") then
+        return prompt
+    end
+
+    -- Final fallback: score every prompt on our plot by its name, ActionText,
+    -- ObjectText, and PrepTable/Dough ancestry. This avoids depending on one hierarchy.
+    local bestPrompt = nil
+    local bestScore = 0
+    for _, obj in ipairs(myPlot:GetDescendants()) do
+        if obj:IsA("ProximityPrompt") and obj.Enabled then
+            local score = doughPromptScore(obj, myPlot)
+            if score > bestScore then
+                bestScore = score
+                bestPrompt = obj
+            end
+        end
+    end
+
+    return bestPrompt
+end
+
+local function fireDoughPromptInstant(prompt)
+    if not prompt or not prompt:IsA("ProximityPrompt") or not prompt.Enabled then
+        return false
+    end
+    if type(fireproximityprompt) ~= "function" then
+        report("Dough", "fireproximityprompt unavailable.")
+        return false
+    end
+
+    -- Make the dough prompt executor-friendly even if the player is not standing
+    -- directly beside the PrepTable.
+    pcall(function() prompt.HoldDuration = 0 end)
+    pcall(function() prompt.RequiresLineOfSight = false end)
+    pcall(function() prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, 1000000000) end)
+
+    local ok = pcall(function() fireproximityprompt(prompt, 0, true) end)
+    if not ok then
+        ok = pcall(function() fireproximityprompt(prompt, 0) end)
+    end
+    if not ok then
+        ok = pcall(function() fireproximityprompt(prompt) end)
+    end
+    return ok
+end
+
 local function autoPrepareDough()
-    local plot = findMyPlot()
-    local prompt = resolve(plot, { "Position", "PrepTable", "PrepTablePrompt" })
-        or (plot and plot:FindFirstChild("PrepTablePrompt", true))
-    if firePromptSafe(prompt, "Dough") then report("Dough", "Prepare Dough prompt dispatched.") end
+    local myPlot = findMyPlot()
+    if not myPlot then
+        report("Dough", "Waiting for your plot.")
+        return
+    end
+
+    local prompt = findPrepareDoughPrompt(myPlot)
+    if not prompt then
+        report("Dough", "PrepTable/Prepare Dough prompt not found on " .. tostring(myPlot.Name) .. ".")
+        return
+    end
+
+    if fireDoughPromptInstant(prompt) then
+        report("Dough", "Prepare Dough prompt dispatched: " .. prompt:GetFullName())
+    else
+        report("Dough", "Prepare Dough prompt found but could not be fired.")
+    end
 end
 
 local bakeIndex = 0
 local function bakeAllBreads()
-    local list = ui({ "MainUI", "BakeSelect", "Frame", "ScrollingFrame" })
-    if not list then report("Bake", "BakeSelect handlers unavailable; waiting for game initialization."); return end
-    local candidates = {}
-    for _, row in ipairs(sortedChildren(list)) do
-        local button = resolve(row, { "Main_Frame", "Buttons", "Bake" })
-        if button then candidates[#candidates + 1] = button end
+    local bakeIds = ENV.ZHM_BakeIds or { "100", "101", "102" }
+    if #bakeIds == 0 then
+        report("Bake", "BakeIds is empty.")
+        return
     end
-    for _ = 1, #candidates do
-        bakeIndex = bakeIndex % #candidates + 1
-        local button = candidates[bakeIndex]
-        if binding(button) and triggerButton(button, "Bake") then
-            report("Bake", "Bake handler dispatched.")
-            return
+
+    -- Optional oven prompt reproduction from the supplied script. Disabled by default.
+    if ENV.ZHM_AllowBakePrompt == true then
+        local myPlot = findMyPlot()
+        local prompt = resolve(myPlot, { "Equipment", "Oven", "BrownOven", "PlacementRoot", "BakePrompt" })
+        if not firePromptSafe(prompt, "Bake") then return end
+        task.wait(0.35)
+        if not farming("ZHM_AutoBake") then return end
+    end
+
+    local list = ui({ "MainUI", "BakeSelect", "Frame", "ScrollingFrame" })
+    if not list then
+        report("Bake", "BakeSelect entries missing. Hidden baking needs existing UI handlers and oven context.")
+        return
+    end
+
+    -- Only use the supplied logged recipe IDs; do not guess or press unrelated Bake buttons.
+    for _ = 1, #bakeIds do
+        bakeIndex = (bakeIndex % #bakeIds) + 1
+        local id = tostring(bakeIds[bakeIndex])
+        local button = resolve(list, { id, "Main_Frame", "Buttons", "Bake" })
+
+        if button then
+            local target = binding(button)
+            if target and triggerButton(button, "Bake") then
+                report("Bake", "Bake " .. id .. " handler dispatched; server acceptance unverified.")
+                return
+            end
         end
     end
-    report("Bake", "No supported Bake handlers found.")
+
+    report("Bake", "No supported Bake handlers found for IDs " .. table.concat(bakeIds, ", ") .. ".")
 end
 
 local enabledBreadButtons = setmetatable({}, { __mode = "k" })
@@ -1860,28 +2101,37 @@ end
 local function autoBuyMarket()
     if not running("ZHM_AutoBuy") then return end
 
-    local guiBought = buyAllMarketGui()
+    -- Simple behavior: open Market, find every purchase button currently present
+    -- anywhere under its UI tree, and dispatch each one. No world prompts,
+    -- distance/radius checks, scrolling route, or category automation here.
+    tryOpenMarket()
+    task.wait(0.10)
 
-    if not running("ZHM_AutoBuy") then return end
-
-    local worldBought = fireAllNearbyWorldBuyPrompts()
-
-    if guiBought > 0 or worldBought > 0 then
-        report(
-            "Market",
-            "Auto Buy All • GUI "
-                .. tostring(guiBought)
-                .. " • World "
-                .. tostring(worldBought)
-        )
-    else
-        report(
-            "Market",
-            "Scanning all Market categories, scroll rows, and nearby Buy prompts."
-        )
+    local frame = getMarketFrame()
+    if not frame then
+        report("Market", "Market UI not found yet; waiting for it to load.")
+        task.wait(0.25)
+        return
     end
 
-    task.wait(MARKET_PASS_WAIT)
+    local buttons = collectPurchaseButtons(frame)
+    local bought = 0
+
+    for _, button in ipairs(buttons) do
+        if not running("ZHM_AutoBuy") then return end
+        if button and button.Parent and fireGuiControl(button) then
+            bought += 1
+        end
+        task.wait(0.01)
+    end
+
+    if bought > 0 then
+        report("Market", "Buy All dispatched on " .. tostring(bought) .. " Market purchase button(s).")
+    else
+        report("Market", "No Market purchase buttons detected yet.")
+    end
+
+    task.wait(0.15)
 end
 
 local function autoUpgradeBakery()
@@ -1896,8 +2146,8 @@ end
 
 local farmJobs = {
     { Key = "ZHM_AutoAccept", Name = "Accept", Interval = 0.05, Run = autoAccept },
-    { Key = "ZHM_AutoPrepareDough", Name = "Dough", Interval = 0.1, Run = autoPrepareDough },
-    { Key = "ZHM_AutoBake", Name = "Bake", Interval = 0.1, Run = bakeAllBreads },
+    { Key = "ZHM_AutoPrepareDough", Name = "Dough", Interval = ENV.ZHM_PrepareInterval, Run = autoPrepareDough },
+    { Key = "ZHM_AutoBake", Name = "Bake", Interval = ENV.ZHM_BakeInterval, Run = bakeAllBreads },
     { Key = "ZHM_AutoCollect", Name = "Collect", Interval = 0.05, Run = collectEquipmentPrompts },
     { Key = "ZHM_AutoCollectTip", Name = "Tip", Interval = 0.08, Run = autoCollectTip },
     { Key = "ZHM_AutoGiveOrder", Name = "GiveOrder", Interval = 0.05, Run = autoGiveOrder },
@@ -2063,13 +2313,28 @@ do
         return prompts
     end
 
-    local function teleportToPrompt(prompt)
+    local function moveToSweepPrompt(prompt)
         local root = getRoot()
         local part = getPromptPart(prompt)
-        if not root or not part then return false end
+        if not root or not part then return false, "missing" end
 
-        root.CFrame = part.CFrame * CFrame.new(0, SWEEP_TP_HEIGHT_OFFSET, SWEEP_TP_BACK_OFFSET)
-        return true
+        local targetCFrame = part.CFrame * CFrame.new(0, SWEEP_TP_HEIGHT_OFFSET, SWEEP_TP_BACK_OFFSET)
+        local myPlot = findMyPlot()
+
+        if myPlot and isPositionInsidePlot(root.Position, myPlot) then
+            local character = player.Character
+            local ok = tweenRootToCFrame(root, targetCFrame, function()
+                return isCurrent()
+                    and ENV.ZHM_AutoSweep == true
+                    and isNight()
+                    and player.Character == character
+                    and root.Parent ~= nil
+            end)
+            return ok, "tween"
+        end
+
+        root.CFrame = targetCFrame
+        return true, "tp"
     end
 
     local function makePromptInstant(prompt)
@@ -2118,15 +2383,19 @@ do
                             break
                         end
 
-                        if prompt and prompt.Parent and prompt.Enabled and teleportToPrompt(prompt) then
-                            -- Fire immediately on arrival, then enforce the requested
-                            -- 1-second delay before the next sweep teleport.
-                            if SWEEP_PROMPT_FIRE_DELAY > 0 then
-                                task.wait(SWEEP_PROMPT_FIRE_DELAY)
+                        if prompt and prompt.Parent and prompt.Enabled then
+                            local moved, moveMode = moveToSweepPrompt(prompt)
+                            if moved then
+                                ENV.ZHM_SweepStatus = (moveMode == "tween" and "Tween sweeping" or "TP sweeping")
+                                -- Fire immediately on arrival, then enforce the requested
+                                -- 1-second delay before the next sweep movement.
+                                if SWEEP_PROMPT_FIRE_DELAY > 0 then
+                                    task.wait(SWEEP_PROMPT_FIRE_DELAY)
+                                end
+                                if not isNight() then break end
+                                fireSweepPrompt(prompt)
+                                task.wait(SWEEP_LOOP_DELAY)
                             end
-                            if not isNight() then break end
-                            fireSweepPrompt(prompt)
-                            task.wait(SWEEP_LOOP_DELAY)
                         end
                     end
                 else
@@ -3083,15 +3352,15 @@ createInfoCard(farmPage, "Bakery Status", function()
 end, 66)
 
 createSection(movePage, "Movement")
-local rackMovementToggle = createToggle(movePage, "Auto Rack Movement", "Instant TP between baking racks and display rack", "ZHM_AutoWalk", true)
-createToggle(movePage, "Auto Press Nearest Prompt", "Press nearest ProximityPrompt / ClickDetector within 18 studs", "ZHM_AutoNearestPrompt", true)
+local rackMovementToggle = createToggle(movePage, "Auto Rack Movement", "Outside plot = TP • inside plot = Tween", "ZHM_AutoWalk", true)
+createToggle(movePage, "Auto Press Nearest Prompt", "Press nearest ProximityPrompt / ClickDetector at unlimited range", "ZHM_AutoNearestPrompt", true)
 createInfoCard(movePage, "Live Movement", function()
     if ENV.ZHM_SweepActive then
         return "Sweep active • rack paused • instant prompts ACTIVE"
     elseif ENV.ZHM_NPCBusy then
         return "NPC TP active • rack movement paused"
     elseif ENV.ZHM_AutoWalk then
-        return "Rack TP active • 1s delay • DisplayRack 10s"
+        return "Adaptive movement • outside TP / inside Tween • 1s delay • DisplayRack 10s"
     end
     return "Movement idle"
 end, 56)
@@ -3170,7 +3439,7 @@ createInfoCard(sidePage, "Live Scanner", function()
 end, 64)
 
 createSection(extraPage, "Extra Automation")
-createToggle(extraPage, "Auto Buy All Market", "Buy all GUI Market items + world Buy prompts", "ZHM_AutoBuy", true)
+createToggle(extraPage, "Auto Buy All Market", "Buy every detected purchase button in the Market UI", "ZHM_AutoBuy", true)
 createToggle(extraPage, "Auto Upgrade", "Upgrade bakery items", "ZHM_AutoUpgrade", true)
 createToggle(extraPage, "Hide Popups", "Suppress known notifications", "ZHM_HidePopups", true)
 createInfoCard(extraPage, "Status", function()
