@@ -10,156 +10,44 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
--- LIVE INSTANT PROXIMITY V2
--- Stronger version:
---   1) Applies to every existing and newly-created ProximityPrompt.
---   2) Locks HoldDuration at 0 with a property-change listener.
---   3) Re-applies every render frame if the game changes it back.
---   4) If a non-zero hold somehow begins, instantly completes it.
--- Disabled prompts are NOT force-enabled.
-local liveInstantPrompts = setmetatable({}, { __mode = "k" })
-local liveInstantConnections = setmetatable({}, { __mode = "k" })
+-- SAFE LIVE INSTANT PROXIMITY
+-- Lightweight version designed to avoid lag/bugs:
+--   1) Set existing prompts to zero hold once.
+--   2) Set newly-created prompts to zero hold once.
+--   3) Re-apply when a prompt is shown.
+-- No RenderStepped loop, no property locking, no forced input, no ClickablePrompt changes.
 
-local function forcePromptInstant(prompt)
-    if not prompt or not prompt.Parent or not prompt:IsA("ProximityPrompt") then
-        return
-    end
-
+local function makePromptInstantSafe(prompt)
+    if not prompt or not prompt:IsA("ProximityPrompt") then return end
     pcall(function()
-        if prompt.HoldDuration ~= 0 then
-            prompt.HoldDuration = 0
-        end
-
-        -- Makes desktop prompts clickable too; does not force disabled prompts on.
-        if prompt.ClickablePrompt ~= true then
-            prompt.ClickablePrompt = true
-        end
+        prompt.HoldDuration = 0
     end)
 end
 
-local function registerLiveInstantPrompt(prompt)
-    if not prompt or not prompt:IsA("ProximityPrompt") then return end
-
-    liveInstantPrompts[prompt] = true
-    forcePromptInstant(prompt)
-
-    -- Avoid stacking duplicate property listeners.
-    if not liveInstantConnections[prompt] then
-        local ok, connection = pcall(function()
-            return prompt:GetPropertyChangedSignal("HoldDuration"):Connect(function()
-                if prompt.Parent and prompt.HoldDuration ~= 0 then
-                    -- Defer avoids fighting the setter in the same property-change callback.
-                    task.defer(function()
-                        if prompt and prompt.Parent then
-                            forcePromptInstant(prompt)
-                        end
-                    end)
-                end
-            end)
-        end)
-
-        if ok and connection then
-            liveInstantConnections[prompt] = connection
-        end
-    end
-end
-
-local function unregisterLiveInstantPrompt(prompt)
-    liveInstantPrompts[prompt] = nil
-
-    local connection = liveInstantConnections[prompt]
-    if connection then
-        pcall(function()
-            connection:Disconnect()
-        end)
-        liveInstantConnections[prompt] = nil
-    end
-end
-
--- Register every prompt already present in Workspace.
+-- Apply once to prompts already in Workspace.
 for _, obj in ipairs(Workspace:GetDescendants()) do
     if obj:IsA("ProximityPrompt") then
-        registerLiveInstantPrompt(obj)
+        makePromptInstantSafe(obj)
     end
 end
 
--- Register prompts created dynamically by the game.
+-- Apply once to prompts created later.
 Workspace.DescendantAdded:Connect(function(obj)
     if obj:IsA("ProximityPrompt") then
-        registerLiveInstantPrompt(obj)
+        makePromptInstantSafe(obj)
 
-        -- Some games configure the prompt one frame after parenting it.
-        task.defer(function()
+        -- Some games finish configuring the prompt shortly after parenting it.
+        task.delay(0.05, function()
             if obj and obj.Parent then
-                forcePromptInstant(obj)
+                makePromptInstantSafe(obj)
             end
         end)
     end
 end)
 
-Workspace.DescendantRemoving:Connect(function(obj)
-    if liveInstantPrompts[obj] or liveInstantConnections[obj] then
-        unregisterLiveInstantPrompt(obj)
-    end
-end)
-
--- The moment a prompt becomes visible, force it to instant again.
+-- Re-apply only when Roblox actually shows a prompt to the player.
 ProximityPromptService.PromptShown:Connect(function(prompt)
-    registerLiveInstantPrompt(prompt)
-    forcePromptInstant(prompt)
-end)
-
--- Failsafe: if the game restores a non-zero hold and the player starts holding,
--- immediately force zero and trigger it using the executor path already used by this script.
-ProximityPromptService.PromptButtonHoldBegan:Connect(function(prompt, playerWhoTriggered)
-    if playerWhoTriggered and playerWhoTriggered ~= player then
-        return
-    end
-
-    registerLiveInstantPrompt(prompt)
-    forcePromptInstant(prompt)
-
-    task.defer(function()
-        if not prompt or not prompt.Parent or not prompt.Enabled then return end
-
-        if type(fireproximityprompt) == "function" then
-            local ok = pcall(function()
-                fireproximityprompt(prompt, 0, true)
-            end)
-
-            if not ok then
-                ok = pcall(function()
-                    fireproximityprompt(prompt, 0)
-                end)
-            end
-
-            if not ok then
-                pcall(function()
-                    fireproximityprompt(prompt)
-                end)
-            end
-        else
-            -- Native fallback: finish the current input immediately.
-            pcall(function()
-                prompt:InputHoldBegin()
-                prompt:InputHoldEnd()
-            end)
-        end
-    end)
-end)
-
--- Render-step enforcement is faster for local UI/input than a slower polling loop.
--- Only writes when a property was actually changed back by the game.
-RunService.RenderStepped:Connect(function()
-    for prompt in pairs(liveInstantPrompts) do
-        if prompt and prompt.Parent then
-            if prompt.HoldDuration ~= 0 or prompt.ClickablePrompt ~= true then
-                forcePromptInstant(prompt)
-            end
-        else
-            unregisterLiveInstantPrompt(prompt)
-        end
-    end
+    makePromptInstantSafe(prompt)
 end)
 
 --------------------------------------------------------------------------------
