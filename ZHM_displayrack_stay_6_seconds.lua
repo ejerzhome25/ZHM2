@@ -559,51 +559,133 @@ local function teleportToPosition(targetPos)
     return true
 end
 
+local function getRackNumber(name)
+    -- If the game names racks like BakingRack1 / BakingRack2 / Rack 3,
+    -- use that number for a clean 1 -> 9 route.
+    local value = tostring(name or "")
+    local number = value:match("(%d+)%D*$")
+    return tonumber(number)
+end
+
+local function buildFixedBakingRackRoute(plot)
+    local racks = getAllBakingRacks(plot)
+    if #racks <= 1 then return racks end
+
+    local char = player.Character
+    local rootPart = char and char:FindFirstChild("HumanoidRootPart")
+    local startPosition = rootPart and rootPart.Position or nil
+
+    -- IMPORTANT: this sort happens ONCE when a route starts.
+    -- It is NOT recalculated after each teleport, so the order cannot jump around.
+    table.sort(racks, function(a, b)
+        local nameA = a.instance and a.instance.Name or ""
+        local nameB = b.instance and b.instance.Name or ""
+        local numberA = getRackNumber(nameA)
+        local numberB = getRackNumber(nameB)
+
+        -- Best case: racks have numbers in their names. Visit 1,2,3...9.
+        if numberA and numberB and numberA ~= numberB then
+            return numberA < numberB
+        elseif numberA and not numberB then
+            return true
+        elseif numberB and not numberA then
+            return false
+        end
+
+        -- If all racks use the same name, preserve the old "farthest first" idea,
+        -- but calculate it only from the player's position at the START of the cycle.
+        if startPosition then
+            local distanceA = (startPosition - a.position).Magnitude
+            local distanceB = (startPosition - b.position).Magnitude
+            if math.abs(distanceA - distanceB) > 0.01 then
+                return distanceA > distanceB
+            end
+        end
+
+        -- Stable position fallback so equal/same-name racks never shuffle randomly.
+        if math.abs(a.position.X - b.position.X) > 0.01 then
+            return a.position.X < b.position.X
+        end
+        if math.abs(a.position.Z - b.position.Z) > 0.01 then
+            return a.position.Z < b.position.Z
+        end
+        if math.abs(a.position.Y - b.position.Y) > 0.01 then
+            return a.position.Y < b.position.Y
+        end
+
+        local pathA = ""
+        local pathB = ""
+        pcall(function() pathA = a.instance:GetFullName() end)
+        pcall(function() pathB = b.instance:GetFullName() end)
+        return pathA < pathB
+    end)
+
+    return racks
+end
+
 local function startAutoWalk()
     task.spawn(function()
-        local visitedRacks = {}
+        local route = {}
+        local routeIndex = 1
+        local routePlot = nil
+
+        local function resetRoute()
+            route = {}
+            routeIndex = 1
+            routePlot = nil
+        end
+
+        local function ensureRoute(plot)
+            -- Build the route once per full cycle (or if the player's plot changes).
+            if routePlot ~= plot or #route == 0 then
+                routePlot = plot
+                route = buildFixedBakingRackRoute(plot)
+                routeIndex = 1
+
+                report(
+                    "AutoWalk",
+                    "Fixed BakingRack route ready: " .. tostring(#route) .. " rack(s)."
+                )
+            end
+        end
 
         while isCurrent() do
             if running("ZHM_AutoWalk") then
                 local myPlot = findMyPlot()
 
                 if myPlot then
-                    local allRacks = getAllBakingRacks(myPlot)
-                    local unvisitedRacks = {}
+                    ensureRoute(myPlot)
 
-                    for _, rack in ipairs(allRacks) do
-                        if not visitedRacks[rack.instance] then
-                            table.insert(unvisitedRacks, rack)
+                    -- Visit exactly one rack at a time using the route captured above.
+                    if routeIndex <= #route then
+                        local rack = route[routeIndex]
+
+                        -- If a rack streamed out / disappeared, skip only that entry.
+                        if rack and rack.instance and rack.instance.Parent
+                            and rack.part and rack.part.Parent then
+
+                            -- Refresh its current position in case the model moved slightly.
+                            rack.position = rack.part.Position
+
+                            report(
+                                "AutoWalk",
+                                "TP BakingRack " .. tostring(routeIndex) .. "/" .. tostring(#route)
+                                    .. ": " .. tostring(rack.instance.Name)
+                            )
+
+                            if teleportToPosition(rack.position + Vector3.new(0, 2.5, 0))
+                                and running("ZHM_AutoWalk") then
+                                task.wait(TP_DELAY)
+                            end
                         end
-                    end
 
-                    if #unvisitedRacks > 0 then
-                        local char = player.Character
-                        local rootPart = char and char:FindFirstChild("HumanoidRootPart")
-
-                        if rootPart then
-                            -- Scan all unvisited BakingRacks from the player's current position,
-                            -- then place the farthest rack first so TP always targets the farthest one.
-                            table.sort(unvisitedRacks, function(a, b)
-                                local distanceA = (rootPart.Position - a.position).Magnitude
-                                local distanceB = (rootPart.Position - b.position).Magnitude
-                                return distanceA > distanceB
-                            end)
-                        end
-
-                        local nextRack = unvisitedRacks[1]
-                        visitedRacks[nextRack.instance] = true
-
-                        report("AutoWalk", "TP to BakingRack: " .. nextRack.instance.Name)
-                        if teleportToPosition(nextRack.position + Vector3.new(0, 2.5, 0))
-                            and running("ZHM_AutoWalk") then
-                            task.wait(TP_DELAY)
-                        end
+                        -- Advance ONCE. No re-sorting from the new player position.
+                        routeIndex += 1
                     else
                         local displayPos = getDisplayRackPos(myPlot)
 
                         if displayPos then
-                            report("AutoWalk", "TP to DisplayRack...")
+                            report("AutoWalk", "All " .. tostring(#route) .. " BakingRacks visited • TP to DisplayRack...")
                             if teleportToPosition(displayPos + Vector3.new(0, 2.5, 0))
                                 and running("ZHM_AutoWalk") then
                                 -- Stay at the DisplayRack for exactly 15 seconds.
@@ -619,7 +701,7 @@ local function startAutoWalk()
                                             and running("ZHM_AutoWalk") then
                                             task.wait(TP_DELAY)
 
-                                            -- Next stop: Cashier, then force one Rolling Pin swing.
+                                            -- Next stop: Cashier, then force Rolling Pin swings.
                                             if running("ZHM_AutoWalk") then
                                                 local cashierPos = getCashierPos(myPlot)
                                                 if cashierPos then
@@ -627,8 +709,6 @@ local function startAutoWalk()
                                                     if teleportToPosition(cashierPos + Vector3.new(0, 2.5, 0))
                                                         and running("ZHM_AutoWalk") then
 
-                                                        -- Immediately spam Rolling Pin swings for 2 seconds
-                                                        -- after teleporting to the Cashier.
                                                         local swingEnd = os.clock() + 2
                                                         local swingAttempts = 0
                                                         local successfulSwings = 0
@@ -637,8 +717,6 @@ local function startAutoWalk()
                                                             and running("ZHM_AutoWalk")
                                                             and os.clock() < swingEnd do
 
-                                                            -- Refresh every pass in case the Rolling Pin module
-                                                            -- replaces/rebinds the function while the script runs.
                                                             local swingNow = ENV.ZHM_SwingRollingPinNow
                                                             if type(swingNow) == "function" then
                                                                 swingAttempts += 1
@@ -648,7 +726,6 @@ local function startAutoWalk()
                                                                 end
                                                             end
 
-                                                            -- No artificial delay: spam once per simulation frame.
                                                             RunService.Heartbeat:Wait()
                                                         end
 
@@ -684,16 +761,16 @@ local function startAutoWalk()
                             task.wait(0.5)
                         end
 
-                        -- Full route repeats:
-                        -- BakingRacks -> DisplayRack (15s) -> Dough PrepTable -> Cashier
-                        -- -> Rolling Pin spam (2s) -> BakingRacks...
-                        visitedRacks = {}
+                        -- Full cycle completed. Re-scan all BakingRacks ONCE and create
+                        -- a fresh fixed route for the next cycle.
+                        resetRoute()
                     end
                 else
+                    resetRoute()
                     task.wait(0.5)
                 end
             else
-                visitedRacks = {}
+                resetRoute()
                 task.wait(0.5)
             end
 
