@@ -325,11 +325,7 @@ local function findMyPlot()
         end
     end
 
-    -- If ownership markers are unavailable, prefer the plot physically nearest
-    -- to the player. This avoids a stale/default PlotName (for example Plot4)
-    -- sending dough/rack automation to the wrong shop while the player is on Plot3.
-    if closestPlot then return closestPlot end
-    return shops:FindFirstChild(ENV.ZHM_PlotName)
+    return shops:FindFirstChild(ENV.ZHM_PlotName) or closestPlot
 end
 
 --------------------------------------------------------------------------------
@@ -823,113 +819,13 @@ local function autoAccept()
     if triggerButton(accept, "Accept") then report("Accept", "Accept handler dispatched.") end
 end
 
-local function doughPromptScore(prompt, myPlot)
-    if not prompt or not prompt:IsA("ProximityPrompt") or not prompt.Enabled then
-        return -math.huge
-    end
-
-    local name = string.lower(tostring(prompt.Name or ""))
-    local action = string.lower(tostring(prompt.ActionText or ""))
-    local objectText = string.lower(tostring(prompt.ObjectText or ""))
-    local score = 0
-
-    if name == "preptableprompt" then score += 100 end
-    if name:find("prep", 1, true) then score += 25 end
-    if name:find("dough", 1, true) then score += 35 end
-    if action:find("prepare dough", 1, true) then score += 100 end
-    if action:find("dough", 1, true) then score += 45 end
-    if action:find("prepare", 1, true) then score += 20 end
-    if objectText:find("dough", 1, true) then score += 30 end
-    if objectText:find("prep", 1, true) then score += 15 end
-
-    local current = prompt.Parent
-    local depth = 0
-    while current and current ~= myPlot and depth < 8 do
-        local ancestorName = string.lower(tostring(current.Name or ""))
-        if ancestorName:find("preptable", 1, true) then score += 70 end
-        if ancestorName:find("prep", 1, true) then score += 15 end
-        if ancestorName:find("dough", 1, true) then score += 20 end
-        current = current.Parent
-        depth += 1
-    end
-
-    return score
-end
-
-local function findPrepareDoughPrompt(myPlot)
-    if not myPlot then return nil end
-
-    -- Known/expected path first.
-    local prompt = resolve(myPlot, { "Position", "PrepTable", "PrepTablePrompt" })
-    if prompt and prompt:IsA("ProximityPrompt") then
-        return prompt
-    end
-
-    -- Compatibility with game builds where PrepTablePrompt moved deeper.
-    prompt = myPlot:FindFirstChild("PrepTablePrompt", true)
-    if prompt and prompt:IsA("ProximityPrompt") then
-        return prompt
-    end
-
-    -- Final fallback: score every prompt on our plot by its name, ActionText,
-    -- ObjectText, and PrepTable/Dough ancestry. This avoids depending on one hierarchy.
-    local bestPrompt = nil
-    local bestScore = 0
-    for _, obj in ipairs(myPlot:GetDescendants()) do
-        if obj:IsA("ProximityPrompt") and obj.Enabled then
-            local score = doughPromptScore(obj, myPlot)
-            if score > bestScore then
-                bestScore = score
-                bestPrompt = obj
-            end
-        end
-    end
-
-    return bestPrompt
-end
-
-local function fireDoughPromptInstant(prompt)
-    if not prompt or not prompt:IsA("ProximityPrompt") or not prompt.Enabled then
-        return false
-    end
-    if type(fireproximityprompt) ~= "function" then
-        report("Dough", "fireproximityprompt unavailable.")
-        return false
-    end
-
-    -- Make the dough prompt executor-friendly even if the player is not standing
-    -- directly beside the PrepTable.
-    pcall(function() prompt.HoldDuration = 0 end)
-    pcall(function() prompt.RequiresLineOfSight = false end)
-    pcall(function() prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, 1000000000) end)
-
-    local ok = pcall(function() fireproximityprompt(prompt, 0, true) end)
-    if not ok then
-        ok = pcall(function() fireproximityprompt(prompt, 0) end)
-    end
-    if not ok then
-        ok = pcall(function() fireproximityprompt(prompt) end)
-    end
-    return ok
-end
-
 local function autoPrepareDough()
+    -- Exact Prepare Dough path from the supplied AutoDoughBake script.
     local myPlot = findMyPlot()
-    if not myPlot then
-        report("Dough", "Waiting for your plot.")
-        return
-    end
+    local prompt = resolve(myPlot, { "Position", "PrepTable", "PrepTablePrompt" })
 
-    local prompt = findPrepareDoughPrompt(myPlot)
-    if not prompt then
-        report("Dough", "PrepTable/Prepare Dough prompt not found on " .. tostring(myPlot.Name) .. ".")
-        return
-    end
-
-    if fireDoughPromptInstant(prompt) then
-        report("Dough", "Prepare Dough prompt dispatched: " .. prompt:GetFullName())
-    else
-        report("Dough", "Prepare Dough prompt found but could not be fired.")
+    if firePromptSafe(prompt, "Dough") then
+        report("Dough", "Prepare Dough prompt dispatched; completion unverified.")
     end
 end
 
