@@ -292,7 +292,7 @@ end
 ENV.ZHM_AutoFarm = ENV.ZHM_AutoFarm == true
 ENV.ZHM_AutoBuy = ENV.ZHM_AutoBuy == true
 ENV.ZHM_AutoUpgrade = ENV.ZHM_AutoUpgrade == true
-for _, key in ipairs({ "ZHM_AutoAccept", "ZHM_AutoPrepareDough", "ZHM_AutoBake", "ZHM_AutoCollect", "ZHM_AutoCollectTip", "ZHM_AutoGiveOrder", "ZHM_AutoEnableBreads", "ZHM_HidePopups" }) do
+for _, key in ipairs({ "ZHM_AutoAccept", "ZHM_AutoPrepareDough", "ZHM_AutoBake", "ZHM_AutoCollect", "ZHM_AutoCollectTip", "ZHM_AutoGiveOrder", "ZHM_AutoPayCashier", "ZHM_AutoEnableBreads", "ZHM_HidePopups" }) do
     if ENV[key] == nil then ENV[key] = true end
 end
 ENV.ZHM_PlotName = ENV.ZHM_PlotName or "Plot4"
@@ -538,14 +538,15 @@ local function startAutoWalk()
                         local rootPart = char and char:FindFirstChild("HumanoidRootPart")
 
                         if rootPart then
-                            -- Scan every unvisited BakingRack from the player's current position,
-                            -- then sort by distance FARTHEST -> NEAREST.
+                            -- Scan all unvisited BakingRacks from the player's current position,
+                            -- then place the farthest rack first so TP always targets the farthest one.
                             table.sort(unvisitedRacks, function(a, b)
-                                return (rootPart.Position - a.position).Magnitude > (rootPart.Position - b.position).Magnitude
+                                local distanceA = (rootPart.Position - a.position).Magnitude
+                                local distanceB = (rootPart.Position - b.position).Magnitude
+                                return distanceA > distanceB
                             end)
                         end
 
-                        -- TP to the farthest BakingRack found by the live scan.
                         local nextRack = unvisitedRacks[1]
                         visitedRacks[nextRack.instance] = true
 
@@ -2152,6 +2153,89 @@ local function autoBuyMarket()
     task.wait(MARKET_PASS_WAIT)
 end
 
+--------------------------------------------------------------------------------
+-- AUTO PAY CASHIER / WORKER SALARY
+-- Uses the logged Bakery worker PaySalary button.
+--------------------------------------------------------------------------------
+local function getBakeryWorkerItems()
+    return ui({ "MainUI", "Bakery", "Frame", "ScrollingFrame", "Worker", "Items" })
+end
+
+local function tryInitializeBakeryWorkerUI()
+    local items = getBakeryWorkerItems()
+    if items then return items end
+
+    -- Exact launcher family from the user's action log.
+    local bakeryButton =
+        ui({ "SideButtons", "Box", "RightColumn", "BakeryButton" })
+        or playerGui:FindFirstChild("BakeryButton", true)
+
+    if bakeryButton and bakeryButton:IsA("GuiButton") then
+        pcall(function()
+            triggerButton(bakeryButton, "PayCashier")
+        end)
+        task.wait(0.05)
+    end
+
+    return getBakeryWorkerItems()
+end
+
+local function autoPayCashier()
+    if not farming("ZHM_AutoPayCashier") then return end
+
+    local items = tryInitializeBakeryWorkerUI()
+    if not items then
+        report("PayCashier", "Cashier/worker salary controls unavailable.")
+        return
+    end
+
+    local buttons = {}
+    local seen = {}
+
+    -- Prefer the exact WorkerTemplate path when present.
+    local workerTemplate = items:FindFirstChild("WorkerTemplate")
+    if workerTemplate then
+        local exactButton = resolve(workerTemplate, { "Main_Frame", "Buttons", "PaySalary" })
+        if exactButton and exactButton:IsA("GuiButton") then
+            seen[exactButton] = true
+            buttons[#buttons + 1] = exactButton
+        end
+    end
+
+    -- Also support cloned/multiple worker rows.
+    for _, obj in ipairs(items:GetDescendants()) do
+        if obj:IsA("GuiButton")
+            and string.lower(obj.Name or "") == "paysalary"
+            and not seen[obj] then
+            seen[obj] = true
+            buttons[#buttons + 1] = obj
+        end
+    end
+
+    if #buttons == 0 then
+        report("PayCashier", "PaySalary button not found yet.")
+        return
+    end
+
+    local paid = 0
+    for _, button in ipairs(buttons) do
+        if not farming("ZHM_AutoPayCashier") then return end
+
+        -- Fire the game's actual PaySalary GUI callback.
+        local ok, fired = pcall(function()
+            return triggerButton(button, "PayCashier")
+        end)
+
+        if ok and fired then
+            paid += 1
+        end
+    end
+
+    if paid > 0 then
+        report("PayCashier", "PaySalary dispatched on " .. tostring(paid) .. " worker button(s).")
+    end
+end
+
 local function autoUpgradeBakery()
     local items = ui({ "MainUI", "Bakery", "Frame", "ScrollingFrame", "Upgrade", "Items" })
     if not items then report("Upgrade", "Upgrade Money controls unavailable."); return end
@@ -2169,6 +2253,7 @@ local farmJobs = {
     { Key = "ZHM_AutoCollect", Name = "Collect", Interval = 0.05, Run = collectEquipmentPrompts },
     { Key = "ZHM_AutoCollectTip", Name = "Tip", Interval = 0.08, Run = autoCollectTip },
     { Key = "ZHM_AutoGiveOrder", Name = "GiveOrder", Interval = 0.05, Run = autoGiveOrder },
+    { Key = "ZHM_AutoPayCashier", Name = "PayCashier", Interval = 0.25, Run = autoPayCashier },
     { Key = "ZHM_AutoEnableBreads", Name = "Breads", Interval = 0.2, Run = autoEnableBreads },
 }
 
@@ -3017,6 +3102,7 @@ for _, featureKey in ipairs({
     "ZHM_AutoCollect",
     "ZHM_AutoCollectTip",
     "ZHM_AutoGiveOrder",
+    "ZHM_AutoPayCashier",
     "ZHM_AutoEnableBreads",
     "ZHM_HidePopups",
     "ZHM_AutoSweep",
@@ -3355,6 +3441,7 @@ local farmChildren = {
     createToggle(farmPage, "Auto Collect", "Collect from every different BakingRack", "ZHM_AutoCollect", true, "ZHM_AutoFarm"),
     createToggle(farmPage, "Auto Collect Tip", "Collect available money from the Tip Jar", "ZHM_AutoCollectTip", true, "ZHM_AutoFarm"),
     createToggle(farmPage, "Auto Give Order", "Deliver finished orders at the DisplayRack", "ZHM_AutoGiveOrder", true, "ZHM_AutoFarm"),
+    createToggle(farmPage, "Auto Pay Cashier", "Automatically press the Bakery worker PaySalary button", "ZHM_AutoPayCashier", true, "ZHM_AutoFarm"),
     createToggle(farmPage, "Enable Breads", "Enable bread options", "ZHM_AutoEnableBreads", true, "ZHM_AutoFarm"),
 }
 masterFarmToggle.Switch.Activated:Connect(function()
@@ -3561,3 +3648,612 @@ end)
 
 print("[ZHM Simple UI] Loaded: optimized UI + existing automation")
 
+--// ==================== MERGED: STABLE NPC HITBOX + ESP ====================
+--// =========================================================
+--// STABLE NPC HITBOX EXPANDER + TRANSPARENT ESP
+--// NPC ONLY
+--// Reduced physics interference
+--// =========================================================
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+
+--// STOP OLD VERSION
+if getgenv().StableNPCHitbox then
+    getgenv().StableNPCHitbox.Enabled = false
+end
+
+task.wait(0.15)
+
+
+--// =========================================================
+--// CONFIG
+--// =========================================================
+
+local Config = {
+    Enabled = true,
+
+    -- Smaller and safer
+    HitboxSize = Vector3.new(8, 6, 8),
+
+    -- How often new NPCs are detected
+    ScanDelay = 0.75,
+
+    -- How often we verify that the server
+    -- hasn't reset the hitbox
+    VerifyDelay = 1,
+
+    ESP = true,
+
+    -- Nearly invisible ESP
+    ESPTransparency = 0.94,
+
+    StatusUI = true
+}
+
+getgenv().StableNPCHitbox = Config
+
+
+--// =========================================================
+--// STATE
+--// =========================================================
+
+local NPCs = {}
+local Modified = {}
+local Visuals = {}
+
+local LastScan = 0
+local LastVerify = 0
+
+local NPCCount = 0
+local ActiveCount = 0
+
+
+--// =========================================================
+--// VISUAL FOLDER
+--// =========================================================
+
+local oldFolder =
+    CoreGui:FindFirstChild("StableNPCHitboxVisuals")
+
+if oldFolder then
+    oldFolder:Destroy()
+end
+
+
+local VisualFolder = Instance.new("Folder")
+VisualFolder.Name = "StableNPCHitboxVisuals"
+VisualFolder.Parent = CoreGui
+
+
+--// =========================================================
+--// UI
+--// =========================================================
+
+local GUI = Instance.new("ScreenGui")
+GUI.Name = "StableNPCHitboxUI"
+GUI.ResetOnSpawn = false
+GUI.Parent = CoreGui
+
+
+local Frame = Instance.new("Frame")
+Frame.Size = UDim2.new(0, 235, 0, 90)
+Frame.Position = UDim2.new(0, 10, 0, 10)
+
+Frame.BackgroundColor3 =
+    Color3.fromRGB(12, 14, 18)
+
+Frame.BackgroundTransparency = 0.15
+Frame.BorderSizePixel = 0
+Frame.Parent = GUI
+
+
+local Corner = Instance.new("UICorner")
+Corner.CornerRadius = UDim.new(0, 8)
+Corner.Parent = Frame
+
+
+local Stroke = Instance.new("UIStroke")
+Stroke.Color = Color3.fromRGB(70, 230, 140)
+Stroke.Transparency = 0.4
+Stroke.Thickness = 1
+Stroke.Parent = Frame
+
+
+local Status = Instance.new("TextLabel")
+Status.Size = UDim2.new(1, -14, 1, -10)
+Status.Position = UDim2.new(0, 7, 0, 5)
+
+Status.BackgroundTransparency = 1
+
+Status.Font = Enum.Font.GothamMedium
+Status.TextSize = 12
+
+Status.TextColor3 =
+    Color3.fromRGB(255, 255, 255)
+
+Status.TextXAlignment =
+    Enum.TextXAlignment.Left
+
+Status.TextYAlignment =
+    Enum.TextYAlignment.Top
+
+Status.Parent = Frame
+
+
+--// =========================================================
+--// HELPERS
+--// =========================================================
+
+local function IsPlayerCharacter(model)
+
+    return model
+        and Players:GetPlayerFromCharacter(model) ~= nil
+end
+
+
+local function GetHumanoid(model)
+
+    if not model then
+        return nil
+    end
+
+    return model:FindFirstChildWhichIsA("Humanoid")
+end
+
+
+local function GetRoot(model)
+
+    if not model then
+        return nil
+    end
+
+
+    local root =
+        model:FindFirstChild("HumanoidRootPart")
+
+    if root and root:IsA("BasePart") then
+        return root
+    end
+
+
+    return nil
+end
+
+
+--// =========================================================
+--// NPC SCAN
+--// =========================================================
+
+local function ScanNPCs()
+
+    local found = {}
+
+    local myCharacter =
+        LocalPlayer.Character
+
+
+    for _, object in ipairs(
+        workspace:GetDescendants()
+    ) do
+
+        if object:IsA("Model")
+            and object ~= myCharacter
+            and not IsPlayerCharacter(object)
+        then
+
+            local humanoid =
+                GetHumanoid(object)
+
+            local root =
+                GetRoot(object)
+
+
+            if humanoid
+                and root
+                and humanoid.Health > 0
+            then
+
+                table.insert(found, object)
+            end
+        end
+    end
+
+
+    NPCs = found
+    NPCCount = #found
+end
+
+
+--// =========================================================
+--// SAVE ORIGINAL
+--// =========================================================
+
+local function SaveOriginal(part)
+
+    if Modified[part] then
+        return
+    end
+
+
+    Modified[part] = {
+        Size = part.Size,
+
+        CanCollide =
+            part.CanCollide,
+
+        CanTouch =
+            part.CanTouch,
+
+        CanQuery =
+            part.CanQuery
+    }
+end
+
+
+--// =========================================================
+--// ESP
+--// =========================================================
+
+local function RemoveESP(npc)
+
+    local visual = Visuals[npc]
+
+    if visual then
+
+        pcall(function()
+            visual:Destroy()
+        end)
+
+        Visuals[npc] = nil
+    end
+end
+
+
+local function UpdateESP(npc, root)
+
+    if not Config.ESP then
+        RemoveESP(npc)
+        return
+    end
+
+
+    local visual =
+        Visuals[npc]
+
+
+    if not visual then
+
+        visual =
+            Instance.new("BoxHandleAdornment")
+
+        visual.Name =
+            "NPCHitboxESP"
+
+        visual.AlwaysOnTop =
+            true
+
+        visual.ZIndex =
+            5
+
+        visual.Color3 =
+            Color3.fromRGB(
+                70,
+                230,
+                140
+            )
+
+        visual.Transparency =
+            Config.ESPTransparency
+
+        visual.Parent =
+            VisualFolder
+
+
+        Visuals[npc] =
+            visual
+    end
+
+
+    visual.Adornee = root
+
+    visual.Size =
+        Config.HitboxSize
+
+    visual.Transparency =
+        Config.ESPTransparency
+end
+
+
+--// =========================================================
+--// APPLY HITBOX
+--// =========================================================
+
+local function ApplyHitbox(npc)
+
+    local root =
+        GetRoot(npc)
+
+
+    if not root then
+        return false
+    end
+
+
+    SaveOriginal(root)
+
+
+    -- Only write properties if needed.
+    -- This avoids constantly fighting the NPC physics.
+    pcall(function()
+
+        if root.Size ~= Config.HitboxSize then
+            root.Size = Config.HitboxSize
+        end
+
+
+        if root.CanCollide ~= false then
+            root.CanCollide = false
+        end
+
+
+        if root.CanTouch ~= true then
+            root.CanTouch = true
+        end
+
+
+        if root.CanQuery ~= true then
+            root.CanQuery = true
+        end
+
+    end)
+
+
+    UpdateESP(
+        npc,
+        root
+    )
+
+
+    return true
+end
+
+
+--// =========================================================
+--// RESTORE
+--// =========================================================
+
+local function RestorePart(part)
+
+    local original =
+        Modified[part]
+
+
+    if not original then
+        return
+    end
+
+
+    if part.Parent then
+
+        pcall(function()
+
+            part.Size =
+                original.Size
+
+            part.CanCollide =
+                original.CanCollide
+
+            part.CanTouch =
+                original.CanTouch
+
+            part.CanQuery =
+                original.CanQuery
+
+        end)
+    end
+
+
+    Modified[part] =
+        nil
+end
+
+
+--// =========================================================
+--// INITIAL SCAN
+--// =========================================================
+
+ScanNPCs()
+
+
+--// =========================================================
+--// MAIN LOOP
+--// =========================================================
+
+task.spawn(function()
+
+    while Config.Enabled do
+
+        local now = tick()
+
+
+        -- Find newly spawned NPCs
+        if now - LastScan
+            >= Config.ScanDelay
+        then
+
+            ScanNPCs()
+
+            LastScan = now
+        end
+
+
+        ActiveCount = 0
+
+
+        -- IMPORTANT:
+        -- Don't change hitboxes every Heartbeat.
+        --
+        -- Only verify roughly once per second.
+        if now - LastVerify
+            >= Config.VerifyDelay
+        then
+
+
+            for _, npc in ipairs(NPCs) do
+
+                if npc
+                    and npc.Parent
+                    and not IsPlayerCharacter(npc)
+                then
+
+                    local humanoid =
+                        GetHumanoid(npc)
+
+                    local root =
+                        GetRoot(npc)
+
+
+                    if humanoid
+                        and humanoid.Health > 0
+                        and root
+                    then
+
+
+                        if ApplyHitbox(npc) then
+
+                            ActiveCount += 1
+
+                        end
+                    end
+                end
+            end
+
+
+            LastVerify = now
+        else
+
+            -- Count only without rewriting physics
+            for _, npc in ipairs(NPCs) do
+
+                local humanoid =
+                    npc
+                    and GetHumanoid(npc)
+
+                local root =
+                    npc
+                    and GetRoot(npc)
+
+
+                if npc
+                    and npc.Parent
+                    and humanoid
+                    and humanoid.Health > 0
+                    and root
+                then
+
+                    ActiveCount += 1
+
+                    -- ESP can follow automatically
+                    -- because it is attached to root.
+                end
+            end
+        end
+
+
+        -- Cleanup destroyed / dead NPCs
+        for part in pairs(Modified) do
+
+            if not part.Parent then
+
+                Modified[part] =
+                    nil
+
+            else
+
+                local npc =
+                    part:FindFirstAncestorWhichIsA(
+                        "Model"
+                    )
+
+
+                local humanoid =
+                    npc
+                    and GetHumanoid(npc)
+
+
+                if not npc
+                    or IsPlayerCharacter(npc)
+                    or not humanoid
+                    or humanoid.Health <= 0
+                then
+
+
+                    if npc then
+                        RemoveESP(npc)
+                    end
+
+
+                    RestorePart(part)
+
+                end
+            end
+        end
+
+
+        for npc in pairs(Visuals) do
+
+            if not npc.Parent
+                or IsPlayerCharacter(npc)
+            then
+
+                RemoveESP(npc)
+            end
+        end
+
+
+        Status.Text =
+            "NPC HITBOX: STABLE MODE\n"
+            ..
+            "NPCs: "
+            ..
+            tostring(NPCCount)
+            ..
+            " | Active: "
+            ..
+            tostring(ActiveCount)
+            ..
+            "\nHitbox: 8 x 6 x 8"
+            ..
+            "\nESP: 94% transparent"
+
+
+        RunService.Heartbeat:Wait()
+    end
+
+
+    -- Restore original NPC parts
+    for part in pairs(Modified) do
+        RestorePart(part)
+    end
+
+
+    for npc in pairs(Visuals) do
+        RemoveESP(npc)
+    end
+
+
+    pcall(function()
+        GUI:Destroy()
+    end)
+
+
+    pcall(function()
+        VisualFolder:Destroy()
+    end)
+
+end)
