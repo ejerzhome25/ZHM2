@@ -2,12 +2,65 @@
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
+local ProximityPromptService = game:GetService("ProximityPromptService")
 local CoreGui = game:GetService("CoreGui")
 local UserInputService = game:GetService("UserInputService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
+
+-- LIVE INSTANT PROXIMITY
+-- Forces every existing/new ProximityPrompt to have zero hold time,
+-- and continuously reapplies it in case the game changes it back.
+local liveInstantPrompts = setmetatable({}, { __mode = "k" })
+
+local function makePromptInstant(prompt)
+    if not prompt or not prompt:IsA("ProximityPrompt") then return end
+    liveInstantPrompts[prompt] = true
+
+    pcall(function()
+        prompt.HoldDuration = 0
+    end)
+end
+
+-- Apply instantly to every prompt that already exists.
+for _, obj in ipairs(Workspace:GetDescendants()) do
+    if obj:IsA("ProximityPrompt") then
+        makePromptInstant(obj)
+    end
+end
+
+-- Apply instantly to prompts created later.
+Workspace.DescendantAdded:Connect(function(obj)
+    if obj:IsA("ProximityPrompt") then
+        makePromptInstant(obj)
+    end
+end)
+
+Workspace.DescendantRemoving:Connect(function(obj)
+    liveInstantPrompts[obj] = nil
+end)
+
+-- Also catch prompts the moment Roblox shows them.
+ProximityPromptService.PromptShown:Connect(function(prompt)
+    makePromptInstant(prompt)
+end)
+
+-- Live enforcement: if the game restores HoldDuration, set it back to 0.
+RunService.Heartbeat:Connect(function()
+    for prompt in pairs(liveInstantPrompts) do
+        if prompt and prompt.Parent then
+            if prompt.HoldDuration ~= 0 then
+                pcall(function()
+                    prompt.HoldDuration = 0
+                end)
+            end
+        else
+            liveInstantPrompts[prompt] = nil
+        end
+    end
+end)
 
 --------------------------------------------------------------------------------
 -- ZHM HUB - SHARED UI / COMPATIBILITY HELPERS
@@ -499,8 +552,8 @@ local function startAutoWalk()
                             report("AutoWalk", "TP to DisplayRack...")
                             if teleportToPosition(displayPos + Vector3.new(0, 2.5, 0))
                                 and running("ZHM_AutoWalk") then
-                                -- Stay at the DisplayRack for exactly 10 seconds.
-                                task.wait(10)
+                                -- Stay at the DisplayRack for exactly 15 seconds.
+                                task.wait(15)
 
                                 -- After DisplayRack, TP to the Dough PrepTable before
                                 -- resetting the rack route and starting the next loop.
@@ -550,7 +603,7 @@ local function startAutoWalk()
                         end
 
                         -- Full route repeats:
-                        -- BakingRacks -> DisplayRack (10s) -> Dough PrepTable -> Cashier
+                        -- BakingRacks -> DisplayRack (15s) -> Dough PrepTable -> Cashier
                         -- -> Rolling Pin swing -> BakingRacks...
                         visitedRacks = {}
                     end
