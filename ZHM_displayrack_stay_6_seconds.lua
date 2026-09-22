@@ -122,6 +122,9 @@ ENV.ZHM_AutoUpgrade = false
 local TP_DELAY = 1 -- 1 second between movement teleports.
 if ENV.ZHM_AutoNearestPrompt == nil then ENV.ZHM_AutoNearestPrompt = false end -- Day default; night controller enables it automatically.
 if ENV.ZHM_SpamDisplayRackPrompts == nil then ENV.ZHM_SpamDisplayRackPrompts = true end -- Spam all prompts around DisplayRack while standing near it.
+if ENV.ZHM_BakingRackScanner == nil then ENV.ZHM_BakingRackScanner = true end -- Live BakingRack detector/status scanner.
+if ENV.ZHM_ExpandBakingRackPrompts == nil then ENV.ZHM_ExpandBakingRackPrompts = true end -- Expand only BakingRack interactions.
+ENV.ZHM_BakingRackStatus = ENV.ZHM_BakingRackStatus or "Scanning BakingRacks..."
 -- Combined side-job modules. Defaults preserve the two standalone scripts.
 if ENV.ZHM_AutoSweep == nil then ENV.ZHM_AutoSweep = true end
 ENV.ZHM_NPCAutoTP = false -- Auto TP removed; scanner is used only for Rolling Pin swing.
@@ -1361,6 +1364,176 @@ local function nearestBakingRackAncestor(obj, stopAt)
     end
     return nil
 end
+
+--------------------------------------------------------------------------------
+-- BAKINGRACK LIVE SCANNER + TARGETED CLICKABLE PROMPT EXPANDER
+-- Scans only the player's own BakingRacks. It does NOT expand unrelated prompts.
+-- Kept inside one spawned function to avoid adding long-lived locals to the main hub.
+--------------------------------------------------------------------------------
+task.spawn(function()
+    local PROMPT_DISTANCE = 1000
+    local ASSOCIATION_RADIUS = 12
+    local SCAN_INTERVAL = 0.20
+
+    local function getRackForInteraction(interaction, plot, rackInfos)
+        if not interaction or not interaction.Parent or not plot then return nil end
+
+        -- Best case: the prompt/click detector is parented under a BakingRack.
+        local rack = nearestBakingRackAncestor(interaction, plot.Parent)
+        if rack then return rack end
+
+        -- Compatibility fallback: some builds put the interaction beside the rack.
+        local interactionPart = getNearestInteractionPart(interaction)
+        if not interactionPart then return nil end
+
+        local closestRack = nil
+        local closestDistance = ASSOCIATION_RADIUS
+
+        for _, rackInfo in ipairs(rackInfos or {}) do
+            local rackPart = rackInfo.part
+            if rackPart and rackPart.Parent then
+                local distance = (interactionPart.Position - rackPart.Position).Magnitude
+                if distance <= closestDistance then
+                    closestDistance = distance
+                    closestRack = rackInfo.instance
+                end
+            end
+        end
+
+        return closestRack
+    end
+
+    local function expandInteraction(interaction)
+        if ENV.ZHM_ExpandBakingRackPrompts ~= true then return false end
+        if not interaction or not interaction.Parent then return false end
+
+        if interaction:IsA("ProximityPrompt") then
+            pcall(function() interaction.HoldDuration = 0 end)
+            pcall(function() interaction.RequiresLineOfSight = false end)
+            pcall(function() interaction.ClickablePrompt = true end)
+            pcall(function()
+                interaction.MaxActivationDistance = math.max(
+                    tonumber(interaction.MaxActivationDistance) or 0,
+                    PROMPT_DISTANCE
+                )
+            end)
+            return true
+        end
+
+        if interaction:IsA("ClickDetector") then
+            pcall(function()
+                interaction.MaxActivationDistance = math.max(
+                    tonumber(interaction.MaxActivationDistance) or 0,
+                    PROMPT_DISTANCE
+                )
+            end)
+            return true
+        end
+
+        return false
+    end
+
+    local function scanOnce()
+        if ENV.ZHM_BakingRackScanner ~= true then
+            ENV.ZHM_BakingRackStatus = "BakingRack scanner disabled"
+            return
+        end
+
+        local plot = findMyPlot()
+        if not plot then
+            ENV.ZHM_BakingRackStatus = "Waiting for your bakery plot..."
+            return
+        end
+
+        local rackInfos = getAllBakingRacks(plot)
+        local rackSet = {}
+        for _, info in ipairs(rackInfos) do
+            if info.instance then rackSet[info.instance] = true end
+        end
+
+        local proximityCount = 0
+        local clickCount = 0
+        local enabledPromptCount = 0
+        local expandedCount = 0
+        local seenInteractions = setmetatable({}, { __mode = "k" })
+
+        -- Scan the plot for interactions that belong to / sit directly beside a BakingRack.
+        for _, obj in ipairs(plot:GetDescendants()) do
+            if obj:IsA("ProximityPrompt") or obj:IsA("ClickDetector") then
+                local rack = getRackForInteraction(obj, plot, rackInfos)
+                if rack and rackSet[rack] and not seenInteractions[obj] then
+                    seenInteractions[obj] = true
+
+                    if obj:IsA("ProximityPrompt") then
+                        proximityCount += 1
+                        if obj.Enabled then enabledPromptCount += 1 end
+                    else
+                        clickCount += 1
+                    end
+
+                    if expandInteraction(obj) then expandedCount += 1 end
+                end
+            end
+        end
+
+        -- Extra pass through each rack for streamed descendants added between scans.
+        for _, info in ipairs(rackInfos) do
+            local rack = info.instance
+            if rack and rack.Parent then
+                for _, obj in ipairs(rack:GetDescendants()) do
+                    if (obj:IsA("ProximityPrompt") or obj:IsA("ClickDetector"))
+                        and not seenInteractions[obj] then
+                        seenInteractions[obj] = true
+
+                        if obj:IsA("ProximityPrompt") then
+                            proximityCount += 1
+                            if obj.Enabled then enabledPromptCount += 1 end
+                        else
+                            clickCount += 1
+                        end
+
+                        if expandInteraction(obj) then expandedCount += 1 end
+                    end
+                end
+            end
+        end
+
+        local nearestDistanceText = "N/A"
+        local rootPart = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+        if rootPart and #rackInfos > 0 then
+            local nearestDistance = math.huge
+            for _, info in ipairs(rackInfos) do
+                if info.part and info.part.Parent then
+                    nearestDistance = math.min(nearestDistance, (rootPart.Position - info.part.Position).Magnitude)
+                end
+            end
+            if nearestDistance < math.huge then
+                nearestDistanceText = string.format("%.1f studs", nearestDistance)
+            end
+        end
+
+        local rangeText = ENV.ZHM_ExpandBakingRackPrompts == true
+            and (tostring(PROMPT_DISTANCE) .. " studs")
+            or "Normal"
+
+        ENV.ZHM_BakingRackStatus =
+            "Racks: " .. tostring(#rackInfos)
+            .. " | Prompts: " .. tostring(proximityCount)
+            .. " | Clicks: " .. tostring(clickCount)
+            .. "\nEnabled prompts: " .. tostring(enabledPromptCount)
+            .. " | Expanded: " .. tostring(expandedCount)
+            .. "\nNearest rack: " .. nearestDistanceText
+            .. " | Range: " .. rangeText
+    end
+
+    while isCurrent() do
+        local ok, err = pcall(scanOnce)
+        if not ok then
+            ENV.ZHM_BakingRackStatus = "Scanner error: " .. tostring(err)
+        end
+        task.wait(SCAN_INTERVAL)
+    end
+end)
 
 local function collectEquipmentPrompts()
     local plot = findMyPlot()
@@ -3148,6 +3321,8 @@ for _, featureKey in ipairs({
     "ZHM_HidePopups",
     "ZHM_AutoSweep",
     "ZHM_NPCAutoSwing",
+    "ZHM_BakingRackScanner",
+    "ZHM_ExpandBakingRackPrompts",
 }) do
     ENV[featureKey] = true
 end
@@ -3500,7 +3675,12 @@ end, 66)
 
 createSection(movePage, "Movement")
 local rackMovementToggle = createToggle(movePage, "Auto Rack Movement", "Instant TP between baking racks and display rack", "ZHM_AutoWalk", true)
+createToggle(movePage, "BakingRack Scanner", "Live scan racks, prompts and click detectors", "ZHM_BakingRackScanner", true)
+createToggle(movePage, "Expand BakingRack Prompts", "1000-stud range • clickable • no line-of-sight • instant hold", "ZHM_ExpandBakingRackPrompts", true)
 local autoNearestPromptToggle = createToggle(movePage, "Instant Proximity (Night Auto)", "Automatically ON at night • OFF during day", "ZHM_AutoNearestPrompt", false)
+createInfoCard(movePage, "BakingRack Live Scanner", function()
+    return tostring(ENV.ZHM_BakingRackStatus or "Scanning BakingRacks...")
+end, 76)
 createInfoCard(movePage, "Live Movement", function()
     if ENV.ZHM_SweepActive then
         return "Sweep active • rack paused • instant prompts ACTIVE"
