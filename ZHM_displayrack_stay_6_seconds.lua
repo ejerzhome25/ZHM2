@@ -1169,7 +1169,7 @@ local bakeAllBreads
 
 do
 --------------------------------------------------------------------------------
--- AUTO BAKE V4 - CONTINUOUS AVAILABLE-BREAD SELECT / BAKE LOOP
+-- AUTO BAKE V5 - ACTION-LOG LOOP (PROMPT -> SELECT -> BAKE -> REPEAT)
 --
 -- New game structure observed:
 --   StarterPlayerScripts.Client.Controllers.BakeSelectController
@@ -1681,6 +1681,53 @@ local function openBakeMenu(plot)
     return frame, list
 end
 
+local function reopenBakeMenuFromPrompt(plot)
+    -- Match the captured action logs exactly:
+    -- BakePrompt -> Select row(s) -> Bake -> then BakePrompt again.
+    local frame = getBakeFrame()
+
+    -- Restore/move any previous logical BakeSelect frame before reopening.
+    if frame and ENV.ZHM_SilentBakeUI == true then
+        setSilentBakeUI(frame, true)
+    end
+
+    local prompt = findBakePrompt(plot)
+    if not prompt then
+        report("Bake", "BakePrompt not found on your current plot.")
+        return nil, nil
+    end
+
+    if not fireBakePromptRobust(prompt) then
+        report("Bake", "BakePrompt could not be fired.")
+        return nil, nil
+    end
+
+    local opened = waitUntil(function()
+        local currentFrame, currentList = getBakeScrollingFrame()
+        return currentFrame
+            and currentList
+            and guiHierarchyVisible(currentFrame)
+    end, 1.25, 0.025)
+
+    if not opened then
+        report("Bake", "BakeSelect menu did not open after BakePrompt.")
+        return nil, nil
+    end
+
+    local currentFrame, currentList = getBakeScrollingFrame()
+
+    if currentFrame and ENV.ZHM_SilentBakeUI == true then
+        setSilentBakeUI(currentFrame, true)
+    end
+
+    -- Wait for at least one selectable numbered row.
+    waitUntil(function()
+        return #getSelectableBakeRows(currentList) > 0
+    end, 0.75, 0.025)
+
+    return currentFrame, currentList
+end
+
 local function runAutoBakeCycle()
     if not farming("ZHM_AutoBake") then
         return
@@ -1699,37 +1746,33 @@ local function runAutoBakeCycle()
         bakeState.ControllerStatusReported = true
     end
 
-    -- One worker stays alive while there are immediately available bread stacks.
-    -- After every successful Bake press it reopens/rescans the live BakeSelect list,
-    -- so newly available rows are selected on the next pass automatically.
-    local localBatchCount = 0
+    local completedInWorker = 0
 
     while farming("ZHM_AutoBake") and isCurrent() do
-        local frame, list = openBakeMenu(plot)
+        -- ACTION LOG STEP 1:
+        -- Fire Oven BakePrompt every single cycle.
+        local frame, list = reopenBakeMenuFromPrompt(plot)
 
         if not frame or not list or not farming("ZHM_AutoBake") then
             bakeState.NextAttempt = os.clock() + 0.20
             return
         end
 
+        -- ACTION LOG STEP 2:
+        -- Read the current numbered rows and select the first 3 that exist.
+        -- No persistent "already selected" memory is used. If the game shows the
+        -- same row IDs again in a later cycle, they may be selected again.
         local rows = getSelectableBakeRows(list)
 
         if #rows == 0 then
-            -- Nothing ready right now. Yield the worker and let the main automation
-            -- call us again shortly, which makes this an ongoing Auto Bake loop.
-            report("Bake", "No selectable bread is ready; live scan will retry.")
-            bakeState.LastBatchSignature = ""
+            report("Bake", "BakePrompt opened, but no selectable bread rows are available.")
             bakeState.NextAttempt = os.clock() + 0.20
             return
         end
 
-        -- The current BakeSelect flow uses three selection slots. If fewer than
-        -- three are available, bake the smaller final batch instead of waiting.
         local batchCount = math.min(3, #rows)
         local signature = makeBakeSignature(rows, batchCount)
-
         local selected = 0
-        local selectedButtons = {}
 
         for i = 1, batchCount do
             if not farming("ZHM_AutoBake") then
@@ -1745,25 +1788,25 @@ local function runAutoBakeCycle()
 
                 if triggerBakeGuiButton(entry.Button, "BakeSelect") then
                     selected += 1
-                    selectedButtons[#selectedButtons + 1] = entry.Button
 
-                    -- Give BakeSelectController one frame-sized window to register
-                    -- the selection before clicking the next available bread.
+                    -- Logs show sequential Select presses before Bake.
                     task.wait(0.05)
                 end
             end
         end
 
         if selected <= 0 then
-            report("Bake", "Available bread rows were found, but Select callbacks did not fire.")
+            report("Bake", "Select callbacks did not fire for current bread rows.")
             bakeState.NextAttempt = os.clock() + 0.25
             return
         end
 
+        -- ACTION LOG STEP 3:
+        -- Press StackTemplate.Main_Frame.Buttons.Bake.
         local finalBake = findFinalBakeButton(list)
 
         if not finalBake then
-            report("Bake", "Bake button not found after selecting " .. tostring(selected) .. " bread(s).")
+            report("Bake", "Bake button not found after selecting bread.")
             bakeState.NextAttempt = os.clock() + 0.25
             return
         end
@@ -1774,63 +1817,46 @@ local function runAutoBakeCycle()
             return
         end
 
-        localBatchCount += 1
         bakeState.BatchCounter += 1
         bakeState.LastBatchSignature = signature
         bakeState.LastBatchTime = os.clock()
+        completedInWorker += 1
 
         report(
             "Bake",
-            "Continuous batch #" .. tostring(bakeState.BatchCounter)
-                .. " sent: " .. tostring(selected)
-                .. " bread(s) [" .. signature .. "]"
+            "Action-log batch #" .. tostring(bakeState.BatchCounter)
+                .. " • selected " .. tostring(selected)
+                .. " row(s) [" .. signature .. "] • Bake pressed."
         )
 
-        -- Wait until the game's own controller gives us evidence that it consumed
-        -- the batch. We intentionally do not decode or forge the Packet buffer.
-        local consumed = waitUntil(function()
+        -- ACTION LOG STEP 4:
+        -- Wait for the current BakeSelect interaction to be consumed/refresh.
+        -- Then the loop starts again from BakePrompt.
+        waitUntil(function()
             local currentFrame, currentList = getBakeScrollingFrame()
 
-            -- Closing/replacing the BakeSelect UI means the request was consumed.
-            if not currentFrame
-                or not currentList
-                or not guiHierarchyVisible(currentFrame) then
+            if not currentFrame or not currentList then
                 return true
             end
 
-            -- If any selected button disappeared / became unavailable, the live
-            -- selection state changed and we can safely rescan.
-            for _, button in ipairs(selectedButtons) do
-                if not bakeSelectButtonUsable(button) then
-                    return true
-                end
+            if not guiHierarchyVisible(currentFrame) then
+                return true
             end
 
             local currentRows = getSelectableBakeRows(currentList)
-            if #currentRows == 0 then
-                return true
-            end
-
             local currentSignature = makeBakeSignature(
                 currentRows,
                 math.min(3, #currentRows)
             )
 
-            return currentSignature ~= signature
+            return #currentRows == 0 or currentSignature ~= signature
         end, 1.35, 0.04)
 
-        if consumed then
-            -- Fast path: controller/UI changed, so immediately scan the next batch.
-            task.wait(0.10)
-        else
-            -- Some versions leave the same row objects on-screen briefly even after
-            -- the server accepted the packet. Avoid hammering the same batch.
-            task.wait(0.45)
-        end
+        -- Small controller settle delay, then immediately repeat from BakePrompt.
+        task.wait(0.12)
 
-        -- Safety yield: if a huge queue exists, periodically return control to the
-        -- scheduler so the other farm modules cannot be starved.
-        if localBatchCount >= 12 then
+        -- Yield occasionally so the other automation modules stay responsive.
+        if completedInWorker >= 12 then
             bakeState.NextAttempt = os.clock() + 0.05
             return
         end
