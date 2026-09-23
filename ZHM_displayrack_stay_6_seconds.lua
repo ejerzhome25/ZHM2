@@ -127,7 +127,7 @@ if ENV.ZHM_ExpandBakingRackPrompts == nil then ENV.ZHM_ExpandBakingRackPrompts =
 ENV.ZHM_BakingRackStatus = ENV.ZHM_BakingRackStatus or "Scanning BakingRacks..."
 -- Combined side-job modules. Defaults preserve the two standalone scripts.
 if ENV.ZHM_AutoSweep == nil then ENV.ZHM_AutoSweep = true end
-ENV.ZHM_NPCAutoTP = false -- Auto TP removed; scanner is used only for Rolling Pin swing.
+if ENV.ZHM_NPCAutoTP == nil then ENV.ZHM_NPCAutoTP = true end -- Auto TP to live Customer.Head.RunawayExclam targets.
 if ENV.ZHM_NPCAutoSwing == nil then ENV.ZHM_NPCAutoSwing = true end
 ENV.ZHM_SweepActive = false
 ENV.ZHM_NPCBusy = false
@@ -358,14 +358,31 @@ local function running(key)
         return false
     end
 
-    -- NPC scanner never owns movement in swing-only mode.
-    -- Rack movement remains independent because NPC teleporting has been removed.
+    -- NPC Auto TP temporarily owns character movement while a valid running Customer
+    -- target is active. Pause only the rack-route movement so it cannot instantly
+    -- teleport the player away from the detected NPC. Other non-movement jobs continue.
+    if key == "ZHM_AutoWalk" and ENV.ZHM_NPCBusy == true then
+        return false
+    end
 
     return true
 end
 
 local function farming(key)
-    return running("ZHM_AutoFarm") and ENV[key] == true
+    if not isCurrent() or ENV.ZHM_AutoFarm ~= true or ENV[key] ~= true then
+        return false
+    end
+
+    -- Keep the two non-movement delivery jobs alive even while Night Auto Sweep
+    -- temporarily owns character movement. This prevents Collect / Give Order
+    -- from dying in the middle of a night cycle. Other bakery jobs still pause.
+    if ENV.ZHM_SweepActive == true then
+        return key == "ZHM_AutoCollect"
+            or key == "ZHM_AutoCollectTip"
+            or key == "ZHM_AutoGiveOrder"
+    end
+
+    return true
 end
 
 local notices = {}
@@ -910,8 +927,26 @@ local function firePromptSafe(prompt, feature)
         report(feature, "fireproximityprompt unavailable.")
         return false
     end
-    fireproximityprompt(prompt)
-    return true
+
+    pcall(function() prompt.HoldDuration = 0 end)
+    pcall(function() prompt.RequiresLineOfSight = false end)
+    pcall(function() prompt.ClickablePrompt = true end)
+    pcall(function()
+        prompt.MaxActivationDistance = math.max(
+            tonumber(prompt.MaxActivationDistance) or 0,
+            100000
+        )
+    end)
+
+    -- Executors differ on which fireproximityprompt signature they support.
+    local ok = pcall(function() fireproximityprompt(prompt, 0, true) end)
+    if not ok then
+        ok = pcall(function() fireproximityprompt(prompt, 0) end)
+    end
+    if not ok then
+        ok = pcall(function() fireproximityprompt(prompt) end)
+    end
+    return ok
 end
 
 --------------------------------------------------------------------------------
@@ -1944,17 +1979,27 @@ local function isGiveOrderPrompt(prompt)
     local name = string.lower(prompt.Name or "")
     local action = string.lower(tostring(prompt.ActionText or ""))
     local objectText = string.lower(tostring(prompt.ObjectText or ""))
+    local compactAction = action:gsub("[%s_%-]+", "")
+    local compactName = name:gsub("[%s_%-]+", "")
 
-    return action == "give order"
-        or action:find("give order", 1, true) ~= nil
-        or action == "deliver"
-        or action:find("deliver order", 1, true) ~= nil
-        or name == "rackdeliverprompt"
-        or name == "deliverprompt"
-        or name == "giveorderprompt"
-        or name:find("giveorder", 1, true) ~= nil
-        or name:find("deliver", 1, true) ~= nil
-        or objectText:find("give order", 1, true) ~= nil
+    local orderAction = action:find("give order", 1, true) ~= nil
+        or action:find("deliver", 1, true) ~= nil
+        or action:find("serve", 1, true) ~= nil
+        or action:find("hand order", 1, true) ~= nil
+        or compactAction:find("giveorder", 1, true) ~= nil
+        or compactAction:find("deliverorder", 1, true) ~= nil
+
+    local orderName = compactName == "rackdeliverprompt"
+        or compactName == "deliverprompt"
+        or compactName == "giveorderprompt"
+        or compactName:find("giveorder", 1, true) ~= nil
+        or compactName:find("deliver", 1, true) ~= nil
+
+    local orderText = objectText:find("give order", 1, true) ~= nil
+        or objectText:find("customer order", 1, true) ~= nil
+        or objectText:find("order", 1, true) ~= nil and (orderAction or orderName)
+
+    return orderAction or orderName or orderText
 end
 
 local function fireGiveOrderPrompt(prompt)
@@ -1968,20 +2013,19 @@ local function fireGiveOrderPrompt(prompt)
         return false
     end
 
-    -- Make the delivery prompt easy to trigger when the rack route reaches it.
+    -- Delivery prompts are frequently recreated mid-game, so configure the live
+    -- instance every time and use the same robust firing path as other prompts.
     pcall(function() prompt.HoldDuration = 0 end)
     pcall(function() prompt.RequiresLineOfSight = false end)
-    pcall(function() prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, 35) end)
-
-    local ok = pcall(function()
-        fireproximityprompt(prompt, 0)
+    pcall(function() prompt.ClickablePrompt = true end)
+    pcall(function()
+        prompt.MaxActivationDistance = math.max(
+            tonumber(prompt.MaxActivationDistance) or 0,
+            100000
+        )
     end)
-    if not ok then
-        ok = pcall(function()
-            fireproximityprompt(prompt)
-        end)
-    end
-    return ok
+
+    return firePromptSafe(prompt, "GiveOrder")
 end
 
 local giveOrderCache = {}
@@ -2003,7 +2047,8 @@ local function getGiveOrderPrompts(plot)
 
     if needScan then
         giveOrderCachePlot = plot
-        giveOrderNextScan = now + 0.20
+        -- Re-scan quickly because the game can replace / retask delivery prompts mid-game.
+        giveOrderNextScan = now + 0.05
         giveOrderCache = {}
 
         if plot then
@@ -2205,18 +2250,26 @@ local function isRackCollectPrompt(prompt)
 
     local name = string.lower(prompt.Name or "")
     local action = string.lower(tostring(prompt.ActionText or ""))
+    local objectText = string.lower(tostring(prompt.ObjectText or ""))
+    local compactName = name:gsub("[%s_%-]+", "")
+    local compactAction = action:gsub("[%s_%-]+", "")
 
     if name == "bakeprompt" or name == "cashierprompt" or isGiveOrderPrompt(prompt) then
         return false
     end
 
-    return name == "pickupllaneraprompt"
-        or name == "displayrackprompt"
-        or name:find("collect", 1, true) ~= nil
-        or name:find("pickup", 1, true) ~= nil
-        or action == "collect"
-        or action:find("collect", 1, true) ~= nil
-        or action:find("pickup", 1, true) ~= nil
+    return compactName == "pickupllaneraprompt"
+        or compactName == "displayrackprompt"
+        or compactName:find("collect", 1, true) ~= nil
+        or compactName:find("pickup", 1, true) ~= nil
+        or compactName:find("take", 1, true) ~= nil
+        or compactAction == "collect"
+        or compactAction:find("collect", 1, true) ~= nil
+        or compactAction:find("pickup", 1, true) ~= nil
+        or compactAction:find("take", 1, true) ~= nil
+        or action:find("grab", 1, true) ~= nil
+        or (objectText:find("bread", 1, true) ~= nil and action ~= "bake")
+        or (objectText:find("tray", 1, true) ~= nil and (action:find("take", 1, true) or action:find("collect", 1, true)))
 end
 
 local function isBakingRackObject(obj)
@@ -2423,11 +2476,11 @@ local function collectEquipmentPrompts()
 
     -- Keep the original reliable grouping behavior: collect ALL valid prompts from
     -- each BakingRack. A rack can expose more than one pickup prompt at the same time.
-    for _, obj in ipairs(equipment:GetDescendants()) do
+    for _, obj in ipairs(plot:GetDescendants()) do
         if not farming("ZHM_AutoCollect") then return end
 
         if obj:IsA("ProximityPrompt") and isRackCollectPrompt(obj) then
-            local rack = nearestBakingRackAncestor(obj, equipment.Parent)
+            local rack = nearestBakingRackAncestor(obj, plot.Parent)
 
             if rack then
                 if not rackGroups[rack] then
@@ -2504,7 +2557,7 @@ local function collectEquipmentPrompts()
                     pcall(function() prompt.HoldDuration = 0 end)
                     pcall(function() prompt.RequiresLineOfSight = false end)
                     pcall(function()
-                        prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, 40)
+                        prompt.MaxActivationDistance = math.max(tonumber(prompt.MaxActivationDistance) or 0, 100000)
                     end)
 
                     if firePromptSafe(prompt, "Collect") then
@@ -2530,7 +2583,7 @@ local function collectEquipmentPrompts()
             pcall(function() prompt.HoldDuration = 0 end)
             pcall(function() prompt.RequiresLineOfSight = false end)
             pcall(function()
-                prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, 40)
+                prompt.MaxActivationDistance = math.max(tonumber(prompt.MaxActivationDistance) or 0, 100000)
             end)
 
             if firePromptSafe(prompt, "Collect") then
@@ -3364,19 +3417,23 @@ local farmJobs = {
 }
 
 local function startAutomation()
-    task.spawn(function()
-        local nextRun = {}
-        while isCurrent() do
-            for _, job in ipairs(farmJobs) do
-                if farming(job.Key) and os.clock() >= (nextRun[job.Key] or 0) then
+    -- Run every bakery feature in its own worker. A collect scan, UI refresh, or
+    -- bake wait can no longer stall Give Order / Collect later in the round.
+    for _, definition in ipairs(farmJobs) do
+        local job = definition
+        task.spawn(function()
+            while isCurrent() do
+                if farming(job.Key) then
                     local ok, err = pcall(job.Run)
                     if not ok then report(job.Name, tostring(err)) end
-                    nextRun[job.Key] = os.clock() + job.Interval
+                    task.wait(job.Interval)
+                else
+                    task.wait(0.03)
                 end
             end
-            task.wait()
-        end
-    end)
+        end)
+    end
+
     for _, definition in ipairs({
         { Key = "ZHM_AutoBuy", Name = "Market", Run = autoBuyMarket },
         { Key = "ZHM_AutoUpgrade", Name = "Upgrade", Run = autoUpgradeBakery },
@@ -3429,21 +3486,28 @@ do
 
     local function isNight()
         local frame = getWeatherFrame()
-        if not frame then return false end
+        if frame then
+            local night = frame:FindFirstChild("Night")
+            local day = frame:FindFirstChild("Day")
 
-        local night = frame:FindFirstChild("Night")
-        local day = frame:FindFirstChild("Day")
+            if night and guiObjectActive(night) then return true end
+            if day and guiObjectActive(day) then return false end
 
-        if night and guiObjectActive(night) then return true end
-        if day and guiObjectActive(day) then return false end
-
-        for _, obj in ipairs(frame:GetDescendants()) do
-            local lower = obj.Name:lower()
-            if lower == "night" and guiObjectActive(obj) then
-                return true
-            elseif lower == "day" and guiObjectActive(obj) then
-                return false
+            for _, obj in ipairs(frame:GetDescendants()) do
+                local lower = obj.Name:lower()
+                if lower == "night" and guiObjectActive(obj) then
+                    return true
+                elseif lower == "day" and guiObjectActive(obj) then
+                    return false
+                end
             end
+        end
+
+        -- Fallback for rounds where WeatherUI is recreated or temporarily missing.
+        local lighting = game:GetService("Lighting")
+        local clockTime = tonumber(lighting.ClockTime)
+        if clockTime then
+            return clockTime >= 18 or clockTime < 6
         end
 
         return false
@@ -3487,23 +3551,42 @@ do
     end
 
     local function getSweepPrompts()
-        local root = Workspace:FindFirstChild("SideJobTrash")
-        if not root then return {} end
-
         local prompts = {}
-        for _, obj in ipairs(root:GetDescendants()) do
-            if obj:IsA("ProximityPrompt") and obj.Enabled then
-                local name = obj.Name:lower()
-                local action = tostring(obj.ActionText or ""):lower()
+        local seen = setmetatable({}, { __mode = "k" })
 
-                if name == "sweep"
-                    or name == "sweepprompt"
-                    or name:find("sweep", 1, true)
-                    or action:find("sweep", 1, true) then
-                    table.insert(prompts, obj)
+        local function scan(container)
+            if not container then return end
+            for _, obj in ipairs(container:GetDescendants()) do
+                if obj:IsA("ProximityPrompt") and obj.Enabled and not seen[obj] then
+                    local name = string.lower(obj.Name or "")
+                    local action = string.lower(tostring(obj.ActionText or ""))
+                    local objectText = string.lower(tostring(obj.ObjectText or ""))
+                    local path = ""
+                    pcall(function() path = string.lower(obj:GetFullName()) end)
+
+                    local looksLikeSweep = name == "sweep"
+                        or name == "sweepprompt"
+                        or name:find("sweep", 1, true) ~= nil
+                        or action:find("sweep", 1, true) ~= nil
+                        or (objectText:find("trash", 1, true) ~= nil and action ~= "")
+                        or path:find("sidejobtrash", 1, true) ~= nil
+
+                    if looksLikeSweep then
+                        seen[obj] = true
+                        prompts[#prompts + 1] = obj
+                    end
                 end
             end
         end
+
+        -- Fast known location first. If the game reparents trash mid-round, fall back
+        -- to a full Workspace scan so the visible "Sweep / Trash" prompt is still found.
+        local root = Workspace:FindFirstChild("SideJobTrash")
+        scan(root)
+        if #prompts == 0 then
+            scan(Workspace)
+        end
+
         return prompts
     end
 
@@ -3534,28 +3617,50 @@ do
     local function makePromptInstant(prompt)
         if not prompt then return end
         pcall(function() prompt.HoldDuration = 0 end)
-        pcall(function() prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, 15) end)
+        pcall(function() prompt.MaxActivationDistance = math.max(tonumber(prompt.MaxActivationDistance) or 0, 100000) end)
         pcall(function() prompt.RequiresLineOfSight = false end)
+        pcall(function() prompt.ClickablePrompt = true end)
     end
 
     local function fireSweepPrompt(prompt)
         if not prompt or not prompt.Parent or not prompt.Enabled then return false end
         makePromptInstant(prompt)
 
+        local fired = false
+
         if type(fireproximityprompt) == "function" then
-            -- Force an instant prompt during sweeping. Different executors support
-            -- different fireproximityprompt signatures, so try all common forms.
-            local ok = pcall(function() fireproximityprompt(prompt, 0, true) end)
-            if not ok then
-                ok = pcall(function() fireproximityprompt(prompt, 0) end)
+            -- Fire more than once because some executors report success before the
+            -- game's prompt listener is ready immediately after a teleport.
+            for _ = 1, 2 do
+                if not prompt.Parent or not prompt.Enabled then break end
+
+                local ok = pcall(function() fireproximityprompt(prompt, 0, true) end)
+                if not ok then
+                    ok = pcall(function() fireproximityprompt(prompt, 0) end)
+                end
+                if not ok then
+                    ok = pcall(function() fireproximityprompt(prompt) end)
+                end
+
+                fired = fired or ok
+                RunService.Heartbeat:Wait()
             end
-            if not ok then
-                ok = pcall(function() fireproximityprompt(prompt) end)
-            end
-            return ok
         end
 
-        return false
+        -- Input fallback for prompt systems that require the actual key event.
+        if prompt.Parent and prompt.Enabled then
+            local keyCode = prompt.KeyboardKeyCode
+            if keyCode and keyCode ~= Enum.KeyCode.Unknown then
+                local ok = pcall(function()
+                    VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+                    task.wait(0.03)
+                    VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+                end)
+                fired = fired or ok
+            end
+        end
+
+        return fired
     end
 
     task.spawn(function()
@@ -3578,13 +3683,21 @@ do
                         end
 
                         if prompt and prompt.Parent and prompt.Enabled and teleportToPrompt(prompt) then
-                            -- Fire immediately on arrival, then enforce the requested
-                            -- 1-second delay before the next sweep teleport.
+                            -- Give Roblox one rendered frame to register that the player
+                            -- is actually inside prompt range before forcing the prompt.
+                            RunService.Heartbeat:Wait()
+                            task.wait(0.03)
+
                             if SWEEP_PROMPT_FIRE_DELAY > 0 then
                                 task.wait(SWEEP_PROMPT_FIRE_DELAY)
                             end
                             if not isNight() then break end
-                            fireSweepPrompt(prompt)
+
+                            local fired = fireSweepPrompt(prompt)
+                            ENV.ZHM_SweepStatus = fired
+                                and "Sweep prompt fired"
+                                or "Sweep prompt found • firing failed"
+
                             task.wait(SWEEP_LOOP_DELAY)
                         end
                     end
@@ -3607,74 +3720,96 @@ do
 end
 
 --------------------------------------------------------------------------------
--- 6B. STRICT MOVING-NPC SCANNER (12-16 STUDS/S) + ROLLING PIN AUTO SWING (NO TP)
+-- 6B. LIVE CUSTOMER.HEAD.RUNAWAYEXCLAM SCANNER + AUTO TP + 3-SECOND ROLLING PIN SWING
 --------------------------------------------------------------------------------
 do
     local ROLLING_PIN_SLOT = "1"
     local rollingPinEquippedThisCharacter = false
     local equipInProgress = false
+    local equipActionDoneThisCharacter = false -- one successful equip/select action per character
+    local directEquipTriedThisCharacter = false -- never spam Humanoid:EquipTool
 
-    -- STRICT swing-target rules:
-    --   1) NPC only; never a player character.
-    --   2) NPC must be alive.
-    --   3) CURRENT horizontal AssemblyLinearVelocity must be 12-16 studs/s inclusive.
-    --   4) NPC must satisfy the existing local scan-area rule.
-    -- No teleporting is performed; the scanner only supplies targets to Rolling Pin swing.
-    local MIN_TARGET_SPEED = 12
-    local MAX_TARGET_SPEED = 16
-    local NPC_PLOT_SCAN_RADIUS = 20
+    -- STRICT live target rules:
+    --   1) Model name must be exactly "Customer" (case-insensitive).
+    --   2) Customer must be alive and have HumanoidRootPart + Head.
+    --   3) Head must contain a live object named exactly "RunawayExclam".
+    --   4) Customer must be within the local scan zone around OutsideWall or DisplayRack.
+    -- A valid target is teleported to automatically, then the already-equipped
+    -- Rolling Pin swings for exactly 3 seconds without touching equip/unequip state.
+    local CUSTOMER_MODEL_NAME = "customer"
+    local RUNAWAY_MARKER_NAME = "RunawayExclam"
+    local NPC_SWING_DURATION = 3.0
+    local NPC_ZONE_SCAN_RADIUS = 20 -- only around OutsideWall / DisplayRack
     local NPC_SCAN_INTERVAL = 0.08
     local NPC_SWING_INTERVAL = 0.08
     local NPC_CLICK_HOLD_TIME = 0.025
-    local NPC_SWING_MAX_DISTANCE = 30
+    local NPC_SWING_MAX_DISTANCE = 1000000000 -- target was already validated by Customer.Head.RunawayExclam
+    local NPC_TP_KEEP_DISTANCE = 3.0 -- stay close enough to hit without stacking inside the NPC
+    local NPC_TP_REPOSITION_DISTANCE = 5.0 -- re-TP only after the NPC moves away from us
+    local NPC_TP_VERTICAL_OFFSET = 0.5
 
     local cachedPlot = nil
     local cachedPlotParts = nil
     local cachedPlotPartsFor = nil
+    local cachedNPCZoneParts = nil
+    local cachedNPCZonePartsFor = nil
+    local cachedNPCZonePartsAt = 0
+    local cachedNPCZoneHasOutsideWall = false
+    local cachedNPCZoneHasDisplayRack = false
     local currentTarget = nil
 
     local function getHotbarSlot1()
         local pg = player:FindFirstChildOfClass("PlayerGui")
         if not pg then return nil end
+
+        -- Known custom/default-like backpack path used by this game.
         local backpackGui = pg:FindFirstChild("BackpackGui")
         local backpack = backpackGui and backpackGui:FindFirstChild("Backpack")
         local hotbar = backpack and backpack:FindFirstChild("Hotbar")
-        return hotbar and hotbar:FindFirstChild(ROLLING_PIN_SLOT) or nil
-    end
+        local slot = hotbar and hotbar:FindFirstChild(ROLLING_PIN_SLOT)
+        if slot then return slot end
 
-    local function findClickableGui(slot)
-        if not slot then return nil end
-        if slot:IsA("GuiButton") then return slot end
-        return slot:FindFirstChildWhichIsA("GuiButton", true)
-    end
-
-    local function fireGuiButtonOnce(button)
-        if not button or not button:IsA("GuiButton") then return false end
-
-        if type(getconnections) == "function" then
-            local fired = false
-            for _, eventName in ipairs({"Activated", "MouseButton1Click", "MouseButton1Up"}) do
-                local signal = button[eventName]
-                if signal then
-                    local ok, connections = pcall(getconnections, signal)
-                    if ok and connections then
-                        for _, connection in ipairs(connections) do
-                            if type(connection.Fire) == "function" then
-                                local success = pcall(function() connection:Fire() end)
-                                if success then fired = true end
+        -- Fallback: find a visible GuiObject named "1" whose descendants say Rolling Pin.
+        for _, obj in ipairs(pg:GetDescendants()) do
+            if obj:IsA("GuiObject") and obj.Name == ROLLING_PIN_SLOT then
+                local textFound = false
+                if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
+                    local text = string.lower(tostring(obj.Text or ""))
+                    textFound = text:find("rolling", 1, true) ~= nil and text:find("pin", 1, true) ~= nil
+                end
+                if not textFound then
+                    for _, d in ipairs(obj:GetDescendants()) do
+                        if d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox") then
+                            local text = string.lower(tostring(d.Text or ""))
+                            if text:find("rolling", 1, true) and text:find("pin", 1, true) then
+                                textFound = true
+                                break
                             end
                         end
                     end
                 end
+                if textFound then return obj end
             end
-            if fired then return true end
         end
 
-        if type(firesignal) == "function" then
-            local ok = pcall(function() firesignal(button.Activated) end)
-            if ok then return true end
+        return nil
+    end
+
+    local function slotShowsRollingPin(slot)
+        if not slot or not slot:IsA("GuiObject") then return false end
+
+        local function textMatches(obj)
+            if not (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) then
+                return false
+            end
+            local text = string.lower(tostring(obj.Text or ""))
+            return text:find("rolling", 1, true) ~= nil and text:find("pin", 1, true) ~= nil
         end
 
+        if textMatches(slot) then return true end
+        for _, d in ipairs(slot:GetDescendants()) do
+            if textMatches(d) then return true end
+        end
         return false
     end
 
@@ -3689,54 +3824,181 @@ do
 
         return pcall(function()
             VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
-            task.wait(0.05)
+            task.wait(0.035)
             VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
         end)
     end
 
+    local function pressRollingPinHotkeyOnce()
+        -- A single 1-key press is more reliable than firing several GUI signals and,
+        -- importantly, cannot create the old equip -> unequip double-toggle by itself.
+        local ok = pcall(function()
+            VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.One, false, game)
+            task.wait(0.04)
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.One, false, game)
+        end)
+        return ok
+    end
+
+    local function isRollingPinTool(tool)
+        if not tool or not tool:IsA("Tool") then return false end
+        local compact = string.lower(tool.Name or ""):gsub("[%s_%-]+", "")
+        return compact:find("rollingpin", 1, true) ~= nil
+            or compact == "pin"
+            or compact:find("bat", 1, true) ~= nil
+    end
+
+    local function findRollingPinTool()
+        local character = player.Character
+        if character then
+            for _, obj in ipairs(character:GetChildren()) do
+                if isRollingPinTool(obj) then
+                    return obj, true
+                end
+            end
+        end
+
+        local backpack = player:FindFirstChildOfClass("Backpack")
+        if backpack then
+            for _, obj in ipairs(backpack:GetChildren()) do
+                if isRollingPinTool(obj) then
+                    return obj, false
+                end
+            end
+        end
+
+        return nil, false
+    end
+
+    local function waitForEquippedTool(timeout)
+        local deadline = os.clock() + (timeout or 0.75)
+        repeat
+            local liveTool, liveEquipped = findRollingPinTool()
+            if liveTool and liveEquipped then
+                rollingPinEquippedThisCharacter = true
+                return true
+            end
+            RunService.Heartbeat:Wait()
+        until not isCurrent() or os.clock() >= deadline
+        return false
+    end
+
     local function equipRollingPinOnce()
-        if rollingPinEquippedThisCharacter or equipInProgress then return end
-        if ENV.ZHM_NPCAutoSwing ~= true then return end
+        if equipInProgress or equipActionDoneThisCharacter then
+            return rollingPinEquippedThisCharacter
+        end
+        if ENV.ZHM_NPCAutoSwing ~= true then return false end
 
         equipInProgress = true
-        for _ = 1, 150 do
-            if rollingPinEquippedThisCharacter or not isCurrent() then break end
-            if ENV.ZHM_NPCAutoSwing ~= true then break end
 
+        -- IMPORTANT: do not mark the one-time action as consumed until the Rolling Pin
+        -- actually exists. This fixes the old startup race where the script ran before
+        -- BackpackGui / the Tool had loaded and permanently gave up after that first miss.
+        while isCurrent()
+            and ENV.ZHM_NPCAutoSwing == true
+            and not equipActionDoneThisCharacter do
+
+            local character = player.Character
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            local tool, equipped = findRollingPinTool()
+
+            -- Already equipped before this script got to it: accept that state and stop.
+            if tool and equipped then
+                rollingPinEquippedThisCharacter = true
+                equipActionDoneThisCharacter = true
+                break
+            end
+
+            -- Best path: equip the actual Tool exactly once after both Tool + Humanoid exist.
+            if tool and humanoid and not directEquipTriedThisCharacter then
+                directEquipTriedThisCharacter = true
+                local called = pcall(function()
+                    humanoid:EquipTool(tool)
+                end)
+
+                if called and waitForEquippedTool(1.0) then
+                    equipActionDoneThisCharacter = true
+                    break
+                end
+
+                -- Never call EquipTool again for this character. If the game uses a
+                -- custom hotbar instead, the code below may perform one slot selection.
+            end
+
+            -- Custom inventory path. Wait until slot 1 is visibly the Rolling Pin, then
+            -- perform ONE selection action. On desktop use the game's normal "1" hotkey;
+            -- on touch-only devices click the visible slot once.
             local slot = getHotbarSlot1()
             if slot and slot:IsA("GuiObject") and slot.Visible
-                and slot.AbsoluteSize.X > 0 and slot.AbsoluteSize.Y > 0 then
+                and slot.AbsoluteSize.X > 0 and slot.AbsoluteSize.Y > 0
+                and slotShowsRollingPin(slot) then
 
-                local clicked = false
-                local button = findClickableGui(slot)
-                if button then clicked = fireGuiButtonOnce(button) end
-                if not clicked then clicked = virtualClickGuiOnce(button or slot) end
+                local selected = false
+                if IS_MOBILE_DEVICE then
+                    selected = virtualClickGuiOnce(slot)
+                else
+                    selected = pressRollingPinHotkeyOnce()
+                    if not selected then
+                        selected = virtualClickGuiOnce(slot)
+                    end
+                end
 
-                if clicked then
-                    rollingPinEquippedThisCharacter = true
+                if selected then
+                    -- Custom inventories may not expose an equipped Tool in Character.
+                    -- The input above is intentionally sent exactly once; from here on,
+                    -- swing code only attacks and never touches equipment again.
+                    task.wait(0.12)
+                    local liveTool, liveEquipped = findRollingPinTool()
+                    rollingPinEquippedThisCharacter = (liveTool and liveEquipped) or true
+                    equipActionDoneThisCharacter = true
                     break
                 end
             end
-            task.wait(0.1)
+
+            -- Keep waiting for inventory/UI replication. This is still "equip once":
+            -- no equip/select input has been sent yet, so waiting does not toggle anything.
+            task.wait(0.10)
         end
+
         equipInProgress = false
+        return rollingPinEquippedThisCharacter
     end
 
-    if ENV.ZHM_NPCAutoSwing == true then
-        task.spawn(equipRollingPinOnce)
-    end
+    -- Start one waiter on execution. It waits for the Rolling Pin to actually load,
+    -- then performs exactly one equip/select action for this character.
+    task.spawn(function()
+        while isCurrent() and not equipActionDoneThisCharacter do
+            if ENV.ZHM_NPCAutoSwing == true then
+                equipRollingPinOnce()
+            end
+            if not equipActionDoneThisCharacter then
+                task.wait(0.10)
+            end
+        end
+    end)
 
     player.CharacterAdded:Connect(function()
         rollingPinEquippedThisCharacter = false
         equipInProgress = false
+        equipActionDoneThisCharacter = false
+        directEquipTriedThisCharacter = false
         cachedPlot = nil
         cachedPlotParts = nil
         cachedPlotPartsFor = nil
         currentTarget = nil
         ENV.ZHM_NPCBusy = false
-        if ENV.ZHM_NPCAutoSwing == true then
-            task.spawn(equipRollingPinOnce)
-        end
+
+        -- New character = new inventory instance, so do one fresh equip for that spawn.
+        task.spawn(function()
+            while isCurrent() and not equipActionDoneThisCharacter do
+                if ENV.ZHM_NPCAutoSwing == true then
+                    equipRollingPinOnce()
+                end
+                if not equipActionDoneThisCharacter then
+                    task.wait(0.10)
+                end
+            end
+        end)
     end)
 
     local function getPlayerRoot()
@@ -3748,17 +4010,40 @@ do
         return model and Players:GetPlayerFromCharacter(model) ~= nil
     end
 
-    local function getHorizontalSpeed(part)
-        if not part or not part:IsA("BasePart") then return 0 end
-        local velocity = part.AssemblyLinearVelocity
-        return Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+    local function isCustomerModel(model)
+        return model
+            and model:IsA("Model")
+            and string.lower(tostring(model.Name or "")) == CUSTOMER_MODEL_NAME
     end
 
-    local function isTargetSpeed(speed)
-        return type(speed) == "number"
-            and speed == speed
-            and speed >= MIN_TARGET_SPEED
-            and speed <= MAX_TARGET_SPEED
+    local function getRunawayMarker(model)
+        if not model or not model:IsA("Model") then return nil, nil end
+
+        -- Exact live path shown in Explorer: Customer > Head > RunawayExclam.
+        local head = model:FindFirstChild("Head")
+        if not head or not head:IsA("BasePart") then return nil, nil end
+
+        local marker = head:FindFirstChild(RUNAWAY_MARKER_NAME)
+        if not marker then return nil, head end
+        return marker, head
+    end
+
+    local function isRunawayMarkerActive(marker, head)
+        if not marker or not marker.Parent then return false end
+        if not head or not head.Parent or marker.Parent ~= head then return false end
+        if marker.Name ~= RUNAWAY_MARKER_NAME then return false end
+
+        -- If the marker exposes a normal visibility/enabled property, respect it.
+        -- Unknown marker classes are considered active while the exact object exists.
+        if marker:IsA("BillboardGui") or marker:IsA("SurfaceGui") then
+            return marker.Enabled == true
+        elseif marker:IsA("GuiObject") then
+            return marker.Visible == true
+        elseif marker:IsA("ParticleEmitter") or marker:IsA("Trail") or marker:IsA("Beam") then
+            return marker.Enabled == true
+        end
+
+        return true
     end
 
     local function getPlotPositionFolder(plot)
@@ -3910,42 +4195,132 @@ do
         return closestPlot
     end
 
-    local function getExpandedPlotScanBox(plot)
-        local parts = getPlotParts(plot)
-        if #parts == 0 then return nil, nil end
+    -- Build the ONLY two NPC scan zones we care about: OutsideWall and DisplayRack.
+    -- This is intentionally separate from getPlotParts(), which is still used only to
+    -- identify the player's plot. NPC candidate scanning never covers the whole plot.
+    local function compactObjectName(name)
+        return string.lower(tostring(name or "")):gsub("[%s_%-]+", "")
+    end
 
-        local minX, minY, minZ = math.huge, math.huge, math.huge
-        local maxX, maxY, maxZ = -math.huge, -math.huge, -math.huge
+    local function getNPCScanZoneParts(plot)
+        if not plot then return {}, false, false end
 
-        -- Build a world-space AABB around the plot parts, accounting for rotation.
-        for _, part in ipairs(parts) do
-            if part and part.Parent then
-                local half = part.Size * 0.5
-                local cf = part.CFrame
-                local right, up, look = cf.RightVector, cf.UpVector, cf.LookVector
-                local extX = math.abs(right.X) * half.X + math.abs(up.X) * half.Y + math.abs(look.X) * half.Z
-                local extY = math.abs(right.Y) * half.X + math.abs(up.Y) * half.Y + math.abs(look.Y) * half.Z
-                local extZ = math.abs(right.Z) * half.X + math.abs(up.Z) * half.Y + math.abs(look.Z) * half.Z
-                local p = part.Position
+        local now = os.clock()
+        if cachedNPCZonePartsFor == plot
+            and cachedNPCZoneParts
+            and now - cachedNPCZonePartsAt < 1.0 then
+            return cachedNPCZoneParts,
+                cachedNPCZoneHasOutsideWall,
+                cachedNPCZoneHasDisplayRack
+        end
 
-                minX = math.min(minX, p.X - extX)
-                minY = math.min(minY, p.Y - extY)
-                minZ = math.min(minZ, p.Z - extZ)
-                maxX = math.max(maxX, p.X + extX)
-                maxY = math.max(maxY, p.Y + extY)
-                maxZ = math.max(maxZ, p.Z + extZ)
+        local parts = {}
+        local seen = {}
+        local foundOutsideWall = false
+        local foundDisplayRack = false
+
+        local function addPart(part)
+            if part and part:IsA("BasePart") and part.Parent and not seen[part] then
+                seen[part] = true
+                parts[#parts + 1] = part
             end
         end
 
-        if minX == math.huge then return nil, nil end
+        local function addContainerParts(container)
+            if not container then return end
 
-        local expand = NPC_PLOT_SCAN_RADIUS * 2
-        local minV = Vector3.new(minX, minY, minZ)
-        local maxV = Vector3.new(maxX, maxY, maxZ)
-        local center = (minV + maxV) * 0.5
-        local size = (maxV - minV) + Vector3.new(expand, expand, expand)
+            if container:IsA("BasePart") then
+                addPart(container)
+            end
 
-        return CFrame.new(center), size
+            for _, descendant in ipairs(container:GetDescendants()) do
+                if descendant:IsA("BasePart") then
+                    addPart(descendant)
+                end
+            end
+        end
+
+        -- Match the named plot objects themselves, then use the physical parts under
+        -- each one. This works whether OutsideWall / DisplayRack is a Part, Model,
+        -- Folder, or a nested equipment container.
+        for _, obj in ipairs(plot:GetDescendants()) do
+            local compact = compactObjectName(obj.Name)
+
+            if compact:find("outsidewall", 1, true) then
+                foundOutsideWall = true
+                addContainerParts(obj)
+            elseif compact:find("displayrack", 1, true) then
+                foundDisplayRack = true
+                addContainerParts(obj)
+            end
+        end
+
+        cachedNPCZonePartsFor = plot
+        cachedNPCZoneParts = parts
+        cachedNPCZonePartsAt = now
+        cachedNPCZoneHasOutsideWall = foundOutsideWall
+        cachedNPCZoneHasDisplayRack = foundDisplayRack
+
+        return parts, foundOutsideWall, foundDisplayRack
+    end
+
+    local function distanceToNPCScanZone(position, plot)
+        if not position or not plot then return math.huge end
+
+        local zoneParts = getNPCScanZoneParts(plot)
+        local nearest = math.huge
+
+        for _, part in ipairs(zoneParts) do
+            if part and part.Parent then
+                local distance = distancePointToPart(position, part)
+                if distance < nearest then
+                    nearest = distance
+                    if nearest <= 0.05 then break end
+                end
+            end
+        end
+
+        return nearest
+    end
+
+    local function getNPCZoneCandidateParts(plot)
+        local zoneParts, hasOutsideWall, hasDisplayRack = getNPCScanZoneParts(plot)
+        if #zoneParts == 0 then
+            return {}, hasOutsideWall, hasDisplayRack
+        end
+
+        local overlap = OverlapParams.new()
+        overlap.FilterType = Enum.RaycastFilterType.Exclude
+        overlap.FilterDescendantsInstances = player.Character and { player.Character } or {}
+        overlap.MaxParts = 0
+
+        local results = {}
+        local seenParts = {}
+        local expand = NPC_ZONE_SCAN_RADIUS * 2
+        local expansion = Vector3.new(expand, expand, expand)
+
+        -- Query only small expanded boxes around the two named zones. Roblox's spatial
+        -- query handles nearby parts directly, so NPCs elsewhere in the map are not
+        -- iterated or speed-checked at all.
+        for _, anchorPart in ipairs(zoneParts) do
+            if anchorPart and anchorPart.Parent then
+                local scanSize = anchorPart.Size + expansion
+                local ok, nearbyParts = pcall(function()
+                    return Workspace:GetPartBoundsInBox(anchorPart.CFrame, scanSize, overlap)
+                end)
+
+                if ok and nearbyParts then
+                    for _, nearbyPart in ipairs(nearbyParts) do
+                        if nearbyPart and nearbyPart.Parent and not seenParts[nearbyPart] then
+                            seenParts[nearbyPart] = true
+                            results[#results + 1] = nearbyPart
+                        end
+                    end
+                end
+            end
+        end
+
+        return results, hasOutsideWall, hasDisplayRack
     end
 
     local function getHumanoidModelFromPart(part)
@@ -3965,27 +4340,15 @@ do
         return nil, nil
     end
 
-    local function getPlotLocalParts(plot)
-        local boxCFrame, boxSize = getExpandedPlotScanBox(plot)
-        if not boxCFrame or not boxSize then return {} end
-
-        local overlap = OverlapParams.new()
-        overlap.FilterType = Enum.RaycastFilterType.Exclude
-        overlap.FilterDescendantsInstances = player.Character and { player.Character } or {}
-        overlap.MaxParts = 0
-
-        local ok, parts = pcall(function()
-            return Workspace:GetPartBoundsInBox(boxCFrame, boxSize, overlap)
-        end)
-
-        return ok and parts or {}
-    end
-
-    local function isStillValidRunningTarget(target)
+    local function isStillValidRunawayTarget(target)
         if not target or not target.model or not target.model.Parent then return false end
-        if isPlayerCharacter(target.model) then return false end
+        if isPlayerCharacter(target.model) or not isCustomerModel(target.model) then return false end
         if not target.root or not target.root.Parent or not target.root:IsA("BasePart") then return false end
+        if target.root.Name ~= "HumanoidRootPart" then return false end
         if not target.humanoid or not target.humanoid.Parent or target.humanoid.Health <= 0 then return false end
+
+        local marker, head = getRunawayMarker(target.model)
+        if not marker or not isRunawayMarkerActive(marker, head) then return false end
 
         local myPlot = target.plot
         if not myPlot or not myPlot.Parent then
@@ -3993,59 +4356,130 @@ do
         end
         if not myPlot then return false end
 
-        -- Re-check BOTH constraints immediately before using the target.
-        local currentSpeed = getHorizontalSpeed(target.root)
-        if not isTargetSpeed(currentSpeed) then return false end
+        -- The Customer must STILL be near OutsideWall or DisplayRack. Moving into the
+        -- rest of the plot/map immediately drops it as a target.
+        local zoneDistance = distanceToNPCScanZone(target.root.Position, myPlot)
+        if zoneDistance > NPC_ZONE_SCAN_RADIUS then return false end
 
-        local plotDistance = distanceToMyPlot(target.root.Position, myPlot)
-        if plotDistance > NPC_PLOT_SCAN_RADIUS then return false end
-
-        target.speed = currentSpeed
-        target.plotDistance = plotDistance
+        target.runawayMarker = marker
+        target.head = head
+        target.zoneDistance = zoneDistance
+        target.plotDistance = zoneDistance -- compatibility with any external status readers
         target.plot = myPlot
         return true
     end
 
-    local function findNearestRunningNPC()
-        local myPlot = findNPCPlot()
-        if not myPlot then
-            ENV.ZHM_NPCStatus = "Waiting for your plot"
-            return nil
+    local function teleportToRunawayCustomer(target)
+        if ENV.ZHM_NPCAutoTP ~= true then return false end
+        if not target or not target.root or not target.root.Parent then return false end
+
+        local myRoot = getPlayerRoot()
+        if not myRoot or not myRoot.Parent then return false end
+
+        local targetRoot = target.root
+        local currentDistance = (myRoot.Position - targetRoot.Position).Magnitude
+
+        -- Once close enough, do not spam CFrame every scan. Reposition only when
+        -- the runaway Customer creates some distance again.
+        if currentDistance <= NPC_TP_REPOSITION_DISTANCE then
+            return true
         end
 
-        local best = nil
-        local bestPlotDistance = math.huge
-        local seenModels = {}
+        -- Stand a few studs to the NPC's side and face it. This avoids placing the
+        -- player's root directly inside the NPC while still keeping melee range.
+        local side = targetRoot.CFrame.RightVector
+        if side.Magnitude < 0.1 then
+            side = Vector3.new(1, 0, 0)
+        end
 
-        -- Spatially scan ONLY the area around your plot. We no longer walk through
-        -- Workspace:GetDescendants(), so far-away NPCs are never candidates.
-        for _, part in ipairs(getPlotLocalParts(myPlot)) do
+        local destination = targetRoot.Position
+            + side.Unit * NPC_TP_KEEP_DISTANCE
+            + Vector3.new(0, NPC_TP_VERTICAL_OFFSET, 0)
+
+        local lookAt = targetRoot.Position + Vector3.new(0, NPC_TP_VERTICAL_OFFSET, 0)
+        local ok = pcall(function()
+            myRoot.CFrame = CFrame.lookAt(destination, lookAt)
+        end)
+
+        return ok
+    end
+
+    -- One 3-second burst per live marker appearance. Once RunawayExclam disappears
+    -- or becomes inactive, the same Customer can trigger again the next time it appears.
+    local handledRunawayMarkers = setmetatable({}, { __mode = "k" })
+
+    local function refreshHandledRunawayMarkers()
+        for marker in pairs(handledRunawayMarkers) do
+            local head = marker and marker.Parent
+            if not marker
+                or not marker.Parent
+                or not head
+                or not head:IsA("BasePart")
+                or not isRunawayMarkerActive(marker, head) then
+                handledRunawayMarkers[marker] = nil
+            end
+        end
+    end
+
+    local function findNearestRunawayCustomer()
+        local myPlot = findNPCPlot()
+        if not myPlot then
+            ENV.ZHM_NPCStatus = "LIVE scanner • waiting for your plot"
+            return nil, 0
+        end
+
+        local candidateParts, hasOutsideWall, hasDisplayRack = getNPCZoneCandidateParts(myPlot)
+        if not hasOutsideWall and not hasDisplayRack then
+            ENV.ZHM_NPCStatus = "LIVE scanner • waiting for OutsideWall / DisplayRack"
+            return nil, 0
+        end
+
+        refreshHandledRunawayMarkers()
+
+        local best = nil
+        local bestZoneDistance = math.huge
+        local seenModels = {}
+        local liveCount = 0
+
+        -- LIVE SCANNER: only parts returned by the OutsideWall / DisplayRack spatial
+        -- queries can become candidates. The marker is checked every scan pass, so a
+        -- newly-created Customer > Head > RunawayExclam is picked up immediately.
+        for _, part in ipairs(candidateParts) do
             local model, humanoid = getHumanoidModelFromPart(part)
 
             if model
                 and humanoid
                 and humanoid.Health > 0
                 and not seenModels[model]
-                and not isPlayerCharacter(model) then
+                and not isPlayerCharacter(model)
+                and isCustomerModel(model) then
 
                 seenModels[model] = true
-                local root = getModelRoot(model)
 
-                if root and root:IsA("BasePart") and root.Parent then
-                    local plotDistance = distanceToMyPlot(root.Position, myPlot)
+                local root = model:FindFirstChild("HumanoidRootPart")
+                local marker, head = getRunawayMarker(model)
 
-                    if plotDistance <= NPC_PLOT_SCAN_RADIUS then
-                        local speed = getHorizontalSpeed(root)
+                if root
+                    and root:IsA("BasePart")
+                    and root.Parent
+                    and head
+                    and marker
+                    and isRunawayMarkerActive(marker, head) then
 
-                        -- STRICT: do not target 11.99 or 16.01. Only 12.00-16.00 inclusive.
-                        if isTargetSpeed(speed) and plotDistance < bestPlotDistance then
-                            bestPlotDistance = plotDistance
+                    local zoneDistance = distanceToNPCScanZone(root.Position, myPlot)
+                    if zoneDistance <= NPC_ZONE_SCAN_RADIUS then
+                        liveCount += 1
+
+                        if handledRunawayMarkers[marker] ~= true and zoneDistance < bestZoneDistance then
+                            bestZoneDistance = zoneDistance
                             best = {
                                 model = model,
                                 root = root,
+                                head = head,
                                 humanoid = humanoid,
-                                speed = speed,
-                                plotDistance = plotDistance,
+                                runawayMarker = marker,
+                                zoneDistance = zoneDistance,
+                                plotDistance = zoneDistance, -- compatibility
                                 plot = myPlot,
                             }
                         end
@@ -4054,7 +4488,7 @@ do
             end
         end
 
-        return best
+        return best, liveCount
     end
 
     local function clickGameplayToSwing()
@@ -4071,6 +4505,26 @@ do
         end)
     end
 
+    local function swingRollingPinRobust()
+        if not isCurrent() or ENV.ZHM_NPCAutoSwing ~= true then return false end
+
+        -- SWING ONLY. Never equip, unequip, click the hotbar, or call EquipTool here.
+        local tool, equipped = findRollingPinTool()
+        if tool and equipped then
+            rollingPinEquippedThisCharacter = true
+            return pcall(function() tool:Activate() end)
+        end
+
+        -- Compatibility path for custom inventories where the equipped item is not
+        -- exposed as a Backpack/Character Tool. This is a gameplay swing click only;
+        -- it never touches the inventory/hotbar.
+        if rollingPinEquippedThisCharacter then
+            return clickGameplayToSwing()
+        end
+
+        return false
+    end
+
     -- Shared one-shot swing used by the movement route when it reaches the Cashier.
     ENV.ZHM_SwingRollingPinNow = function()
         if not isCurrent()
@@ -4079,42 +4533,62 @@ do
             return false
         end
 
-        -- Reuse the existing slot-1 equip logic if the Rolling Pin is not equipped yet.
-        if not rollingPinEquippedThisCharacter and not equipInProgress then
-            equipRollingPinOnce()
-        end
-
-        if not rollingPinEquippedThisCharacter then
-            return false
-        end
-
-        return clickGameplayToSwing()
+        return swingRollingPinRobust()
     end
 
     task.spawn(function()
         while isCurrent() do
-            local anyNPCFeature = ENV.ZHM_NPCAutoSwing == true
+            local anyNPCFeature = ENV.ZHM_NPCAutoSwing == true or ENV.ZHM_NPCAutoTP == true
 
             if anyNPCFeature and ENV.ZHM_SweepActive ~= true then
-                if ENV.ZHM_NPCAutoSwing == true
-                    and not rollingPinEquippedThisCharacter
-                    and not equipInProgress then
-                    task.spawn(equipRollingPinOnce)
+                refreshHandledRunawayMarkers()
+
+                -- Keep the active Customer for only one 3-second swing burst.
+                if currentTarget then
+                    if not isStillValidRunawayTarget(currentTarget) then
+                        currentTarget = nil
+                        ENV.ZHM_NPCBusy = false
+                    elseif os.clock() >= (currentTarget.swingUntil or 0) then
+                        if currentTarget.runawayMarker then
+                            handledRunawayMarkers[currentTarget.runawayMarker] = true
+                        end
+                        currentTarget = nil
+                        ENV.ZHM_NPCBusy = false
+                    end
                 end
 
-                local target = findNearestRunningNPC()
-                if target and isStillValidRunningTarget(target) then
-                    currentTarget = target
-                    ENV.ZHM_NPCStatus = target.model.Name
-                        .. " • " .. string.format("%.2f", target.speed) .. " studs/s"
-                        .. " • " .. string.format("%.1f", target.plotDistance) .. "/20 from plot"
+                if not currentTarget then
+                    local target, liveCount = findNearestRunawayCustomer()
+                    ENV.ZHM_NPCRunawayLiveCount = liveCount or 0
+                    if target and isStillValidRunawayTarget(target) then
+                        target.swingUntil = os.clock() + NPC_SWING_DURATION
+                        currentTarget = target
+                    end
+                end
 
-                    -- Swing-only mode: detecting an NPC never moves the character.
-                    ENV.ZHM_NPCBusy = false
+                local target = currentTarget
+                if target and isStillValidRunawayTarget(target) then
+                    -- Mark NPC movement ownership BEFORE teleporting so the rack-route
+                    -- loop pauses instead of immediately overriding this CFrame.
+                    ENV.ZHM_NPCBusy = ENV.ZHM_NPCAutoTP == true
+
+                    local tpWorked = false
+                    if ENV.ZHM_NPCAutoTP == true then
+                        tpWorked = teleportToRunawayCustomer(target)
+                    end
+
+                    local remaining = math.max(0, (target.swingUntil or os.clock()) - os.clock())
+                    ENV.ZHM_NPCStatus = "LIVE " .. tostring(ENV.ZHM_NPCRunawayLiveCount or 1) .. " • "
+                        .. target.model.Name .. " > Head > RunawayExclam"
+                        .. (ENV.ZHM_NPCAutoTP == true and (tpWorked and " • TP" or " • TP failed") or "")
+                        .. " • swing " .. string.format("%.1f", remaining) .. "s"
+                        .. " • " .. string.format("%.1f", target.zoneDistance or target.plotDistance or 0)
+                        .. "/" .. tostring(NPC_ZONE_SCAN_RADIUS) .. " from OutsideWall/DisplayRack"
                 else
-                    currentTarget = nil
                     ENV.ZHM_NPCBusy = false
-                    ENV.ZHM_NPCStatus = "Scanning plot • 12-16 studs/s • max 20 studs"
+                    local liveCount = ENV.ZHM_NPCRunawayLiveCount or 0
+                    ENV.ZHM_NPCStatus = "LIVE scanner • " .. tostring(liveCount)
+                        .. " RunawayExclam • Customer > Head > RunawayExclam • OutsideWall/DisplayRack"
                 end
             else
                 currentTarget = nil
@@ -4136,10 +4610,20 @@ do
                 local target = currentTarget
                 local myRoot = getPlayerRoot()
 
-                if target and myRoot and isStillValidRunningTarget(target) then
+                if target
+                    and myRoot
+                    and os.clock() < (target.swingUntil or 0)
+                    and isStillValidRunawayTarget(target) then
+
                     local distance = (myRoot.Position - target.root.Position).Magnitude
                     if distance <= NPC_SWING_MAX_DISTANCE then
-                        clickGameplayToSwing()
+                        local swung = swingRollingPinRobust()
+                        if swung then
+                            local remaining = math.max(0, (target.swingUntil or os.clock()) - os.clock())
+                            ENV.ZHM_NPCStatus = "LIVE " .. tostring(ENV.ZHM_NPCRunawayLiveCount or 1) .. " • "
+                                .. target.model.Name .. " > Head > RunawayExclam • swinging "
+                                .. string.format("%.1f", remaining) .. "s"
+                        end
                     end
                 end
             end
@@ -4674,7 +5158,8 @@ end)
 
 createSection(sidePage, "Side Jobs")
 createToggle(sidePage, "Night Auto Sweep", "Sweep trash prompts at night", "ZHM_AutoSweep", true)
-createToggle(sidePage, "Rolling Pin Swing", "Auto-equip and swing at detected moving NPCs (12-16 studs/sec)", "ZHM_NPCAutoSwing", true)
+createToggle(sidePage, "NPC Auto TP", "LIVE scanner • OutsideWall/DisplayRack • Customer > Head > RunawayExclam • TP", "ZHM_NPCAutoTP", true)
+createToggle(sidePage, "Rolling Pin Swing", "Customer > Head > RunawayExclam • auto swing for 3 seconds • live scan", "ZHM_NPCAutoSwing", true)
 createInfoCard(sidePage, "Live Scanner", function()
     return "Sweep: " .. tostring(ENV.ZHM_SweepStatus or "Waiting")
         .. "\nNPC: " .. tostring(ENV.ZHM_NPCStatus or "Idle")
