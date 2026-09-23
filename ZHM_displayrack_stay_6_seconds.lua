@@ -528,6 +528,52 @@ local function getCashierPos(plot)
     return nil
 end
 
+-- Oven destination used after the Cashier before restarting the BakingRack loop.
+local function getOvenPos(plot)
+    if not plot then return nil end
+
+    local equipment = plot:FindFirstChild("Equipment") or plot
+
+    -- Exact path used by the current baking system.
+    local ovenRoot = resolve(equipment, { "Oven", "BrownOven", "PlacementRoot" })
+    if ovenRoot then
+        local part = getPartFromContainer(ovenRoot) or getPartFromContainer(ovenRoot.Parent)
+        if part then return part.Position end
+    end
+
+    -- Prefer an actual Oven/BrownOven object in Equipment.
+    for _, wanted in ipairs({ "BrownOven", "Oven" }) do
+        local obj = equipment:FindFirstChild(wanted, true)
+        if obj then
+            local part = getPartFromContainer(obj) or getPartFromContainer(obj.Parent)
+            if part then return part.Position end
+        end
+    end
+
+    -- Compatibility fallback for renamed oven models.
+    for _, desc in ipairs(equipment:GetDescendants()) do
+        local lowerName = string.lower(desc.Name or "")
+        if lowerName:find("oven", 1, true)
+            and not lowerName:find("prompt", 1, true) then
+            local part = getPartFromContainer(desc) or getPartFromContainer(desc.Parent)
+            if part then return part.Position end
+        end
+    end
+
+    -- Final fallback: use the BakePrompt's parent/ancestor.
+    local prompt = plot:FindFirstChild("BakePrompt", true)
+    if prompt then
+        local current = prompt.Parent
+        while current and current ~= plot do
+            local part = getPartFromContainer(current)
+            if part then return part.Position end
+            current = current.Parent
+        end
+    end
+
+    return nil
+end
+
 local function getAllBakingRacks(plot)
     if not plot then return {} end
     local equipment = plot:FindFirstChild("Equipment") or plot
@@ -689,8 +735,8 @@ local function startAutoWalk()
                             report("AutoWalk", "All " .. tostring(#route) .. " BakingRacks visited • TP to DisplayRack...")
                             if teleportToPosition(displayPos + Vector3.new(0, 2.5, 0))
                                 and running("ZHM_AutoWalk") then
-                                -- Stay at the DisplayRack for exactly 15 seconds.
-                                task.wait(15)
+                                -- Stay at the DisplayRack for exactly 7 seconds.
+                                task.wait(7)
 
                                 -- After DisplayRack, TP to the Dough PrepTable before
                                 -- resetting the rack route and starting the next loop.
@@ -744,6 +790,21 @@ local function startAutoWalk()
                                                                 "AutoWalk",
                                                                 "Cashier reached • Rolling Pin module was not ready during 2s spam."
                                                             )
+                                                        end
+
+                                                        -- Final stop before looping: TP from Cashier to Oven.
+                                                        if running("ZHM_AutoWalk") then
+                                                            local ovenPos = getOvenPos(myPlot)
+                                                            if ovenPos then
+                                                                report("AutoWalk", "Cashier complete • TP to Oven • stay 1.5s • restart BakingRack loop...")
+                                                                if teleportToPosition(ovenPos + Vector3.new(0, 2.5, 0))
+                                                                    and running("ZHM_AutoWalk") then
+                                                                    task.wait(1.5)
+                                                                end
+                                                            else
+                                                                report("AutoWalk", "Oven not found; restarting BakingRack loop.")
+                                                                task.wait(0.25)
+                                                            end
                                                         end
                                                     end
                                                 else
@@ -1108,7 +1169,7 @@ local bakeAllBreads
 
 do
 --------------------------------------------------------------------------------
--- AUTO BAKE V3 - CONTROLLER-AWARE / SILENT / LOOPING
+-- AUTO BAKE V4 - CONTINUOUS AVAILABLE-BREAD SELECT / BAKE LOOP
 --
 -- New game structure observed:
 --   StarterPlayerScripts.Client.Controllers.BakeSelectController
@@ -1124,7 +1185,7 @@ do
 -- IMPORTANT:
 -- We intentionally let the game's OWN BakeSelectController invoke the final
 -- network packet instead of guessing undocumented FireServer arguments.
--- The actual BakeSelect.Frame is forced invisible while callbacks are fired directly.
+-- The menu is kept logically active but moved off-screen, so Auto Bake is silent.
 --------------------------------------------------------------------------------
 
 local bakeState = {
@@ -1138,8 +1199,6 @@ local bakeState = {
 
 local silentBakeFrame = nil
 local silentBakeOriginalPosition = nil
-local silentBakeOriginalVisible = nil
-local silentBakeVisibleConnection = nil
 
 local function getBakeControllersFolder()
     -- Runtime location after StarterPlayerScripts is cloned to LocalPlayer.PlayerScripts.
@@ -1181,30 +1240,16 @@ local function getBakeControllerStatus()
 end
 
 local function restoreSilentBakeUI()
-    if silentBakeVisibleConnection then
+    if silentBakeFrame
+        and silentBakeFrame.Parent
+        and silentBakeOriginalPosition then
         pcall(function()
-            silentBakeVisibleConnection:Disconnect()
+            silentBakeFrame.Position = silentBakeOriginalPosition
         end)
-        silentBakeVisibleConnection = nil
-    end
-
-    if silentBakeFrame and silentBakeFrame.Parent then
-        if silentBakeOriginalPosition then
-            pcall(function()
-                silentBakeFrame.Position = silentBakeOriginalPosition
-            end)
-        end
-
-        if silentBakeOriginalVisible ~= nil then
-            pcall(function()
-                silentBakeFrame.Visible = silentBakeOriginalVisible
-            end)
-        end
     end
 
     silentBakeFrame = nil
     silentBakeOriginalPosition = nil
-    silentBakeOriginalVisible = nil
 end
 
 local function setSilentBakeUI(frame, enabled)
@@ -1218,36 +1263,16 @@ local function setSilentBakeUI(frame, enabled)
     if enabled then
         if silentBakeFrame ~= frame then
             restoreSilentBakeUI()
-
             silentBakeFrame = frame
             silentBakeOriginalPosition = frame.Position
-            silentBakeOriginalVisible = frame.Visible
-
-            -- Hard-hide the actual BakeSelect.Frame seen in StarterGui/PlayerGui.
-            -- Button callbacks can still be fired directly while the parent is hidden.
-            pcall(function()
-                frame.Visible = false
-            end)
-
-            -- BakeSelectController may try to set Visible=true whenever BakePrompt is
-            -- opened. Force it back to false immediately so the popup never appears.
-            silentBakeVisibleConnection = frame:GetPropertyChangedSignal("Visible"):Connect(function()
-                if ENV.ZHM_SilentBakeUI == true
-                    and farming("ZHM_AutoBake")
-                    and frame
-                    and frame.Parent
-                    and frame.Visible then
-
-                    pcall(function()
-                        frame.Visible = false
-                    end)
-                end
-            end)
+        elseif silentBakeOriginalPosition == nil then
+            silentBakeOriginalPosition = frame.Position
         end
 
-        -- Re-apply every scan in case another controller changed the property.
+        -- Do NOT set Visible=false. The game's BakeSelectController may depend on
+        -- the UI remaining logically open. Moving it off-screen keeps handlers alive.
         pcall(function()
-            frame.Visible = false
+            frame.Position = UDim2.new(8, 0, 8, 0)
         end)
     else
         restoreSilentBakeUI()
@@ -1483,6 +1508,31 @@ local function waitUntil(predicate, timeoutSeconds, step)
     return false
 end
 
+local function bakeSelectButtonUsable(button)
+    if not button
+        or not button.Parent
+        or not button:IsA("GuiButton") then
+        return false
+    end
+
+    -- A hidden Select button is not currently available.
+    if button.Visible == false then
+        return false
+    end
+
+    -- Newer Roblox GuiButtons expose Interactable. Use it when available,
+    -- but remain compatible with executors / game versions where it is absent.
+    local okInteractable, interactable = pcall(function()
+        return button.Interactable
+    end)
+
+    if okInteractable and interactable == false then
+        return false
+    end
+
+    return true
+end
+
 local function getSelectableBakeRows(list)
     local rows = {}
 
@@ -1490,6 +1540,8 @@ local function getSelectableBakeRows(list)
         return rows
     end
 
+    -- Read the live list every pass. Do not cache rows because BakeSelectController
+    -- can destroy/recreate them after each successful bake.
     for _, row in ipairs(list:GetChildren()) do
         local number = tonumber(row.Name)
 
@@ -1498,10 +1550,7 @@ local function getSelectableBakeRows(list)
                 "Main_Frame", "Buttons", "Select"
             })
 
-            if selectButton
-                and selectButton:IsA("GuiButton")
-                and selectButton.Visible then
-
+            if bakeSelectButtonUsable(selectButton) then
                 rows[#rows + 1] = {
                     Number = number,
                     Name = row.Name,
@@ -1587,9 +1636,7 @@ end
 local function openBakeMenu(plot)
     local frame, list = getBakeScrollingFrame()
 
-    -- If numbered rows already exist, BakeSelectController has populated the current
-    -- bake session. It does NOT matter that Frame.Visible is false in Silent mode.
-    if frame and list and #getSelectableBakeRows(list) > 0 then
+    if frame and list and guiHierarchyVisible(frame) then
         if ENV.ZHM_SilentBakeUI == true then
             setSilentBakeUI(frame, true)
         end
@@ -1602,37 +1649,34 @@ local function openBakeMenu(plot)
         return nil, nil
     end
 
-    -- Hide the persistent BakeSelect frame BEFORE opening the prompt so there is no
-    -- one-frame popup/flicker when BakeSelectController changes Visible to true.
-    if frame and ENV.ZHM_SilentBakeUI == true then
-        setSilentBakeUI(frame, true)
-    end
-
     if not fireBakePromptRobust(prompt) then
-        -- During an active oven/progress state the prompt may temporarily be disabled.
-        -- Keep the UI hidden and simply retry on the next Auto Bake pass.
-        return frame, list
+        report("Bake", "BakePrompt could not be fired.")
+        return nil, nil
     end
 
-    -- Wait for the controller to populate numbered stack rows. Visibility is ignored
-    -- intentionally because Silent Auto Bake forces Frame.Visible=false.
-    waitUntil(function()
+    -- Wait for BakeSelectController to create/open the new menu.
+    local opened = waitUntil(function()
         local currentFrame, currentList = getBakeScrollingFrame()
-
-        if currentFrame and ENV.ZHM_SilentBakeUI == true then
-            setSilentBakeUI(currentFrame, true)
-        end
-
         return currentFrame
             and currentList
-            and #getSelectableBakeRows(currentList) > 0
-    end, 1.25, 0.02)
+            and guiHierarchyVisible(currentFrame)
+    end, 1.25, 0.025)
+
+    if not opened then
+        report("Bake", "BakeSelectController did not open the menu yet.")
+        return nil, nil
+    end
 
     frame, list = getBakeScrollingFrame()
 
     if frame and ENV.ZHM_SilentBakeUI == true then
         setSilentBakeUI(frame, true)
     end
+
+    -- Wait briefly for numbered stack rows to populate.
+    waitUntil(function()
+        return #getSelectableBakeRows(list) > 0
+    end, 0.75, 0.025)
 
     return frame, list
 end
@@ -1645,6 +1689,7 @@ local function runAutoBakeCycle()
     local plot = findMyPlot()
     if not plot then
         report("Bake", "Waiting for your plot.")
+        bakeState.NextAttempt = os.clock() + 0.25
         return
     end
 
@@ -1654,114 +1699,145 @@ local function runAutoBakeCycle()
         bakeState.ControllerStatusReported = true
     end
 
-    local frame, list = openBakeMenu(plot)
+    -- One worker stays alive while there are immediately available bread stacks.
+    -- After every successful Bake press it reopens/rescans the live BakeSelect list,
+    -- so newly available rows are selected on the next pass automatically.
+    local localBatchCount = 0
 
-    if not frame or not list or not farming("ZHM_AutoBake") then
-        return
-    end
+    while farming("ZHM_AutoBake") and isCurrent() do
+        local frame, list = openBakeMenu(plot)
 
-    local rows = getSelectableBakeRows(list)
-
-    if #rows == 0 then
-        -- No dough ready. Leave silently and retry later.
-        report("Bake", "No selectable dough stack is ready yet.")
-        bakeState.NextAttempt = os.clock() + 0.30
-        return
-    end
-
-    -- Fresh logs show batches of 3, with a smaller final batch if fewer remain.
-    local batchCount = math.min(3, #rows)
-    local signature = makeBakeSignature(rows, batchCount)
-
-    -- Prevent re-selecting the exact same server batch while the UI/server is still
-    -- processing the previous Bake request.
-    if signature == bakeState.LastBatchSignature
-        and os.clock() - bakeState.LastBatchTime < 1.10 then
-        bakeState.NextAttempt = bakeState.LastBatchTime + 1.10
-        return
-    end
-
-    local selected = 0
-
-    for i = 1, batchCount do
-        if not farming("ZHM_AutoBake") then
+        if not frame or not list or not farming("ZHM_AutoBake") then
+            bakeState.NextAttempt = os.clock() + 0.20
             return
         end
 
-        local entry = rows[i]
+        local rows = getSelectableBakeRows(list)
 
-        if entry and entry.Button and entry.Button.Parent then
-            if triggerBakeGuiButton(entry.Button, "BakeSelect") then
-                selected += 1
+        if #rows == 0 then
+            -- Nothing ready right now. Yield the worker and let the main automation
+            -- call us again shortly, which makes this an ongoing Auto Bake loop.
+            report("Bake", "No selectable bread is ready; live scan will retry.")
+            bakeState.LastBatchSignature = ""
+            bakeState.NextAttempt = os.clock() + 0.20
+            return
+        end
 
-                -- Let BakeSelectController register each stack in order.
-                task.wait(0.045)
+        -- The current BakeSelect flow uses three selection slots. If fewer than
+        -- three are available, bake the smaller final batch instead of waiting.
+        local batchCount = math.min(3, #rows)
+        local signature = makeBakeSignature(rows, batchCount)
+
+        local selected = 0
+        local selectedButtons = {}
+
+        for i = 1, batchCount do
+            if not farming("ZHM_AutoBake") then
+                return
+            end
+
+            local entry = rows[i]
+
+            if entry
+                and entry.Button
+                and entry.Button.Parent
+                and bakeSelectButtonUsable(entry.Button) then
+
+                if triggerBakeGuiButton(entry.Button, "BakeSelect") then
+                    selected += 1
+                    selectedButtons[#selectedButtons + 1] = entry.Button
+
+                    -- Give BakeSelectController one frame-sized window to register
+                    -- the selection before clicking the next available bread.
+                    task.wait(0.05)
+                end
             end
         end
-    end
 
-    if selected <= 0 then
-        report("Bake", "Select callbacks were not available.")
-        bakeState.NextAttempt = os.clock() + 0.25
-        return
-    end
-
-    local finalBake = findFinalBakeButton(list)
-
-    if not finalBake then
-        report("Bake", "Shared StackTemplate Bake button was not found.")
-        bakeState.NextAttempt = os.clock() + 0.25
-        return
-    end
-
-    if not triggerBakeGuiButton(finalBake, "Bake") then
-        report("Bake", "Final Bake callback could not be dispatched.")
-        bakeState.NextAttempt = os.clock() + 0.25
-        return
-    end
-
-    bakeState.BatchCounter += 1
-    bakeState.LastBatchSignature = signature
-    bakeState.LastBatchTime = os.clock()
-
-    report(
-        "Bake",
-        "Batch #" .. tostring(bakeState.BatchCounter)
-            .. " sent: " .. tostring(selected)
-            .. " stack(s) [" .. signature .. "]"
-    )
-
-    -- Wait for any indication that BakeProgressController / BakeryController consumed
-    -- the request: menu closes, rows change, or a bake progress element appears.
-    waitUntil(function()
-        if getBakeProgressVisible() then
-            return true
+        if selected <= 0 then
+            report("Bake", "Available bread rows were found, but Select callbacks did not fire.")
+            bakeState.NextAttempt = os.clock() + 0.25
+            return
         end
 
-        local currentFrame, currentList = getBakeScrollingFrame()
+        local finalBake = findFinalBakeButton(list)
 
-        if not currentFrame or not currentList then
-            return true
+        if not finalBake then
+            report("Bake", "Bake button not found after selecting " .. tostring(selected) .. " bread(s).")
+            bakeState.NextAttempt = os.clock() + 0.25
+            return
         end
 
-        if currentFrame and ENV.ZHM_SilentBakeUI == true then
-            setSilentBakeUI(currentFrame, true)
+        if not triggerBakeGuiButton(finalBake, "Bake") then
+            report("Bake", "Final Bake callback could not be dispatched.")
+            bakeState.NextAttempt = os.clock() + 0.25
+            return
         end
 
-        local currentRows = getSelectableBakeRows(currentList)
-        local currentSignature = makeBakeSignature(
-            currentRows,
-            math.min(3, #currentRows)
+        localBatchCount += 1
+        bakeState.BatchCounter += 1
+        bakeState.LastBatchSignature = signature
+        bakeState.LastBatchTime = os.clock()
+
+        report(
+            "Bake",
+            "Continuous batch #" .. tostring(bakeState.BatchCounter)
+                .. " sent: " .. tostring(selected)
+                .. " bread(s) [" .. signature .. "]"
         )
 
-        return currentSignature ~= signature
-    end, 1.50, 0.04)
+        -- Wait until the game's own controller gives us evidence that it consumed
+        -- the batch. We intentionally do not decode or forge the Packet buffer.
+        local consumed = waitUntil(function()
+            local currentFrame, currentList = getBakeScrollingFrame()
 
-    -- Give the server a small settling window before beginning the next batch.
-    bakeState.NextAttempt = os.clock() + 0.18
+            -- Closing/replacing the BakeSelect UI means the request was consumed.
+            if not currentFrame
+                or not currentList
+                or not guiHierarchyVisible(currentFrame) then
+                return true
+            end
+
+            -- If any selected button disappeared / became unavailable, the live
+            -- selection state changed and we can safely rescan.
+            for _, button in ipairs(selectedButtons) do
+                if not bakeSelectButtonUsable(button) then
+                    return true
+                end
+            end
+
+            local currentRows = getSelectableBakeRows(currentList)
+            if #currentRows == 0 then
+                return true
+            end
+
+            local currentSignature = makeBakeSignature(
+                currentRows,
+                math.min(3, #currentRows)
+            )
+
+            return currentSignature ~= signature
+        end, 1.35, 0.04)
+
+        if consumed then
+            -- Fast path: controller/UI changed, so immediately scan the next batch.
+            task.wait(0.10)
+        else
+            -- Some versions leave the same row objects on-screen briefly even after
+            -- the server accepted the packet. Avoid hammering the same batch.
+            task.wait(0.45)
+        end
+
+        -- Safety yield: if a huge queue exists, periodically return control to the
+        -- scheduler so the other farm modules cannot be starved.
+        if localBatchCount >= 12 then
+            bakeState.NextAttempt = os.clock() + 0.05
+            return
+        end
+    end
 end
 
--- Keep BakeSelect.Frame permanently hidden while Auto Bake is enabled.
+-- Keep BakeSelect permanently off-screen while Auto Bake is enabled.
 task.spawn(function()
     while isCurrent() do
         local frame = getBakeFrame()
@@ -1798,16 +1874,19 @@ bakeAllBreads = function()
 
     bakeState.Busy = true
 
-    -- Run the bake cycle separately so waiting for the controller/UI/server does not
-    -- freeze Accept, Collect, Give Order, Pay Cashier, etc.
+    -- Run the continuous bake worker separately so waiting for the controller/UI/server
+    -- does not freeze Accept, Collect, Give Order, Pay Cashier, etc.
     task.spawn(function()
-        local ok, err = pcall(runAutoBakeCycle)
+        local ok, err = xpcall(runAutoBakeCycle, function(message)
+            return tostring(message)
+        end)
 
         if not ok then
             report("Bake", "Auto Bake error: " .. tostring(err))
             bakeState.NextAttempt = os.clock() + 0.35
         end
 
+        -- Always release Busy so the scheduler can start the next live scan.
         bakeState.Busy = false
     end)
 end
