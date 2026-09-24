@@ -3611,16 +3611,28 @@ local function startAutomation()
 end
 
 --------------------------------------------------------------------------------
--- 6A. NIGHT TRASH AUTO SWEEP (MERGED FROM STANDALONE)
--- Priority owner while active: pauses farm/buy/upgrade/rack/NPC loops without
--- changing the user's toggle values. Everything resumes when trash is gone.
+-- 6A. NIGHT TRASH AUTO SWEEP - DIRECT SWEEPPROMPT HEARTBEAT SPAM
+-- Logged action path:
+--   Workspace.SideJobTrash.SideJobTrash.SweepPrompt
+--
+-- While Night Auto Sweep is enabled and it is night:
+--   1) Resolve the exact logged SweepPrompt every frame so recreated trash still works.
+--   2) Keep the prompt instant/reachable.
+--   3) Stay near the active trash prompt when needed.
+--   4) Fire the prompt every Heartbeat while it remains enabled.
+--   5) Fall back to the older live sweep scanner only if the exact path is missing.
 --------------------------------------------------------------------------------
 do
-    local SWEEP_SCAN_INTERVAL = 0.15
     local SWEEP_TP_HEIGHT_OFFSET = 2.5
     local SWEEP_TP_BACK_OFFSET = 1.5
-    local SWEEP_PROMPT_FIRE_DELAY = 0 -- fire immediately after each sweep TP
-    local SWEEP_LOOP_DELAY = TP_DELAY
+    local SWEEP_RETP_DISTANCE = 12
+    local SWEEP_RETP_COOLDOWN = 0.20
+    local SWEEP_FALLBACK_RESCAN = 0.10
+
+    local lastSweepPrompt = nil
+    local lastSweepTeleport = 0
+    local lastFallbackScan = 0
+    local fallbackPrompts = {}
 
     local function guiObjectActive(obj)
         if not obj or not obj:IsA("GuiObject") or not obj.Visible then
@@ -3653,7 +3665,7 @@ do
             if day and guiObjectActive(day) then return false end
 
             for _, obj in ipairs(frame:GetDescendants()) do
-                local lower = obj.Name:lower()
+                local lower = string.lower(obj.Name or "")
                 if lower == "night" and guiObjectActive(obj) then
                     return true
                 elseif lower == "day" and guiObjectActive(obj) then
@@ -3662,7 +3674,7 @@ do
             end
         end
 
-        -- Fallback for rounds where WeatherUI is recreated or temporarily missing.
+        -- Fallback if WeatherUI is recreated/missing.
         local lighting = game:GetService("Lighting")
         local clockTime = tonumber(lighting.ClockTime)
         if clockTime then
@@ -3683,24 +3695,15 @@ do
 
     local function getPromptPart(prompt)
         if not prompt then return nil end
-        local parent = prompt.Parent
+        local current = prompt.Parent
 
-        if parent and parent:IsA("BasePart") then
-            return parent
-        end
-
-        if parent and parent:IsA("Model") then
-            return parent.PrimaryPart
-                or parent:FindFirstChild("HumanoidRootPart")
-                or parent:FindFirstChildWhichIsA("BasePart", true)
-        end
-
-        local current = parent
         while current and current ~= Workspace do
             if current:IsA("BasePart") then
                 return current
             elseif current:IsA("Model") then
-                local part = current.PrimaryPart or current:FindFirstChildWhichIsA("BasePart", true)
+                local part = current.PrimaryPart
+                    or current:FindFirstChild("HumanoidRootPart")
+                    or current:FindFirstChildWhichIsA("BasePart", true)
                 if part then return part end
             end
             current = current.Parent
@@ -3709,12 +3712,41 @@ do
         return nil
     end
 
-    local function getSweepPrompts()
-        local prompts = {}
+    -- Exact path from ActionLogs V10:
+    -- Workspace.SideJobTrash.SideJobTrash.SweepPrompt
+    local function getExactSweepPrompt()
+        local outer = Workspace:FindFirstChild("SideJobTrash")
+        if not outer then return nil end
+
+        local inner = outer:FindFirstChild("SideJobTrash")
+        local prompt = inner and inner:FindFirstChild("SweepPrompt")
+
+        if prompt and prompt:IsA("ProximityPrompt") then
+            return prompt
+        end
+
+        -- Small exact-name fallback inside SideJobTrash in case one nesting level changes.
+        prompt = outer:FindFirstChild("SweepPrompt", true)
+        if prompt and prompt:IsA("ProximityPrompt") then
+            return prompt
+        end
+
+        return nil
+    end
+
+    local function getFallbackSweepPrompts()
+        local now = os.clock()
+        if now - lastFallbackScan < SWEEP_FALLBACK_RESCAN then
+            return fallbackPrompts
+        end
+
+        lastFallbackScan = now
+        fallbackPrompts = {}
         local seen = setmetatable({}, { __mode = "k" })
 
         local function scan(container)
             if not container then return end
+
             for _, obj in ipairs(container:GetDescendants()) do
                 if obj:IsA("ProximityPrompt") and obj.Enabled and not seen[obj] then
                     local name = string.lower(obj.Name or "")
@@ -3732,94 +3764,94 @@ do
 
                     if looksLikeSweep then
                         seen[obj] = true
-                        prompts[#prompts + 1] = obj
+                        fallbackPrompts[#fallbackPrompts + 1] = obj
                     end
                 end
             end
         end
 
-        -- Fast known location first. If the game reparents trash mid-round, fall back
-        -- to a full Workspace scan so the visible "Sweep / Trash" prompt is still found.
-        local root = Workspace:FindFirstChild("SideJobTrash")
-        scan(root)
-        if #prompts == 0 then
+        local trashRoot = Workspace:FindFirstChild("SideJobTrash")
+        scan(trashRoot)
+
+        if #fallbackPrompts == 0 then
             scan(Workspace)
         end
 
-        return prompts
-    end
-
-    local function sortPromptsByDistance(prompts)
-        local root = getRoot()
-        if not root then return prompts end
-
-        table.sort(prompts, function(a, b)
-            local partA = getPromptPart(a)
-            local partB = getPromptPart(b)
-            local distA = partA and (root.Position - partA.Position).Magnitude or math.huge
-            local distB = partB and (root.Position - partB.Position).Magnitude or math.huge
-            return distA < distB
-        end)
-
-        return prompts
-    end
-
-    local function teleportToPrompt(prompt)
-        local root = getRoot()
-        local part = getPromptPart(prompt)
-        if not root or not part then return false end
-
-        root.CFrame = part.CFrame * CFrame.new(0, SWEEP_TP_HEIGHT_OFFSET, SWEEP_TP_BACK_OFFSET)
-        return true
+        return fallbackPrompts
     end
 
     local function makePromptInstant(prompt)
         if not prompt then return end
         pcall(function() prompt.HoldDuration = 0 end)
-        pcall(function() prompt.MaxActivationDistance = math.max(tonumber(prompt.MaxActivationDistance) or 0, 100000) end)
         pcall(function() prompt.RequiresLineOfSight = false end)
         pcall(function() prompt.ClickablePrompt = true end)
+        pcall(function()
+            prompt.MaxActivationDistance = math.max(
+                tonumber(prompt.MaxActivationDistance) or 0,
+                100000
+            )
+        end)
     end
 
-    local function fireSweepPrompt(prompt)
-        if not prompt or not prompt.Parent or not prompt.Enabled then return false end
+    local function keepNearSweepPrompt(prompt)
+        local root = getRoot()
+        local part = getPromptPart(prompt)
+        if not root or not part then return false end
+
+        local distance = (root.Position - part.Position).Magnitude
+        local now = os.clock()
+
+        -- TP once for a newly recreated prompt, or again only if something moved us away.
+        if prompt ~= lastSweepPrompt
+            or (distance > SWEEP_RETP_DISTANCE and now - lastSweepTeleport >= SWEEP_RETP_COOLDOWN) then
+
+            root.CFrame = part.CFrame * CFrame.new(0, SWEEP_TP_HEIGHT_OFFSET, SWEEP_TP_BACK_OFFSET)
+            lastSweepTeleport = now
+        end
+
+        lastSweepPrompt = prompt
+        return true
+    end
+
+    local function fireSweepPromptOnce(prompt)
+        if not prompt or not prompt.Parent or not prompt.Enabled then
+            return false
+        end
+
         makePromptInstant(prompt)
 
-        local fired = false
-
         if type(fireproximityprompt) == "function" then
-            -- Fire more than once because some executors report success before the
-            -- game's prompt listener is ready immediately after a teleport.
-            for _ = 1, 2 do
-                if not prompt.Parent or not prompt.Enabled then break end
+            local ok = pcall(function()
+                fireproximityprompt(prompt, 0, true)
+            end)
 
-                local ok = pcall(function() fireproximityprompt(prompt, 0, true) end)
-                if not ok then
-                    ok = pcall(function() fireproximityprompt(prompt, 0) end)
-                end
-                if not ok then
-                    ok = pcall(function() fireproximityprompt(prompt) end)
-                end
-
-                fired = fired or ok
-                RunService.Heartbeat:Wait()
-            end
-        end
-
-        -- Input fallback for prompt systems that require the actual key event.
-        if prompt.Parent and prompt.Enabled then
-            local keyCode = prompt.KeyboardKeyCode
-            if keyCode and keyCode ~= Enum.KeyCode.Unknown then
-                local ok = pcall(function()
-                    VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
-                    task.wait(0.03)
-                    VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+            if not ok then
+                ok = pcall(function()
+                    fireproximityprompt(prompt, 0)
                 end)
-                fired = fired or ok
+            end
+
+            if not ok then
+                ok = pcall(function()
+                    fireproximityprompt(prompt)
+                end)
+            end
+
+            if ok then
+                return true
             end
         end
 
-        return fired
+        -- Executor fallback when fireproximityprompt is unavailable/fails.
+        local keyCode = prompt.KeyboardKeyCode
+        if keyCode and keyCode ~= Enum.KeyCode.Unknown then
+            return pcall(function()
+                VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+                VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+            end)
+        end
+
+        return false
     end
 
     task.spawn(function()
@@ -3827,49 +3859,59 @@ do
             if ENV.ZHM_AutoSweep ~= true then
                 ENV.ZHM_SweepActive = false
                 ENV.ZHM_SweepStatus = "OFF"
-                task.wait(0.2)
-            elseif isNight() then
-                local prompts = sortPromptsByDistance(getSweepPrompts())
-
-                if #prompts > 0 then
-                    ENV.ZHM_SweepActive = true
-                    ENV.ZHM_NPCBusy = false
-                    ENV.ZHM_SweepStatus = "Sweeping " .. tostring(#prompts) .. " target(s)"
-
-                    for _, prompt in ipairs(prompts) do
-                        if not isCurrent() or ENV.ZHM_AutoSweep ~= true or not isNight() then
-                            break
-                        end
-
-                        if prompt and prompt.Parent and prompt.Enabled and teleportToPrompt(prompt) then
-                            -- Give Roblox one rendered frame to register that the player
-                            -- is actually inside prompt range before forcing the prompt.
-                            RunService.Heartbeat:Wait()
-                            task.wait(0.03)
-
-                            if SWEEP_PROMPT_FIRE_DELAY > 0 then
-                                task.wait(SWEEP_PROMPT_FIRE_DELAY)
-                            end
-                            if not isNight() then break end
-
-                            local fired = fireSweepPrompt(prompt)
-                            ENV.ZHM_SweepStatus = fired
-                                and "Sweep prompt fired"
-                                or "Sweep prompt found • firing failed"
-
-                            task.wait(SWEEP_LOOP_DELAY)
-                        end
-                    end
-                else
-                    ENV.ZHM_SweepActive = false
-                    ENV.ZHM_SweepStatus = "Night • no trash"
-                end
-
-                task.wait(SWEEP_SCAN_INTERVAL)
-            else
+                lastSweepPrompt = nil
+                RunService.Heartbeat:Wait()
+            elseif not isNight() then
                 ENV.ZHM_SweepActive = false
                 ENV.ZHM_SweepStatus = "Waiting for night"
-                task.wait(0.25)
+                lastSweepPrompt = nil
+                RunService.Heartbeat:Wait()
+            else
+                -- PRIMARY METHOD: exact logged path, spammed every Heartbeat at night.
+                local exactPrompt = getExactSweepPrompt()
+
+                if exactPrompt and exactPrompt.Parent and exactPrompt.Enabled then
+                    ENV.ZHM_SweepActive = true
+                    ENV.ZHM_NPCBusy = false
+
+                    keepNearSweepPrompt(exactPrompt)
+                    local fired = fireSweepPromptOnce(exactPrompt)
+
+                    ENV.ZHM_SweepStatus = fired
+                        and "Night • DIRECT SweepPrompt SPAM"
+                        or "Night • SweepPrompt found • retrying"
+                else
+                    -- FALLBACK: if the exact path is temporarily missing/reparented,
+                    -- keep the previous live scanner as a compatibility safety net.
+                    local prompts = getFallbackSweepPrompts()
+                    local activePrompt = nil
+
+                    for _, prompt in ipairs(prompts) do
+                        if prompt and prompt.Parent and prompt.Enabled then
+                            activePrompt = prompt
+                            break
+                        end
+                    end
+
+                    if activePrompt then
+                        ENV.ZHM_SweepActive = true
+                        ENV.ZHM_NPCBusy = false
+
+                        keepNearSweepPrompt(activePrompt)
+                        local fired = fireSweepPromptOnce(activePrompt)
+
+                        ENV.ZHM_SweepStatus = fired
+                            and "Night • fallback Sweep SPAM"
+                            or "Night • fallback prompt • retrying"
+                    else
+                        ENV.ZHM_SweepActive = false
+                        ENV.ZHM_SweepStatus = "Night • no active trash prompt"
+                        lastSweepPrompt = nil
+                    end
+                end
+
+                -- No artificial sweep delay: the prompt is attempted once every Heartbeat.
+                RunService.Heartbeat:Wait()
             end
         end
 
@@ -4998,9 +5040,11 @@ mountGui(screenGui)
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
-mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+-- Spawn the main hub on the LEFT side of the screen.
+-- Keep a small 10 px margin while staying vertically centered.
+mainFrame.AnchorPoint = Vector2.new(0, 0.5)
 mainFrame.Size = UDim2.new(0, 340, 0, 390)
-mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+mainFrame.Position = UDim2.new(0, 10, 0.5, 0)
 mainFrame.BackgroundColor3 = UI_BG
 mainFrame.BorderSizePixel = 0
 mainFrame.Parent = screenGui
@@ -5688,7 +5732,8 @@ local expandedPosition = mainFrame.Position
 
 local miniButton = Instance.new("TextButton")
 miniButton.Name = "MiniButton"
-miniButton.AnchorPoint = Vector2.new(0.5, 0.5)
+-- Match the main frame anchor so minimizing/restoring does not shift horizontally.
+miniButton.AnchorPoint = Vector2.new(0, 0.5)
 miniButton.Size = UDim2.new(0, 46, 0, 46)
 miniButton.Position = expandedPosition
 miniButton.BackgroundColor3 = UI_PANEL
