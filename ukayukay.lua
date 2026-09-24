@@ -216,12 +216,12 @@ screenGui.DisplayOrder = 9999
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 mountGui(screenGui)
 
---// MAIN WINDOW
+--// MAIN WINDOW (Spawned on Left Side)
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
-mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+mainFrame.AnchorPoint = Vector2.new(0, 0.5)
 mainFrame.Size = UDim2.new(0, 340, 0, 420)
-mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+mainFrame.Position = UDim2.new(0, 20, 0.5, 0)
 mainFrame.BackgroundColor3 = UI_BG
 mainFrame.BorderSizePixel = 0
 mainFrame.Parent = screenGui
@@ -740,7 +740,7 @@ createInfoCard(miscPage, "Bale Handler", "Background processing handles crate ba
 local settingsPage = pages.Settings
 
 --------------------------------------------------
--- CONFIGURATION SAVE / LOAD SYSTEM
+-- CONFIGURATION SAVE / LOAD SYSTEM (FIXED)
 --------------------------------------------------
 local saveConfig, loadConfig
 
@@ -796,12 +796,12 @@ loadConfig = function(isAutoBoot)
 
     local success, data = pcall(function()
         local raw = readfile(CONFIG_FILE)
-        return HttpService:JSONEncode(raw)
+        return HttpService:JSONDecode(raw)
     end)
 
     if success and type(data) == "table" then
         if isAutoBoot and data.AutoLoad == false then
-            return -- Auto-load on boot is disabled in saved file
+            return
         end
 
         if data.AutoLoad ~= nil and toggles.AutoLoad then toggles.AutoLoad.Set(data.AutoLoad) end
@@ -1126,7 +1126,6 @@ local function getNPCHead(model)
     return model:FindFirstChild("Head") or getNPCRoot(model)
 end
 
--- Smooth Tween approach to moving NPC
 local function tweenToNPC(npc, speedStudsPerSec)
     speedStudsPerSec = speedStudsPerSec or 95
     local npcRoot = getNPCRoot(npc)
@@ -1149,7 +1148,6 @@ local function tweenToNPC(npc, speedStudsPerSec)
     tween.Completed:Wait()
 end
 
--- Continuous Glue-Tracking + Swing for full 3 Seconds
 local function attackAndFollowNPC(npc, durationSec)
     durationSec = durationSec or 3.0
     local startTime = os.clock()
@@ -1162,7 +1160,6 @@ local function attackAndFollowNPC(npc, durationSec)
             break
         end
 
-        -- Keep player glued right next to the walking NPC
         local npcPos = npcRoot.Position
         local npcLook = npcRoot.CFrame.LookVector
         local followPos = npcPos - (npcLook * 2.5) + Vector3.new(0, 0.5, 0)
@@ -1172,7 +1169,6 @@ local function attackAndFollowNPC(npc, durationSec)
             playerRoot.AssemblyLinearVelocity = Vector3.zero
         end)
 
-        -- Fire swing remotes continuously
         pcall(function() setHangerLookRemote:FireServer(npcRoot) end)
         pcall(function() setHangerLookRemote:FireServer(npcRoot.CFrame) end)
         
@@ -1192,7 +1188,6 @@ local function attackAndFollowNPC(npc, durationSec)
     end
 end
 
--- Teleport instantly back to Desk Fan 1
 local function tpBackToDeskFan1()
     teleportToDeskFan1()
 end
@@ -1337,7 +1332,6 @@ task.spawn(function()
     end
 end)
 
---// TRIGGER LIVE-TRACKING ACTION + 3-SECOND SWING + RETURN
 local isHandlingNpc = false
 
 local function triggerHangerAction(npc)
@@ -1475,9 +1469,9 @@ end)
 local minimized = false
 local miniButton = Instance.new("TextButton")
 miniButton.Name = "MiniButton"
-miniButton.AnchorPoint = Vector2.new(0.5, 0.5)
+miniButton.AnchorPoint = Vector2.new(0, 0.5)
 miniButton.Size = UDim2.new(0, 46, 0, 46)
-miniButton.Position = mainFrame.Position
+miniButton.Position = UDim2.new(0, 20, 0.5, 0)
 miniButton.BackgroundColor3 = UI_PANEL
 miniButton.BorderSizePixel = 0
 miniButton.Text = MINI_TEXT
@@ -1521,4 +1515,4 @@ task.spawn(function()
     setMinimized(true) -- Always auto-minimizes upon execution
 end)
 
-print("[ZHM HUB] Loaded Successfully with Permanent Auto-Minimize & Config Management!")
+print("[ZHM HUB] Loaded Successfully with Left-Side Spawn, Permanent Auto-Minimize & Config Management!")
