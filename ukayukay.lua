@@ -1883,12 +1883,18 @@ end)
 
 if TAB_DEFINITIONS[1] then setActivePage(TAB_DEFINITIONS[1].Key) end
 
---// AUTO-LOAD CONFIG
--- Keep the ZHM hub visible on startup. It only minimizes if you press the minimize/close button.
+--// AUTO-LOAD CONFIG + AUTO MINIMIZE ON EXECUTE
+-- Start minimized immediately so only the floating Z button is shown.
+setMinimized(true)
+
 task.spawn(function()
     task.wait(0.5)
     loadConfig(true)
-    setMinimized(false)
+
+    -- Config loading or other startup code must never reopen the main hub.
+    if screenGui and screenGui.Parent then
+        setMinimized(true)
+    end
 end)
 
 print("[ZHM HUB] Loaded Successfully with Anti-AFK, Red-Text-Only Warning Filter, Full Game UI Visible & Config Management!")
