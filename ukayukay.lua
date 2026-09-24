@@ -1,3 +1,8 @@
+--// NETWORK PAUSE BYPASS
+pcall(function()
+    game:GetService("CoreGui").RobloxGui["CoreScripts/NetworkPause"]:Destroy()
+end)
+
 --// SERVICES
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
