@@ -1152,113 +1152,101 @@ end
 startAutoNearestPrompt()
 
 --------------------------------------------------------------------------------
--- AUTO BUY BAKING RACK: LIVE PROMPT DETECTOR
--- Detects the green ProximityPrompt shown as:
---   ActionText = "Buy"
---   ObjectText = "Baking Rack"
--- When enabled from the UI, matching prompts are fired automatically even if
--- another interaction is closer to the player. The normal Instant Proximity
--- system stays permanently ON independently of this feature.
+-- AUTO BUY BAKING RACK: DYNAMIC MY-PLOT DIRECT SPAM (NO TELEPORT)
+-- Dynamically resolves the player's owned plot, then repeatedly fires:
+--   MyPlot.Equipment.BakingRack["1".."100"].BuyBakingRackPrompt
+-- No TP is used. Prompts are made instant + long-range and fired every 0.10s.
 --------------------------------------------------------------------------------
 local AUTO_BUY_BAKING_RACK_SCAN_DELAY = 0.10
-local AUTO_BUY_BAKING_RACK_REFIRE_DELAY = 0.35
-local bakingRackBuyLastFire = setmetatable({}, { __mode = "k" })
 
-local function textHasBakingRack(value)
-    local textValue = string.lower(tostring(value or ""))
-    return textValue:find("baking rack", 1, true) ~= nil
-        or textValue:find("bakingrack", 1, true) ~= nil
-end
+-- Separate resolver for Auto Buy so this feature follows the supplied
+-- standalone script without changing the plot logic used by other ZHM features.
+local function findAutoBuyBakingRackPlot()
+    local shops = Workspace:FindFirstChild("Game")
+        and Workspace.Game:FindFirstChild("Shops")
 
-local function isBuyBakingRackPrompt(prompt)
-    if not prompt or not prompt.Parent or not prompt:IsA("ProximityPrompt") then
-        return false
+    if not shops then
+        return nil
     end
 
-    local actionText = string.lower(tostring(prompt.ActionText or ""))
-    local objectText = string.lower(tostring(prompt.ObjectText or ""))
-    local promptName = string.lower(tostring(prompt.Name or ""))
+    for _, plot in ipairs(shops:GetChildren()) do
+        local owner = plot:FindFirstChild("Owner") or plot:FindFirstChild("Player")
 
-    -- Exact match for the prompt shown in the screenshot.
-    if actionText == "buy"
-        and (objectText == "baking rack" or objectText == "bakingrack") then
-        return true
-    end
-
-    -- Compatibility fallback for small text/name changes made by the game.
-    local hasBuy = actionText:find("buy", 1, true) ~= nil
-        or promptName:find("buy", 1, true) ~= nil
-
-    if not hasBuy then
-        return false
-    end
-
-    if textHasBakingRack(objectText) or textHasBakingRack(promptName) then
-        return true
-    end
-
-    local current = prompt.Parent
-    local depth = 0
-    while current and current ~= Workspace and depth < 8 do
-        if textHasBakingRack(current.Name) then
-            return true
+        if owner and owner:IsA("ValueBase") then
+            if owner.Value == player
+                or owner.Value == player.Name
+                or owner.Value == player.UserId then
+                return plot
+            end
         end
-        current = current.Parent
-        depth += 1
+
+        if plot:GetAttribute("OwnerUserId") == player.UserId then
+            return plot
+        end
     end
 
-    return false
+    -- Same compatibility fallback as the supplied script.
+    return shops:FindFirstChild("Plot1")
 end
 
 local function startAutoBuyBakingRack()
     task.spawn(function()
         while isCurrent() do
             if ENV.ZHM_AutoBuyBakingRack == true then
-                local found = 0
-                local fired = 0
-                local now = os.clock()
+                -- Re-find the plot/folders every loop because purchases can rebuild
+                -- rack instances and some servers may assign a different plot.
+                local plot = findAutoBuyBakingRackPlot()
+                local equipmentFolder = plot and plot:FindFirstChild("Equipment")
+                local bakingRackFolder = equipmentFolder and equipmentFolder:FindFirstChild("BakingRack")
 
-                for interaction in pairs(nearestInteractions) do
-                    if not isCurrent() then return end
+                if bakingRackFolder then
+                    local found = 0
+                    local fired = 0
 
-                    if interaction
-                        and interaction.Parent
-                        and interaction:IsA("ProximityPrompt")
-                        and interaction.Enabled
-                        and isBuyBakingRackPrompt(interaction) then
+                    for i = 1, 100 do
+                        if not isCurrent() then return end
+                        if ENV.ZHM_AutoBuyBakingRack ~= true then break end
 
-                        found += 1
+                        local rackModel = bakingRackFolder:FindFirstChild(tostring(i))
+                        if rackModel then
+                            local prompt = rackModel:FindFirstChild("BuyBakingRackPrompt")
+                            if prompt and prompt:IsA("ProximityPrompt") then
+                                found += 1
 
-                        local lastFire = bakingRackBuyLastFire[interaction] or 0
-                        if now - lastFire >= AUTO_BUY_BAKING_RACK_REFIRE_DELAY then
-                            bakingRackBuyLastFire[interaction] = now
+                                -- Supplied no-TP direct prompt method.
+                                pcall(function()
+                                    prompt.HoldDuration = 0
+                                    prompt.MaxActivationDistance = 999999
+                                end)
 
-                            -- Keep the target prompt fully instant/reachable, then fire it.
-                            pcall(function() interaction.HoldDuration = 0 end)
-                            pcall(function() interaction.RequiresLineOfSight = false end)
-                            pcall(function() interaction.ClickablePrompt = true end)
-                            pcall(function()
-                                interaction.MaxActivationDistance = math.max(
-                                    tonumber(interaction.MaxActivationDistance) or 0,
-                                    100000
-                                )
-                            end)
+                                local ok = pcall(function()
+                                    fireproximityprompt(prompt)
+                                end)
 
-                            if firePromptSafe(interaction, "BuyBakingRack") then
-                                fired += 1
+                                if ok then
+                                    fired += 1
+                                end
                             end
                         end
                     end
-                end
 
-                if found == 0 then
-                    ENV.ZHM_BuyBakingRackStatus = "LIVE • waiting for Buy / Baking Rack prompt"
-                elseif fired > 0 then
-                    ENV.ZHM_BuyBakingRackStatus = "LIVE • detected " .. tostring(found)
-                        .. " • fired " .. tostring(fired)
+                    if found > 0 then
+                        ENV.ZHM_BuyBakingRackStatus =
+                            "SPAMMING • " .. tostring(plot and plot.Name or "Unknown Plot")
+                            .. " • found " .. tostring(found)
+                            .. " • fired " .. tostring(fired)
+                    else
+                        ENV.ZHM_BuyBakingRackStatus =
+                            "SPAMMING • " .. tostring(plot and plot.Name or "Unknown Plot")
+                            .. " • BakingRack found • no numbered prompts"
+                    end
+                elseif plot then
+                    ENV.ZHM_BuyBakingRackStatus =
+                        "SPAMMING • " .. tostring(plot.Name)
+                        .. " • BakingRack folder not found in Equipment"
                 else
-                    ENV.ZHM_BuyBakingRackStatus = "LIVE • detected " .. tostring(found)
-                        .. " • refire cooldown"
+                    ENV.ZHM_BuyBakingRackStatus =
+                        "SPAMMING • owned plot not found"
                 end
             else
                 ENV.ZHM_BuyBakingRackStatus = "Auto Buy Baking Rack disabled"
@@ -5473,7 +5461,7 @@ end, 64)
 
 createSection(extraPage, "Extra Automation")
 createToggle(extraPage, "Auto Buy All Market", "Buy all GUI Market items + world Buy prompts", "ZHM_AutoBuy", false)
-createToggle(extraPage, "Auto Buy Baking Rack", "LIVE detect Buy / Baking Rack prompt and fire it automatically", "ZHM_AutoBuyBakingRack", false)
+createToggle(extraPage, "Auto Buy Baking Rack", "Dynamic my-plot BakingRack 1-100 spam every 0.1s • no TP", "ZHM_AutoBuyBakingRack", false)
 createInfoCard(extraPage, "Baking Rack Buyer", function()
     return tostring(ENV.ZHM_BuyBakingRackStatus or "Auto Buy Baking Rack disabled")
 end, 54)
