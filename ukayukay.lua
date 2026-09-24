@@ -42,62 +42,393 @@ local UI_STROKE  = Color3.fromRGB(53, 59, 70)
 local UI_DANGER  = Color3.fromRGB(235, 92, 92)
 
 --------------------------------------------------
--- ALWAYS-ON UI CLEANER (CashFrame & Hub Protection)
+-- GAME UI SAFETY
+-- Never destroys or hides the game's GUI objects.
+-- The popup filter below only suppresses popup text glyphs.
 --------------------------------------------------
-local function getCashFrame()
-    local gameUI = playerGui:FindFirstChild("GameUI")
-    if not gameUI then return nil end
-    local HUD = gameUI:FindFirstChild("HUD")
-    if not HUD then return nil end
-    local bottomLeft = HUD:FindFirstChild("BottomLeft")
-    if not bottomLeft then return nil end
-    return bottomLeft:FindFirstChild("CashFrame")
+
+--------------------------------------------------
+-- OPTIMIZED SCREEN POPUP TEXT HIDER
+--
+-- PERFORMANCE FIX:
+--   * NO RenderStepped loop
+--   * NO Heartbeat loop
+--   * NO Workspace:GetDescendants() scanning
+--   * NO 0.20-second repeated full GUI scans
+--   * NO AbsolutePosition / AbsoluteSize change listeners
+--
+-- It is now event-driven. Existing TextLabels are indexed once, then only
+-- newly-created / changed labels are checked.
+--------------------------------------------------
+local hidePopupTextActive = true
+
+local popupTextStates = setmetatable({}, {__mode = "k"})
+local popupTextConnections = setmetatable({}, {__mode = "k"})
+local popupDynamic = setmetatable({}, {__mode = "k"})
+
+local POPUP_NAME_KEYWORDS = {
+    "notification", "notify", "warning", "warn", "popup", "message",
+    "alert", "error", "toast", "banner", "announce", "announcement",
+    "prompt", "notice", "feedback", "statusmessage"
+}
+
+local function isPopupTextObject(obj)
+    return obj and obj:IsA("TextLabel")
 end
 
-local function shouldKeep(obj)
-    -- 1. Keep Mobile Touch Controls
-    local touchGui = playerGui:FindFirstChild("TouchGui")
-    if obj.Name == "TouchGui" or (touchGui and obj:IsDescendantOf(touchGui)) then
-        return true
-    end
+local function getCashFrameForPopupProtection()
+    local gameUI = playerGui:FindFirstChild("GameUI")
+    local hud = gameUI and gameUI:FindFirstChild("HUD")
+    local bottomLeft = hud and hud:FindFirstChild("BottomLeft")
+    return bottomLeft and bottomLeft:FindFirstChild("CashFrame") or nil
+end
 
-    -- 2. Protect ZHM Hub & ESP ScreenGuis
-    local rootGui = obj:FindFirstAncestorOfClass("ScreenGui") or (obj:IsA("ScreenGui") and obj)
-    if rootGui and (rootGui.Name:find("ZHM") or rootGui.Name:find("Hub") or rootGui.Name == GUI_NAME) then
-        return true
-    end
-
-    -- 3. Keep CashFrame & Hierarchy
-    local cashFrame = getCashFrame()
-    if cashFrame then
-        if obj == cashFrame or obj:IsDescendantOf(cashFrame) or cashFrame:IsDescendantOf(obj) then
+local function hasProtectedAncestorName(obj)
+    local current = obj
+    while current do
+        local n = string.lower(tostring(current.Name or ""))
+        if n == "touchgui"
+            or n:find("experiencechat", 1, true)
+            or n:find("playerlist", 1, true)
+            or n:find("backpack", 1, true)
+            or n:find("topbar", 1, true)
+        then
             return true
         end
+        current = current.Parent
+    end
+    return false
+end
+
+local function isProtectedPopupText(obj)
+    if not obj then
+        return true
+    end
+
+    local rootGui = obj:FindFirstAncestorOfClass("ScreenGui")
+    if rootGui then
+        local guiName = tostring(rootGui.Name or "")
+        if guiName == GUI_NAME or guiName == "ZHM_NPC_ESP" then
+            return true
+        end
+    end
+
+    local cashFrame = getCashFrameForPopupProtection()
+    if cashFrame and (obj == cashFrame or obj:IsDescendantOf(cashFrame)) then
+        return true
+    end
+
+    return hasProtectedAncestorName(obj)
+end
+
+local function popupNameLooksRelevant(obj)
+    local current = obj
+    local depth = 0
+
+    while current and depth < 7 do
+        local n = string.lower(tostring(current.Name or "")):gsub("[%s_%-%p]", "")
+
+        for _, keyword in ipairs(POPUP_NAME_KEYWORDS) do
+            local k = keyword:gsub("[%s_%-%p]", "")
+            if n:find(k, 1, true) then
+                return true
+            end
+        end
+
+        current = current.Parent
+        depth += 1
     end
 
     return false
 end
 
-local function purgeUI()
+local function getViewportSize()
+    local camera = Workspace.CurrentCamera
+    return camera and camera.ViewportSize or Vector2.new(1920, 1080)
+end
+
+local function isKnownWarningText(text)
+    local lower = string.lower(text)
+
+    return lower:find("you don't own", 1, true)
+        or lower:find("you dont own", 1, true)
+        or lower:find("out of stock", 1, true)
+        or lower:find("until the next restock", 1, true)
+end
+
+local function textLooksLikePopup(obj)
+    if not isPopupTextObject(obj) or isProtectedPopupText(obj) then
+        return false
+    end
+
+    local textValue = tostring(obj.Text or "")
+    local trimmed = textValue:gsub("^%s+", ""):gsub("%s+$", "")
+
+    if trimmed == "" then
+        return false
+    end
+
+    -- Always catch the known warning wording.
+    if isKnownWarningText(trimmed) then
+        return true
+    end
+
+    -- Names such as Warning / Notification / Toast / Message are cheap and
+    -- reliable signals.
+    if popupNameLooksRelevant(obj) then
+        return true
+    end
+
+    -- Generic popup detection is intentionally limited to DYNAMIC labels.
+    -- This prevents normal static HUD/menu text from being hidden.
+    if not popupDynamic[obj] then
+        return false
+    end
+
+    if not obj.Visible then
+        return false
+    end
+
+    local size = obj.AbsoluteSize
+    local pos = obj.AbsolutePosition
+    local viewport = getViewportSize()
+
+    if size.X <= 0 or size.Y <= 0 then
+        return false
+    end
+
+    local centerX = pos.X + (size.X * 0.5)
+    local centerY = pos.Y + (size.Y * 0.5)
+
+    local nearHorizontalCenter =
+        math.abs(centerX - viewport.X * 0.5) <= viewport.X * 0.43
+
+    local inPopupBand =
+        centerY >= viewport.Y * 0.02
+        and centerY <= viewport.Y * 0.76
+
+    local messageSized =
+        size.X >= math.max(120, viewport.X * 0.12)
+        and size.Y >= 16
+        and size.Y <= math.max(260, viewport.Y * 0.34)
+
+    local readablePopupText =
+        obj.TextScaled == true
+        or obj.TextSize >= 14
+
+    return nearHorizontalCenter
+        and inPopupBand
+        and messageSized
+        and readablePopupText
+end
+
+local function restorePopupTextObject(obj)
+    local state = popupTextStates[obj]
+    if not state then
+        return
+    end
+
+    if obj and obj.Parent then
+        pcall(function()
+            obj.MaxVisibleGraphemes = state.MaxVisibleGraphemes
+            obj.TextTransparency = state.TextTransparency
+            obj.TextStrokeTransparency = state.TextStrokeTransparency
+        end)
+    end
+
+    popupTextStates[obj] = nil
+end
+
+local function forcePopupTextHidden(obj)
+    if not obj or not obj.Parent then
+        return
+    end
+
+    if popupTextStates[obj] == nil then
+        popupTextStates[obj] = {
+            MaxVisibleGraphemes = obj.MaxVisibleGraphemes,
+            TextTransparency = obj.TextTransparency,
+            TextStrokeTransparency = obj.TextStrokeTransparency,
+        }
+    end
+
+    pcall(function()
+        if obj.MaxVisibleGraphemes ~= 0 then
+            obj.MaxVisibleGraphemes = 0
+        end
+
+        if obj.TextTransparency ~= 1 then
+            obj.TextTransparency = 1
+        end
+
+        if obj.TextStrokeTransparency ~= 1 then
+            obj.TextStrokeTransparency = 1
+        end
+    end)
+end
+
+local function updatePopupTextObject(obj)
+    if not isPopupTextObject(obj) or not obj.Parent then
+        return
+    end
+
+    if hidePopupTextActive and textLooksLikePopup(obj) then
+        forcePopupTextHidden(obj)
+    else
+        restorePopupTextObject(obj)
+    end
+end
+
+local function watchPopupTextObject(obj, markDynamic)
+    if not isPopupTextObject(obj) then
+        return
+    end
+
+    if markDynamic then
+        popupDynamic[obj] = true
+    end
+
+    if not popupTextConnections[obj] then
+        local connections = {}
+
+        local function connectProperty(propertyName, callback)
+            local ok, connection = pcall(function()
+                return obj:GetPropertyChangedSignal(propertyName):Connect(callback)
+            end)
+
+            if ok and connection then
+                table.insert(connections, connection)
+            end
+        end
+
+        -- Recycled notification labels normally change Text or Visible.
+        -- These two events replace the expensive continuous GUI scans.
+        connectProperty("Text", function()
+            popupDynamic[obj] = true
+            task.defer(function()
+                if obj and obj.Parent then
+                    updatePopupTextObject(obj)
+                end
+            end)
+        end)
+
+        connectProperty("Visible", function()
+            if obj.Visible then
+                popupDynamic[obj] = true
+            end
+
+            task.defer(function()
+                if obj and obj.Parent then
+                    updatePopupTextObject(obj)
+                end
+            end)
+        end)
+
+        -- If the game tries to restore an already-hidden popup, immediately
+        -- force only that one label back to hidden. No per-frame loop needed.
+        connectProperty("MaxVisibleGraphemes", function()
+            if hidePopupTextActive
+                and popupTextStates[obj]
+                and obj.MaxVisibleGraphemes ~= 0
+            then
+                pcall(function()
+                    obj.MaxVisibleGraphemes = 0
+                end)
+            end
+        end)
+
+        connectProperty("TextTransparency", function()
+            if hidePopupTextActive
+                and popupTextStates[obj]
+                and obj.TextTransparency ~= 1
+            then
+                pcall(function()
+                    obj.TextTransparency = 1
+                end)
+            end
+        end)
+
+        connectProperty("TextStrokeTransparency", function()
+            if hidePopupTextActive
+                and popupTextStates[obj]
+                and obj.TextStrokeTransparency ~= 1
+            then
+                pcall(function()
+                    obj.TextStrokeTransparency = 1
+                end)
+            end
+        end)
+
+        popupTextConnections[obj] = connections
+    end
+
+    -- One deferred check gives Roblox a moment to finish layout calculations.
+    task.defer(function()
+        if obj and obj.Parent then
+            updatePopupTextObject(obj)
+        end
+    end)
+end
+
+local function scanExistingPlayerGuiOnce()
+    -- ONE-TIME scan only. We intentionally do not scan Workspace because the
+    -- requested warning is screen UI and scanning the whole 3D world was the
+    -- main performance problem.
     for _, obj in ipairs(playerGui:GetDescendants()) do
-        if obj:IsA("GuiObject") and not shouldKeep(obj) then
-            pcall(function() obj:Destroy() end)
+        if isPopupTextObject(obj) then
+            watchPopupTextObject(obj, false)
         end
     end
 end
 
--- Run initial cleanup & setup active listener
-purgeUI()
+local function restoreAllPopupText()
+    local objects = {}
 
+    for obj in pairs(popupTextStates) do
+        table.insert(objects, obj)
+    end
+
+    for _, obj in ipairs(objects) do
+        restorePopupTextObject(obj)
+    end
+end
+
+local function setPopupTextHidden(enabled)
+    hidePopupTextActive = enabled == true
+
+    if hidePopupTextActive then
+        -- Refresh current labels once when the toggle is switched ON.
+        for obj in pairs(popupTextConnections) do
+            if obj and obj.Parent then
+                updatePopupTextObject(obj)
+            end
+        end
+    else
+        restoreAllPopupText()
+    end
+end
+
+-- Index current PlayerGui TextLabels only once.
+scanExistingPlayerGuiOnce()
+
+-- Watch only labels created later.
 playerGui.DescendantAdded:Connect(function(obj)
-    if obj:IsA("GuiObject") then
-        task.defer(function()
-            if obj and obj.Parent and not shouldKeep(obj) then
-                pcall(function() obj:Destroy() end)
+    if isPopupTextObject(obj) then
+        popupDynamic[obj] = true
+
+        -- A short delayed check catches popups whose size/position is assigned
+        -- immediately after creation, without any continuous scanning.
+        task.delay(0.03, function()
+            if obj and obj.Parent then
+                watchPopupTextObject(obj, true)
             end
         end)
     end
 end)
+
+-- Keep enabled by default; the Settings toggle controls this later.
+setPopupTextHidden(true)
+
 
 --// UI HELPERS
 local function addCorner(parent, radius)
@@ -737,6 +1068,39 @@ local miscPage = pages.Misc
 createSection(miscPage, "UTILITIES & EXTRAS")
 createInfoCard(miscPage, "Bale Handler", "Background processing handles crate bales automatically.", 58)
 
+local antiAfkActive = true
+toggles.AntiAFK = createToggle(miscPage, "Anti AFK", "Prevents idle disconnect while enabled", true, function(e)
+    antiAfkActive = e
+end)
+
+-- Disconnect an older Anti-AFK connection when re-executing the script.
+local antiAfkConnection
+pcall(function()
+    if getgenv then
+        local env = getgenv()
+        if env.ZHM_ANTI_AFK_CONNECTION then
+            pcall(function() env.ZHM_ANTI_AFK_CONNECTION:Disconnect() end)
+        end
+    end
+
+    antiAfkConnection = player.Idled:Connect(function()
+        if not antiAfkActive then return end
+
+        pcall(function()
+            VirtualUser:CaptureController()
+            local camera = Workspace.CurrentCamera
+            local cameraCFrame = camera and camera.CFrame or CFrame.new()
+            VirtualUser:Button2Down(Vector2.new(0, 0), cameraCFrame)
+            task.wait(0.1)
+            VirtualUser:Button2Up(Vector2.new(0, 0), cameraCFrame)
+        end)
+    end)
+
+    if getgenv then
+        getgenv().ZHM_ANTI_AFK_CONNECTION = antiAfkConnection
+    end
+end)
+
 local settingsPage = pages.Settings
 
 --------------------------------------------------
@@ -758,6 +1122,8 @@ saveConfig = function()
         AutoClaimPayment = toggles.AutoClaimPayment and toggles.AutoClaimPayment.Get() or false,
         AutoUnlock = toggles.AutoUnlock and toggles.AutoUnlock.Get() or false,
         AutoSpeedTp = toggles.AutoSpeedTp and toggles.AutoSpeedTp.Get() or false,
+        AntiAFK = toggles.AntiAFK and (toggles.AntiAFK.Get() == true) or false,
+        HidePopupText = toggles.HidePopupText and (toggles.HidePopupText.Get() == true) or false,
     }
 
     pcall(function()
@@ -811,6 +1177,13 @@ loadConfig = function(isAutoBoot)
         if data.AutoClaimPayment ~= nil and toggles.AutoClaimPayment then toggles.AutoClaimPayment.Set(data.AutoClaimPayment) end
         if data.AutoUnlock ~= nil and toggles.AutoUnlock then toggles.AutoUnlock.Set(data.AutoUnlock) end
         if data.AutoSpeedTp ~= nil and toggles.AutoSpeedTp then toggles.AutoSpeedTp.Set(data.AutoSpeedTp) end
+        if data.AntiAFK ~= nil and toggles.AntiAFK then toggles.AntiAFK.Set(data.AntiAFK) end
+        if data.HidePopupText ~= nil and toggles.HidePopupText then
+            toggles.HidePopupText.Set(data.HidePopupText)
+        elseif data.HideRedWarnings ~= nil and toggles.HidePopupText then
+            -- Backward compatibility with configs from the previous version.
+            toggles.HidePopupText.Set(data.HideRedWarnings)
+        end
 
         statusCard.SetText("[Config] Settings loaded successfully!")
     else
@@ -835,7 +1208,11 @@ createActionButton(settingsPage, "Load Config", "Restores saved settings & toggl
 end)
 
 createSection(settingsPage, "INTERFACE CONTROLS")
-createInfoCard(settingsPage, "ZHM HUB Info", "Version 3.26 - Permanent Auto-Minimize On Execute", 65)
+toggles.HidePopupText = createToggle(settingsPage, "Hide Screen Popup Text", "Hides popup/notification text of any color; frames and normal UI stay visible", true, function(e)
+    setPopupTextHidden(e)
+end)
+
+createInfoCard(settingsPage, "ZHM HUB Info", "Version 3.32 - Anti AFK + Live Popup Text Filter", 65)
 
 --// REMOTES & LOOPS
 local remotesFolder = ReplicatedStorage:WaitForChild("Remotes")
@@ -1210,7 +1587,6 @@ player.CharacterAdded:Connect(function()
     task.wait(0.8)
     forceEquipHangerOnce()
     teleportToDeskFan1()
-    purgeUI()
 end)
 
 --// LOCAL NPC SCANNING (Speed 10-13 Filter, Max Distance 50 Studs)
@@ -1501,18 +1877,18 @@ minimizeBtn.Activated:Connect(function() setMinimized(true) end)
 miniButton.Activated:Connect(function() setMinimized(false) end)
 
 closeBtn.Activated:Connect(function()
-    if disconnectResponsiveScale then disconnectResponsiveScale() end
-    speedScreenGui:Destroy()
-    screenGui:Destroy()
+    -- Hide instead of destroying. The floating Z button restores the hub.
+    setMinimized(true)
 end)
 
 if TAB_DEFINITIONS[1] then setActivePage(TAB_DEFINITIONS[1].Key) end
 
---// AUTO-LOAD CONFIG & ALWAYS AUTO-MINIMIZE ON BOOT
+--// AUTO-LOAD CONFIG
+-- Keep the ZHM hub visible on startup. It only minimizes if you press the minimize/close button.
 task.spawn(function()
     task.wait(0.5)
     loadConfig(true)
-    setMinimized(true) -- Always auto-minimizes upon execution
+    setMinimized(false)
 end)
 
-print("[ZHM HUB] Loaded Successfully with Left-Side Spawn, Permanent Auto-Minimize & Config Management!")
+print("[ZHM HUB] Loaded Successfully with Anti-AFK, Red-Text-Only Warning Filter, Full Game UI Visible & Config Management!")
