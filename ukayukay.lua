@@ -7,14 +7,17 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local VirtualUser = game:GetService("VirtualUser")
+local HttpService = game:GetService("HttpService")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
---// EASY CONFIG
+--// EASY CONFIG & PATHS
 local GUI_NAME = "ZHM_UI_Template"
 local HUB_TITLE = "ZHM HUB - Desk Fan 1"
 local MINI_TEXT = "Z"
+local CONFIG_FOLDER = "ZHM_HUB"
+local CONFIG_FILE = "ZHM_HUB/Config.json"
 
 local TAB_DEFINITIONS = {
     {Key = "Main", Label = "MAIN"},
@@ -32,6 +35,64 @@ local UI_TEXT    = Color3.fromRGB(242, 244, 248)
 local UI_MUTED   = Color3.fromRGB(145, 151, 163)
 local UI_STROKE  = Color3.fromRGB(53, 59, 70)
 local UI_DANGER  = Color3.fromRGB(235, 92, 92)
+
+--------------------------------------------------
+-- ALWAYS-ON UI CLEANER (CashFrame & Hub Protection)
+--------------------------------------------------
+local function getCashFrame()
+    local gameUI = playerGui:FindFirstChild("GameUI")
+    if not gameUI then return nil end
+    local HUD = gameUI:FindFirstChild("HUD")
+    if not HUD then return nil end
+    local bottomLeft = HUD:FindFirstChild("BottomLeft")
+    if not bottomLeft then return nil end
+    return bottomLeft:FindFirstChild("CashFrame")
+end
+
+local function shouldKeep(obj)
+    -- 1. Keep Mobile Touch Controls
+    local touchGui = playerGui:FindFirstChild("TouchGui")
+    if obj.Name == "TouchGui" or (touchGui and obj:IsDescendantOf(touchGui)) then
+        return true
+    end
+
+    -- 2. Protect ZHM Hub & ESP ScreenGuis
+    local rootGui = obj:FindFirstAncestorOfClass("ScreenGui") or (obj:IsA("ScreenGui") and obj)
+    if rootGui and (rootGui.Name:find("ZHM") or rootGui.Name:find("Hub") or rootGui.Name == GUI_NAME) then
+        return true
+    end
+
+    -- 3. Keep CashFrame & Hierarchy
+    local cashFrame = getCashFrame()
+    if cashFrame then
+        if obj == cashFrame or obj:IsDescendantOf(cashFrame) or cashFrame:IsDescendantOf(obj) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function purgeUI()
+    for _, obj in ipairs(playerGui:GetDescendants()) do
+        if obj:IsA("GuiObject") and not shouldKeep(obj) then
+            pcall(function() obj:Destroy() end)
+        end
+    end
+end
+
+-- Run initial cleanup & setup active listener
+purgeUI()
+
+playerGui.DescendantAdded:Connect(function(obj)
+    if obj:IsA("GuiObject") then
+        task.defer(function()
+            if obj and obj.Parent and not shouldKeep(obj) then
+                pcall(function() obj:Destroy() end)
+            end
+        end)
+    end
+end)
 
 --// UI HELPERS
 local function addCorner(parent, radius)
@@ -398,6 +459,62 @@ local function createToggle(parent, title, description, defaultValue, callback)
     }
 end
 
+local function createActionButton(parent, title, description, buttonText, callback)
+    local row = Instance.new("Frame")
+    row.Name = title:gsub("%W+", "") .. "Button"
+    row.Size = UDim2.new(1, 0, 0, description and 50 or 42)
+    row.BackgroundColor3 = UI_PANEL
+    row.BorderSizePixel = 0
+    row.Parent = parent
+    addCorner(row, 8)
+    addStroke(row, UI_STROKE, 1, 0.45)
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -110, 0, 18)
+    label.Position = UDim2.new(0, 10, 0, description and 6 or 11)
+    label.BackgroundTransparency = 1
+    label.Text = title
+    label.TextColor3 = UI_TEXT
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 10
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = row
+
+    if description then
+        local desc = Instance.new("TextLabel")
+        desc.Size = UDim2.new(1, -110, 0, 18)
+        desc.Position = UDim2.new(0, 10, 0, 25)
+        desc.BackgroundTransparency = 1
+        desc.Text = description
+        desc.TextColor3 = UI_MUTED
+        desc.Font = Enum.Font.Gotham
+        desc.TextSize = 7
+        desc.TextTruncate = Enum.TextTruncate.AtEnd
+        desc.TextXAlignment = Enum.TextXAlignment.Left
+        desc.Parent = row
+    end
+
+    local btn = Instance.new("TextButton")
+    btn.Name = "Btn"
+    btn.Size = UDim2.new(0, 85, 0, 28)
+    btn.Position = UDim2.new(1, -95, 0.5, -14)
+    btn.BackgroundColor3 = UI_ACCENT
+    btn.BorderSizePixel = 0
+    btn.AutoButtonColor = true
+    btn.Text = buttonText or "ACTION"
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 9
+    btn.Parent = row
+    addCorner(btn, 7)
+
+    btn.Activated:Connect(function()
+        if callback then task.spawn(callback) end
+    end)
+
+    return row
+end
+
 local function createInfoCard(parent, title, textValue, height)
     local card = Instance.new("Frame")
     card.Name = title:gsub("%W+", "") .. "Info"
@@ -441,6 +558,7 @@ end
 
 local function createMultiDropdown(parent, title, options, callback)
     local selectedOptions = {}
+    local optionButtons = {}
     local isOpen = false
 
     local card = Instance.new("Frame")
@@ -535,6 +653,8 @@ local function createMultiDropdown(parent, title, options, callback)
         optBtn.Parent = listHolder
         addCorner(optBtn, 5)
 
+        optionButtons[opt] = optBtn
+
         optBtn.Activated:Connect(function()
             local current = selectedOptions[opt] == true
             selectedOptions[opt] = not current
@@ -555,7 +675,30 @@ local function createMultiDropdown(parent, title, options, callback)
         arrow.Text = isOpen and "▲" or "▼"
     end)
 
-    return { Card = card, Get = function() return selectedOptions end }
+    return {
+        Card = card,
+        Get = function() return selectedOptions end,
+        Set = function(newSelected)
+            selectedOptions = {}
+            for opt, active in pairs(newSelected or {}) do
+                if active then selectedOptions[opt] = true end
+            end
+            for _, opt in ipairs(options) do
+                local optBtn = optionButtons[opt]
+                local isAct = selectedOptions[opt] == true
+                if optBtn then
+                    if isAct then
+                        optBtn.Text = "  [X] " .. tostring(opt)
+                        optBtn.TextColor3 = UI_ACCENT
+                    else
+                        optBtn.Text = "  [ ] " .. tostring(opt)
+                        optBtn.TextColor3 = UI_MUTED
+                    end
+                end
+            end
+            updateDisplay()
+        end
+    }
 end
 
 for _, tab in ipairs(TAB_DEFINITIONS) do
@@ -565,6 +708,7 @@ for _, tab in ipairs(TAB_DEFINITIONS) do
 end
 
 --// TABS & PAGES
+local toggles = {}
 local mainPage = pages.Main
 createSection(mainPage, "STATUS & OVERVIEW")
 local statusCard = createInfoCard(mainPage, "Current Status", "Idle", 58)
@@ -572,25 +716,121 @@ local statusCard = createInfoCard(mainPage, "Current Status", "Idle", 58)
 createSection(mainPage, "CRATE SHOP CONFIG")
 local crateOptions = {"Common", "Rare", "Very Rare", "Epic", "Special", "Legendary", "Hyper", "Vintage"}
 local selectedCrates = {}
-createMultiDropdown(mainPage, "Select Crate Types to Buy", crateOptions, function(results) selectedCrates = results end)
+local crateDropdown = createMultiDropdown(mainPage, "Select Crate Types to Buy", crateOptions, function(results) selectedCrates = results end)
 
 local autoPage = pages.Auto
 createSection(autoPage, "AUTOMATION MODULES")
 local autoBuyActive, autoRestockActive, autoClaimPaymentActive, autoUnlockActive, autoSpeedTpActive = false, false, false, false, false
 
-createToggle(autoPage, "Enable Auto-Buy", "Automatically buys checked crates from shop", false, function(e) autoBuyActive = e end)
-createToggle(autoPage, "Auto Restock Racks (1-100)", "Automatically restocks all clothing racks (1 to 100)", false, function(e) autoRestockActive = e end)
-createToggle(autoPage, "Auto Claim Payment", "Spam claims customer payments automatically", false, function(e) autoClaimPaymentActive = e end)
-createToggle(autoPage, "Auto Unlock Racks", "Spam unlocks new clothing racks via remote", false, function(e) autoUnlockActive = e end)
-createToggle(autoPage, "Auto Tween to Speed 10-13 NPC", "Continuously tracks and glides to nearest NPC, swings 3s, then returns to Desk Fan 1", false, function(e) autoSpeedTpActive = e end)
+toggles.AutoBuy = createToggle(autoPage, "Enable Auto-Buy", "Automatically buys checked crates from shop", false, function(e) autoBuyActive = e end)
+toggles.AutoRestock = createToggle(autoPage, "Auto Restock Racks (1-100)", "Automatically restocks all clothing racks (1 to 100)", false, function(e) autoRestockActive = e end)
+toggles.AutoClaimPayment = createToggle(autoPage, "Auto Claim Payment", "Spam claims customer payments automatically", false, function(e) autoClaimPaymentActive = e end)
+toggles.AutoUnlock = createToggle(autoPage, "Auto Unlock Racks", "Spam unlocks new clothing racks via remote", false, function(e) autoUnlockActive = e end)
+toggles.AutoSpeedTp = createToggle(autoPage, "Auto Tween to Speed 10-13 NPC", "Continuously tracks and glides to nearest NPC, swings 3s, then returns to Desk Fan 1", false, function(e) autoSpeedTpActive = e end)
 
 local miscPage = pages.Misc
 createSection(miscPage, "UTILITIES & EXTRAS")
 createInfoCard(miscPage, "Bale Handler", "Background processing handles crate bales automatically.", 58)
 
 local settingsPage = pages.Settings
+
+--------------------------------------------------
+-- CONFIGURATION SAVE / LOAD SYSTEM
+--------------------------------------------------
+local saveConfig, loadConfig
+
+saveConfig = function()
+    if not writefile then
+        statusCard.SetText("[Config] System Error: writefile function missing!")
+        return
+    end
+
+    local data = {
+        AutoLoad = toggles.AutoLoad and toggles.AutoLoad.Get() or false,
+        SelectedCrates = crateDropdown and crateDropdown.Get() or {},
+        AutoBuy = toggles.AutoBuy and toggles.AutoBuy.Get() or false,
+        AutoRestock = toggles.AutoRestock and toggles.AutoRestock.Get() or false,
+        AutoClaimPayment = toggles.AutoClaimPayment and toggles.AutoClaimPayment.Get() or false,
+        AutoUnlock = toggles.AutoUnlock and toggles.AutoUnlock.Get() or false,
+        AutoSpeedTp = toggles.AutoSpeedTp and toggles.AutoSpeedTp.Get() or false,
+    }
+
+    pcall(function()
+        if makefolder and isfolder and not isfolder(CONFIG_FOLDER) then
+            makefolder(CONFIG_FOLDER)
+        end
+    end)
+
+    local success, err = pcall(function()
+        writefile(CONFIG_FILE, HttpService:JSONEncode(data))
+    end)
+
+    if success then
+        statusCard.SetText("[Config] Settings saved to workspace/" .. CONFIG_FILE)
+    else
+        statusCard.SetText("[Config] Save failed: " .. tostring(err))
+    end
+end
+
+loadConfig = function(isAutoBoot)
+    if not readfile or not isfile then
+        if not isAutoBoot then
+            statusCard.SetText("[Config] System Error: readfile/isfile function missing!")
+        end
+        return
+    end
+
+    local exists = false
+    pcall(function() exists = isfile(CONFIG_FILE) end)
+    if not exists then
+        if not isAutoBoot then
+            statusCard.SetText("[Config] No saved configuration file found.")
+        end
+        return
+    end
+
+    local success, data = pcall(function()
+        local raw = readfile(CONFIG_FILE)
+        return HttpService:JSONEncode(raw)
+    end)
+
+    if success and type(data) == "table" then
+        if isAutoBoot and data.AutoLoad == false then
+            return -- Auto-load on boot is disabled in saved file
+        end
+
+        if data.AutoLoad ~= nil and toggles.AutoLoad then toggles.AutoLoad.Set(data.AutoLoad) end
+        if data.SelectedCrates and crateDropdown then crateDropdown.Set(data.SelectedCrates) end
+        if data.AutoBuy ~= nil and toggles.AutoBuy then toggles.AutoBuy.Set(data.AutoBuy) end
+        if data.AutoRestock ~= nil and toggles.AutoRestock then toggles.AutoRestock.Set(data.AutoRestock) end
+        if data.AutoClaimPayment ~= nil and toggles.AutoClaimPayment then toggles.AutoClaimPayment.Set(data.AutoClaimPayment) end
+        if data.AutoUnlock ~= nil and toggles.AutoUnlock then toggles.AutoUnlock.Set(data.AutoUnlock) end
+        if data.AutoSpeedTp ~= nil and toggles.AutoSpeedTp then toggles.AutoSpeedTp.Set(data.AutoSpeedTp) end
+
+        statusCard.SetText("[Config] Settings loaded successfully!")
+    else
+        if not isAutoBoot then
+            statusCard.SetText("[Config] Failed to load config JSON.")
+        end
+    end
+end
+
+createSection(settingsPage, "CONFIG MANAGER")
+
+toggles.AutoLoad = createToggle(settingsPage, "Auto Load Config On Start", "Automatically loads saved settings when script runs", false, function(e)
+    task.defer(saveConfig)
+end)
+
+createActionButton(settingsPage, "Save Config", "Saves all active settings & toggles to file", "SAVE", function()
+    saveConfig()
+end)
+
+createActionButton(settingsPage, "Load Config", "Restores saved settings & toggles from file", "LOAD", function()
+    loadConfig(false)
+end)
+
 createSection(settingsPage, "INTERFACE CONTROLS")
-createInfoCard(settingsPage, "ZHM HUB Info", "Version 3.13 - Fixed Continuous NPC Tracking Glue", 65)
+createInfoCard(settingsPage, "ZHM HUB Info", "Version 3.26 - Permanent Auto-Minimize On Execute", 65)
 
 --// REMOTES & LOOPS
 local remotesFolder = ReplicatedStorage:WaitForChild("Remotes")
@@ -1027,6 +1267,7 @@ player.CharacterAdded:Connect(function()
     task.wait(0.8)
     forceEquipHangerOnce()
     teleportToDeskFan1()
+    purgeUI()
 end)
 
 --// LOCAL NPC SCANNING (Speed 10-13 Filter, Max Distance 50 Studs)
@@ -1325,4 +1566,11 @@ end)
 
 if TAB_DEFINITIONS[1] then setActivePage(TAB_DEFINITIONS[1].Key) end
 
-print("[ZHM HUB] Loaded Successfully!")
+--// AUTO-LOAD CONFIG & ALWAYS AUTO-MINIMIZE ON BOOT
+task.spawn(function()
+    task.wait(0.5)
+    loadConfig(true)
+    setMinimized(true) -- Always auto-minimizes upon execution
+end)
+
+print("[ZHM HUB] Loaded Successfully with Permanent Auto-Minimize & Config Management!")
