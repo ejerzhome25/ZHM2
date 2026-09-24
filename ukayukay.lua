@@ -216,12 +216,12 @@ screenGui.DisplayOrder = 9999
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 mountGui(screenGui)
 
---// MAIN WINDOW (UPDATED: Spawns on the left side of screen)
+--// MAIN WINDOW
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
-mainFrame.AnchorPoint = Vector2.new(0, 0.5)
+mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
 mainFrame.Size = UDim2.new(0, 340, 0, 420)
-mainFrame.Position = UDim2.new(0, 20, 0.5, 0)
+mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
 mainFrame.BackgroundColor3 = UI_BG
 mainFrame.BorderSizePixel = 0
 mainFrame.Parent = screenGui
@@ -731,7 +731,7 @@ toggles.AutoBuy = createToggle(autoPage, "Enable Auto-Buy", "Automatically buys 
 toggles.AutoRestock = createToggle(autoPage, "Auto Restock Racks (1-100)", "Automatically restocks all clothing racks (1 to 100)", false, function(e) autoRestockActive = e end)
 toggles.AutoClaimPayment = createToggle(autoPage, "Auto Claim Payment", "Spam claims customer payments automatically", false, function(e) autoClaimPaymentActive = e end)
 toggles.AutoUnlock = createToggle(autoPage, "Auto Unlock Racks", "Spam unlocks new clothing racks via remote", false, function(e) autoUnlockActive = e end)
-toggles.AutoSpeedTp = createToggle(autoPage, "Auto Tween to Speed 10-13 NPC", "Continuously tracks and glides to nearest NPC, swings 3s, then returns to Desk Fan 1", false, function(e) autoSpeedTpActive = e end)
+toggles.AutoSpeedTp = createToggle(autoPage, "Auto Tween to Speed 10-13 NPC", "Continuously tracks and tweens to nearest NPC, swings 3s, then teleports back to Desk Fan 1", false, function(e) autoSpeedTpActive = e end)
 
 local miscPage = pages.Misc
 createSection(miscPage, "UTILITIES & EXTRAS")
@@ -1126,34 +1126,27 @@ local function getNPCHead(model)
     return model:FindFirstChild("Head") or getNPCRoot(model)
 end
 
--- Smooth initial approach to moving NPC
-local function glideToNPC(npc, speedStudsPerSec)
+-- Smooth Tween approach to moving NPC
+local function tweenToNPC(npc, speedStudsPerSec)
     speedStudsPerSec = speedStudsPerSec or 95
-    local maxTimeout = os.clock() + 2.5
+    local npcRoot = getNPCRoot(npc)
+    local playerRoot = getPlayerRoot()
+    if not npcRoot or not playerRoot then return end
+
+    local targetPos = npcRoot.Position
+    local currentPos = playerRoot.Position
+    local distance = (currentPos - targetPos).Magnitude
     
-    while npc and npc.Parent and os.clock() < maxTimeout do
-        local npcRoot = getNPCRoot(npc)
-        local playerRoot = getPlayerRoot()
-        if not npcRoot or not playerRoot then break end
-        
-        local targetPos = npcRoot.Position
-        local currentPos = playerRoot.Position
-        local distance = (currentPos - targetPos).Magnitude
-        
-        if distance <= 3.5 then
-            break
-        end
-        
-        local dt = RunService.Heartbeat:Wait()
-        local stepDistance = speedStudsPerSec * dt
-        local alpha = math.clamp(stepDistance / distance, 0, 1)
-        
-        local newPos = currentPos:Lerp(targetPos, alpha)
-        pcall(function()
-            playerRoot.CFrame = CFrame.new(newPos, targetPos)
-            playerRoot.AssemblyLinearVelocity = Vector3.zero
-        end)
-    end
+    if distance <= 3.5 then return end
+
+    local travelTime = math.clamp(distance / speedStudsPerSec, 0.1, 1.5)
+    local tweenInfo = TweenInfo.new(travelTime, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
+    
+    local targetCFrame = CFrame.new(targetPos - (npcRoot.CFrame.LookVector * 2.5) + Vector3.new(0, 0.5, 0), targetPos)
+    local tween = TweenService:Create(playerRoot, tweenInfo, {CFrame = targetCFrame})
+    
+    tween:Play()
+    tween.Completed:Wait()
 end
 
 -- Continuous Glue-Tracking + Swing for full 3 Seconds
@@ -1199,59 +1192,9 @@ local function attackAndFollowNPC(npc, durationSec)
     end
 end
 
--- Glide directly back to Desk Fan 1
-local function glideToPosition(targetCFrame, speedStudsPerSec)
-    local char = player.Character
-    local root = getPlayerRoot()
-    if not char or not root then return end
-    
-    speedStudsPerSec = speedStudsPerSec or 90
-    local currentPos = root.Position
-    local targetPos = targetCFrame.Position
-    local distance = (currentPos - targetPos).Magnitude
-    
-    if distance < 1 then
-        pcall(function() char:PivotTo(targetCFrame) end)
-        return
-    end
-    
-    local timeElapsed = 0
-    local totalTime = math.clamp(distance / speedStudsPerSec, 0.1, 0.8)
-    
-    while timeElapsed < totalTime do
-        local dt = RunService.Heartbeat:Wait()
-        timeElapsed = timeElapsed + dt
-        local alpha = math.clamp(timeElapsed / totalTime, 0, 1)
-        
-        local activeRoot = getPlayerRoot()
-        if not activeRoot then break end
-        
-        local lerpPos = currentPos:Lerp(targetPos, alpha)
-        local lerpRot = activeRoot.CFrame:Lerp(targetCFrame, alpha)
-        
-        pcall(function()
-            activeRoot.CFrame = CFrame.new(lerpPos) * (lerpRot - lerpRot.Position)
-            activeRoot.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-        end)
-    end
-    
-    pcall(function()
-        local finalRoot = getPlayerRoot()
-        if finalRoot then
-            finalRoot.CFrame = targetCFrame
-            finalRoot.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-        end
-    end)
-end
-
-local function tweenBackToDeskFan1()
-    local fanPart = getDeskFan1Part()
-    if fanPart then
-        local targetCFrame = fanPart.CFrame + Vector3.new(0, 3, 0)
-        glideToPosition(targetCFrame, 90)
-    else
-        teleportToDeskFan1()
-    end
+-- Teleport instantly back to Desk Fan 1
+local function tpBackToDeskFan1()
+    teleportToDeskFan1()
 end
 
 --// STARTUP EXECUTION
@@ -1403,14 +1346,14 @@ local function triggerHangerAction(npc)
 
     forceEquipHangerOnce()
 
-    statusCard.SetText("[ZHM] Approaching NPC (" .. npc.Name .. ")...")
-    glideToNPC(npc, 95)
+    statusCard.SetText("[ZHM] Tweening to NPC (" .. npc.Name .. ")...")
+    tweenToNPC(npc, 95)
 
     statusCard.SetText("[ZHM] Reached NPC | Tracking & Swinging for 3s...")
     attackAndFollowNPC(npc, 3.0)
 
-    statusCard.SetText("[ZHM] Swing finished. Gliding back to Desk Fan 1...")
-    tweenBackToDeskFan1()
+    statusCard.SetText("[ZHM] Swing finished. Teleporting back to Desk Fan 1...")
+    tpBackToDeskFan1()
 
     task.wait(0.5)
     isHandlingNpc = false
@@ -1532,7 +1475,7 @@ end)
 local minimized = false
 local miniButton = Instance.new("TextButton")
 miniButton.Name = "MiniButton"
-miniButton.AnchorPoint = Vector2.new(0, 0.5)
+miniButton.AnchorPoint = Vector2.new(0.5, 0.5)
 miniButton.Size = UDim2.new(0, 46, 0, 46)
 miniButton.Position = mainFrame.Position
 miniButton.BackgroundColor3 = UI_PANEL
