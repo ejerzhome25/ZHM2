@@ -6,6 +6,12 @@ local ProximityPromptService = game:GetService("ProximityPromptService")
 local CoreGui = game:GetService("CoreGui")
 local UserInputService = game:GetService("UserInputService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
+local HttpService = game:GetService("HttpService")
+
+local ENV = (getgenv and getgenv()) or _G
+
+-- Instant Proximity is a permanent core feature: always ON, not config-controlled.
+ENV.ZHM_AutoNearestPrompt = true
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -29,6 +35,7 @@ do
 local IS_MOBILE_DEVICE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 
 local function makePromptInstantSafe(prompt)
+    if ENV.ZHM_AutoNearestPrompt ~= true then return end
     if not prompt or not prompt:IsA("ProximityPrompt") then return end
 
     pcall(function()
@@ -84,16 +91,18 @@ end
 --------------------------------------------------------------------------------
 -- ZHM HUB - SHARED UI / COMPATIBILITY HELPERS
 --------------------------------------------------------------------------------
-local ENV = (getgenv and getgenv()) or _G
-
--- Integrated FOV state. Every fresh execution starts at 120.
-ENV.ZHM_FOV = 120
+-- Integrated FOV state is opt-in. Executing the hub does not change the camera.
+ENV.ZHM_FOV = tonumber(ENV.ZHM_FOV)
+    or (Workspace.CurrentCamera and Workspace.CurrentCamera.FieldOfView)
+    or 70
+ENV.ZHM_FOVActive = false
 ENV.ZHM_ApplyFOV = function(value)
     value = tonumber(value)
     if not value then return false end
 
     value = math.clamp(value, 1, 120)
     ENV.ZHM_FOV = value
+    ENV.ZHM_FOVActive = true
 
     local camera = Workspace.CurrentCamera
     if camera then
@@ -103,32 +112,52 @@ ENV.ZHM_ApplyFOV = function(value)
     return true
 end
 
-ENV.ZHM_ApplyFOV(120)
-
--- Re-apply the selected FOV if Roblox replaces CurrentCamera.
+-- Only re-apply FOV after the user has enabled/applied it from the UI (or loaded a config).
 Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
     task.wait()
-    if ENV.ZHM_ApplyFOV then
-        ENV.ZHM_ApplyFOV(ENV.ZHM_FOV or 120)
+    if ENV.ZHM_FOVActive == true and ENV.ZHM_ApplyFOV then
+        ENV.ZHM_ApplyFOV(ENV.ZHM_FOV or 70)
     end
 end)
 
 local controller = { CancelGeneration = 0 }
 ENV.ZHM_Controller = controller
-ENV.ZHM_AutoWalk = true
-ENV.ZHM_AutoFarm = false
-ENV.ZHM_AutoBuy = false
-ENV.ZHM_AutoUpgrade = false
+
+-- Every optional user-facing feature starts OFF on every execution.
+-- Instant Proximity is the one exception and stays permanently ON.
+-- Saved settings are restored automatically on execute when a config file exists.
+ENV.ZHM_ConfigKeys = {
+    "ZHM_AutoWalk",
+    "ZHM_AutoFarm",
+    "ZHM_AutoBuy",
+    "ZHM_AutoBuyBakingRack",
+    "ZHM_AutoUpgrade",
+    "ZHM_SpamDisplayRackPrompts",
+    "ZHM_BakingRackScanner",
+    "ZHM_ExpandBakingRackPrompts",
+    "ZHM_AutoSweep",
+    "ZHM_NPCAutoTP",
+    "ZHM_NPCAutoSwing",
+    "ZHM_AutoAccept",
+    "ZHM_AutoPrepareDough",
+    "ZHM_AutoBake",
+    "ZHM_AutoCollect",
+    "ZHM_AutoCollectTip",
+    "ZHM_AutoGiveOrder",
+    "ZHM_AutoPayCashier",
+    "ZHM_AutoEnableBreads",
+    "ZHM_HidePopups",
+    "ZHM_NPCHitbox",
+    "ZHM_NPCHitboxESP",
+}
+for _, featureKey in ipairs(ENV.ZHM_ConfigKeys) do
+    ENV[featureKey] = false
+end
+ENV.ZHM_AutoNearestPrompt = true
+
 local TP_DELAY = 1 -- 1 second between movement teleports.
-if ENV.ZHM_AutoNearestPrompt == nil then ENV.ZHM_AutoNearestPrompt = false end -- Day default; night controller enables it automatically.
-if ENV.ZHM_SpamDisplayRackPrompts == nil then ENV.ZHM_SpamDisplayRackPrompts = true end -- Spam all prompts around DisplayRack while standing near it.
-if ENV.ZHM_BakingRackScanner == nil then ENV.ZHM_BakingRackScanner = true end -- Live BakingRack detector/status scanner.
-if ENV.ZHM_ExpandBakingRackPrompts == nil then ENV.ZHM_ExpandBakingRackPrompts = true end -- Expand only BakingRack interactions.
-ENV.ZHM_BakingRackStatus = ENV.ZHM_BakingRackStatus or "Scanning BakingRacks..."
--- Combined side-job modules. Defaults preserve the two standalone scripts.
-if ENV.ZHM_AutoSweep == nil then ENV.ZHM_AutoSweep = true end
-if ENV.ZHM_NPCAutoTP == nil then ENV.ZHM_NPCAutoTP = true end -- Auto TP to live Customer.Head.RunawayExclam targets.
-if ENV.ZHM_NPCAutoSwing == nil then ENV.ZHM_NPCAutoSwing = true end
+ENV.ZHM_BakingRackStatus = "BakingRack scanner disabled"
+ENV.ZHM_BuyBakingRackStatus = "Auto Buy Baking Rack disabled"
 ENV.ZHM_SweepActive = false
 ENV.ZHM_NPCBusy = false
 ENV.ZHM_NPCStatus = "Swing scanner idle"
@@ -337,7 +366,7 @@ ENV.ZHM_AutoFarm = ENV.ZHM_AutoFarm == true
 ENV.ZHM_AutoBuy = ENV.ZHM_AutoBuy == true
 ENV.ZHM_AutoUpgrade = ENV.ZHM_AutoUpgrade == true
 for _, key in ipairs({ "ZHM_AutoAccept", "ZHM_AutoPrepareDough", "ZHM_AutoBake", "ZHM_AutoCollect", "ZHM_AutoCollectTip", "ZHM_AutoGiveOrder", "ZHM_AutoPayCashier", "ZHM_AutoEnableBreads", "ZHM_HidePopups" }) do
-    if ENV[key] == nil then ENV[key] = true end
+    if ENV[key] == nil then ENV[key] = false end
 end
 if ENV.ZHM_SilentBakeUI == nil then ENV.ZHM_SilentBakeUI = true end
 ENV.ZHM_PlotName = ENV.ZHM_PlotName or "Plot4"
@@ -825,8 +854,18 @@ local function startAutoWalk()
                                                         end
                                                     end
                                                 else
-                                                    report("AutoWalk", "Cashier not found; restarting rack route.")
-                                                    task.wait(0.25)
+                                                    -- Cashier was not detected: skip it and go directly to the Oven.
+                                                    local ovenPos = getOvenPos(myPlot)
+                                                    if ovenPos then
+                                                        report("AutoWalk", "Cashier not found • TP directly to Oven • stay 1.5s • restart BakingRack loop...")
+                                                        if teleportToPosition(ovenPos + Vector3.new(0, 2.5, 0))
+                                                            and running("ZHM_AutoWalk") then
+                                                            task.wait(1.5)
+                                                        end
+                                                    else
+                                                        report("AutoWalk", "Cashier and Oven not found; restarting BakingRack loop.")
+                                                        task.wait(0.25)
+                                                    end
                                                 end
                                             end
                                         end
@@ -1111,6 +1150,126 @@ local function startAutoNearestPrompt()
 end
 
 startAutoNearestPrompt()
+
+--------------------------------------------------------------------------------
+-- AUTO BUY BAKING RACK: LIVE PROMPT DETECTOR
+-- Detects the green ProximityPrompt shown as:
+--   ActionText = "Buy"
+--   ObjectText = "Baking Rack"
+-- When enabled from the UI, matching prompts are fired automatically even if
+-- another interaction is closer to the player. The normal Instant Proximity
+-- system stays permanently ON independently of this feature.
+--------------------------------------------------------------------------------
+local AUTO_BUY_BAKING_RACK_SCAN_DELAY = 0.10
+local AUTO_BUY_BAKING_RACK_REFIRE_DELAY = 0.35
+local bakingRackBuyLastFire = setmetatable({}, { __mode = "k" })
+
+local function textHasBakingRack(value)
+    local textValue = string.lower(tostring(value or ""))
+    return textValue:find("baking rack", 1, true) ~= nil
+        or textValue:find("bakingrack", 1, true) ~= nil
+end
+
+local function isBuyBakingRackPrompt(prompt)
+    if not prompt or not prompt.Parent or not prompt:IsA("ProximityPrompt") then
+        return false
+    end
+
+    local actionText = string.lower(tostring(prompt.ActionText or ""))
+    local objectText = string.lower(tostring(prompt.ObjectText or ""))
+    local promptName = string.lower(tostring(prompt.Name or ""))
+
+    -- Exact match for the prompt shown in the screenshot.
+    if actionText == "buy"
+        and (objectText == "baking rack" or objectText == "bakingrack") then
+        return true
+    end
+
+    -- Compatibility fallback for small text/name changes made by the game.
+    local hasBuy = actionText:find("buy", 1, true) ~= nil
+        or promptName:find("buy", 1, true) ~= nil
+
+    if not hasBuy then
+        return false
+    end
+
+    if textHasBakingRack(objectText) or textHasBakingRack(promptName) then
+        return true
+    end
+
+    local current = prompt.Parent
+    local depth = 0
+    while current and current ~= Workspace and depth < 8 do
+        if textHasBakingRack(current.Name) then
+            return true
+        end
+        current = current.Parent
+        depth += 1
+    end
+
+    return false
+end
+
+local function startAutoBuyBakingRack()
+    task.spawn(function()
+        while isCurrent() do
+            if ENV.ZHM_AutoBuyBakingRack == true then
+                local found = 0
+                local fired = 0
+                local now = os.clock()
+
+                for interaction in pairs(nearestInteractions) do
+                    if not isCurrent() then return end
+
+                    if interaction
+                        and interaction.Parent
+                        and interaction:IsA("ProximityPrompt")
+                        and interaction.Enabled
+                        and isBuyBakingRackPrompt(interaction) then
+
+                        found += 1
+
+                        local lastFire = bakingRackBuyLastFire[interaction] or 0
+                        if now - lastFire >= AUTO_BUY_BAKING_RACK_REFIRE_DELAY then
+                            bakingRackBuyLastFire[interaction] = now
+
+                            -- Keep the target prompt fully instant/reachable, then fire it.
+                            pcall(function() interaction.HoldDuration = 0 end)
+                            pcall(function() interaction.RequiresLineOfSight = false end)
+                            pcall(function() interaction.ClickablePrompt = true end)
+                            pcall(function()
+                                interaction.MaxActivationDistance = math.max(
+                                    tonumber(interaction.MaxActivationDistance) or 0,
+                                    100000
+                                )
+                            end)
+
+                            if firePromptSafe(interaction, "BuyBakingRack") then
+                                fired += 1
+                            end
+                        end
+                    end
+                end
+
+                if found == 0 then
+                    ENV.ZHM_BuyBakingRackStatus = "LIVE • waiting for Buy / Baking Rack prompt"
+                elseif fired > 0 then
+                    ENV.ZHM_BuyBakingRackStatus = "LIVE • detected " .. tostring(found)
+                        .. " • fired " .. tostring(fired)
+                else
+                    ENV.ZHM_BuyBakingRackStatus = "LIVE • detected " .. tostring(found)
+                        .. " • refire cooldown"
+                end
+            else
+                ENV.ZHM_BuyBakingRackStatus = "Auto Buy Baking Rack disabled"
+            end
+
+            task.wait(AUTO_BUY_BAKING_RACK_SCAN_DELAY)
+        end
+    end)
+end
+
+startAutoBuyBakingRack()
 
 --------------------------------------------------------------------------------
 -- DISPLAYRACK: SPAM ALL NEARBY PROXIMITY PROMPTS
@@ -4680,27 +4839,144 @@ playerGui.DescendantAdded:Connect(function(desc) if desc:IsA("TextLabel") then w
 --------------------------------------------------------------------------------
 destroyNamedGui("ZHM_MasterUI")
 
--- Keep every feature enabled on execute.
-for _, featureKey in ipairs({
-    "ZHM_AutoWalk",
-    "ZHM_AutoFarm",
-    "ZHM_AutoBuy",
-    "ZHM_AutoUpgrade",
-    "ZHM_AutoAccept",
-    "ZHM_AutoPrepareDough",
-    "ZHM_AutoBake",
-    "ZHM_AutoCollect",
-    "ZHM_AutoCollectTip",
-    "ZHM_AutoGiveOrder",
-    "ZHM_AutoPayCashier",
-    "ZHM_AutoEnableBreads",
-    "ZHM_HidePopups",
-    "ZHM_AutoSweep",
-    "ZHM_NPCAutoSwing",
-    "ZHM_BakingRackScanner",
-    "ZHM_ExpandBakingRackPrompts",
-}) do
-    ENV[featureKey] = true
+-- Startup reset: clear stale runtime state first.
+-- A saved config is auto-loaded below after the config loader is defined.
+-- Instant Proximity is permanent and remains ON.
+for _, featureKey in ipairs(ENV.ZHM_ConfigKeys or {}) do
+    ENV[featureKey] = false
+end
+ENV.ZHM_AutoNearestPrompt = true
+ENV.ZHM_FOVActive = false
+
+-- Persistent config: saved settings auto-load on every execution when available.
+ENV.ZHM_ConfigFile = "ZHM_HUB_config.json"
+ENV.ZHM_ConfigStatus = "Checking saved config..."
+
+ENV.ZHM_RefreshAllToggles = nil -- assigned after UI toggles are constructed
+
+ENV.ZHM_SaveConfig = function()
+    if type(writefile) ~= "function" then
+        ENV.ZHM_ConfigStatus = "Save unavailable: writefile is not supported"
+        return false
+    end
+
+    local data = {
+        Version = 1,
+        Features = {},
+        FOV = tonumber(ENV.ZHM_FOV) or 70,
+        FOVActive = ENV.ZHM_FOVActive == true,
+    }
+
+    for _, key in ipairs(ENV.ZHM_ConfigKeys or {}) do
+        data.Features[key] = ENV[key] == true
+    end
+
+    local ok, encoded = pcall(function()
+        return HttpService:JSONEncode(data)
+    end)
+    if not ok then
+        ENV.ZHM_ConfigStatus = "Save failed: JSON encode error"
+        return false
+    end
+
+    local wrote, err = pcall(function()
+        writefile(ENV.ZHM_ConfigFile, encoded)
+    end)
+    ENV.ZHM_ConfigStatus = wrote and "Config saved" or ("Save failed: " .. tostring(err))
+    return wrote
+end
+
+ENV.ZHM_LoadConfig = function()
+    if type(readfile) ~= "function" then
+        ENV.ZHM_ConfigStatus = "Load unavailable: readfile is not supported"
+        return false
+    end
+
+    if type(isfile) == "function" then
+        local okFile, exists = pcall(isfile, ENV.ZHM_ConfigFile)
+        if okFile and not exists then
+            ENV.ZHM_ConfigStatus = "No saved config found"
+            return false
+        end
+    end
+
+    local okRead, raw = pcall(function()
+        return readfile(ENV.ZHM_ConfigFile)
+    end)
+    if not okRead or type(raw) ~= "string" then
+        ENV.ZHM_ConfigStatus = "No saved config found"
+        return false
+    end
+
+    local okDecode, data = pcall(function()
+        return HttpService:JSONDecode(raw)
+    end)
+    if not okDecode or type(data) ~= "table" then
+        ENV.ZHM_ConfigStatus = "Load failed: invalid config"
+        return false
+    end
+
+    -- Clear optional states first, then restore saved values.
+    -- This loader is used both automatically on execute and by the LOAD CONFIG button.
+    -- Instant Proximity is intentionally not part of the saved config.
+    for _, key in ipairs(ENV.ZHM_ConfigKeys or {}) do
+        ENV[key] = false
+    end
+    ENV.ZHM_AutoNearestPrompt = true
+
+    if type(data.Features) == "table" then
+        for _, key in ipairs(ENV.ZHM_ConfigKeys or {}) do
+            ENV[key] = data.Features[key] == true
+        end
+    end
+    ENV.ZHM_AutoNearestPrompt = true
+
+    ENV.ZHM_FOVActive = false
+    if data.FOVActive == true and tonumber(data.FOV) and ENV.ZHM_ApplyFOV then
+        ENV.ZHM_ApplyFOV(tonumber(data.FOV))
+    elseif tonumber(data.FOV) then
+        ENV.ZHM_FOV = math.clamp(tonumber(data.FOV), 1, 120)
+    end
+
+    if type(ENV.ZHM_RefreshAllToggles) == "function" then
+        pcall(ENV.ZHM_RefreshAllToggles)
+    end
+    if type(ENV.ZHM_RefreshFOVUI) == "function" then
+        pcall(ENV.ZHM_RefreshFOVUI)
+    end
+
+    ENV.ZHM_ConfigStatus = "Config loaded"
+    return true
+end
+
+-- AUTO LOAD SAVED CONFIG ON EXECUTE
+-- If no config exists (or file APIs are unavailable), the hub safely keeps defaults OFF.
+do
+    local loaded = ENV.ZHM_LoadConfig()
+    if loaded then
+        ENV.ZHM_ConfigStatus = "Config auto-loaded on execute"
+    end
+end
+
+ENV.ZHM_AllFeaturesOff = function()
+    for _, key in ipairs(ENV.ZHM_ConfigKeys or {}) do
+        ENV[key] = false
+    end
+    -- ALL OFF only disables optional features; Instant Proximity stays permanently enabled.
+    ENV.ZHM_AutoNearestPrompt = true
+    ENV.ZHM_FOVActive = false
+    ENV.ZHM_NPCBusy = false
+    ENV.ZHM_SweepActive = false
+
+    if type(ENV.ZHM_RefreshAllToggles) == "function" then
+        pcall(ENV.ZHM_RefreshAllToggles)
+    end
+    if type(ENV.ZHM_RefreshFOVUI) == "function" then
+        pcall(ENV.ZHM_RefreshFOVUI)
+    end
+
+    ENV.ZHM_ConfigStatus = "Optional features disabled • Instant Proximity stays ON"
+    return true
 end
 
 local UI_BG = Color3.fromRGB(18, 20, 25)
@@ -4822,6 +5098,7 @@ pageHost.Parent = body
 local pages = {}
 local tabButtons = {}
 local infoUpdaters = {}
+local toggleRegistry = {}
 local TAB_COUNT = 4
 
 local function createPage(name)
@@ -4964,7 +5241,9 @@ local function createToggle(parent, title, description, envKey, defaultValue, ma
     end)
 
     refresh()
-    return {Row = row, Refresh = refresh, Switch = switch}
+    local toggleObject = {Row = row, Refresh = refresh, Switch = switch}
+    toggleRegistry[envKey] = toggleObject
+    return toggleObject
 end
 
 local function createInfoCard(parent, title, getText, height)
@@ -5025,16 +5304,16 @@ sideTab.Activated:Connect(function() setActivePage("SideJobs") end)
 extraTab.Activated:Connect(function() setActivePage("Extra") end)
 
 createSection(farmPage, "Bakery Automation")
-local masterFarmToggle = createToggle(farmPage, "Auto Farm", "Master bakery automation switch", "ZHM_AutoFarm", true)
+local masterFarmToggle = createToggle(farmPage, "Auto Farm", "Master bakery automation switch", "ZHM_AutoFarm", false)
 local farmChildren = {
-    createToggle(farmPage, "Auto Accept", "Accept customer orders", "ZHM_AutoAccept", true, "ZHM_AutoFarm"),
-    createToggle(farmPage, "Prepare Dough", "Use prep table automatically", "ZHM_AutoPrepareDough", true, "ZHM_AutoFarm"),
-    createToggle(farmPage, "Auto Bake", "Controller-aware silent baking loop", "ZHM_AutoBake", true, "ZHM_AutoFarm"),
-    createToggle(farmPage, "Auto Collect", "Collect from every different BakingRack", "ZHM_AutoCollect", true, "ZHM_AutoFarm"),
-    createToggle(farmPage, "Auto Collect Tip", "Collect available money from the Tip Jar", "ZHM_AutoCollectTip", true, "ZHM_AutoFarm"),
-    createToggle(farmPage, "Auto Give Order", "Deliver finished orders at the DisplayRack", "ZHM_AutoGiveOrder", true, "ZHM_AutoFarm"),
-    createToggle(farmPage, "Auto Pay Cashier", "Automatically press the Bakery worker PaySalary button", "ZHM_AutoPayCashier", true, "ZHM_AutoFarm"),
-    createToggle(farmPage, "Enable Breads", "Enable bread options", "ZHM_AutoEnableBreads", true, "ZHM_AutoFarm"),
+    createToggle(farmPage, "Auto Accept", "Accept customer orders", "ZHM_AutoAccept", false, "ZHM_AutoFarm"),
+    createToggle(farmPage, "Prepare Dough", "Use prep table automatically", "ZHM_AutoPrepareDough", false, "ZHM_AutoFarm"),
+    createToggle(farmPage, "Auto Bake", "Controller-aware silent baking loop", "ZHM_AutoBake", false, "ZHM_AutoFarm"),
+    createToggle(farmPage, "Auto Collect", "Collect from every different BakingRack", "ZHM_AutoCollect", false, "ZHM_AutoFarm"),
+    createToggle(farmPage, "Auto Collect Tip", "Collect available money from the Tip Jar", "ZHM_AutoCollectTip", false, "ZHM_AutoFarm"),
+    createToggle(farmPage, "Auto Give Order", "Deliver finished orders at the DisplayRack", "ZHM_AutoGiveOrder", false, "ZHM_AutoFarm"),
+    createToggle(farmPage, "Auto Pay Cashier", "Automatically press the Bakery worker PaySalary button", "ZHM_AutoPayCashier", false, "ZHM_AutoFarm"),
+    createToggle(farmPage, "Enable Breads", "Enable bread options", "ZHM_AutoEnableBreads", false, "ZHM_AutoFarm"),
 }
 masterFarmToggle.Switch.Activated:Connect(function()
     task.defer(function()
@@ -5050,10 +5329,13 @@ createInfoCard(farmPage, "Bakery Status", function()
 end, 66)
 
 createSection(movePage, "Movement")
-local rackMovementToggle = createToggle(movePage, "Auto Rack Movement", "Instant TP between baking racks and display rack", "ZHM_AutoWalk", true)
-createToggle(movePage, "BakingRack Scanner", "Live scan racks, prompts and click detectors", "ZHM_BakingRackScanner", true)
-createToggle(movePage, "Expand BakingRack Prompts", "1000-stud range • clickable • no line-of-sight • instant hold", "ZHM_ExpandBakingRackPrompts", true)
-local autoNearestPromptToggle = createToggle(movePage, "Instant Proximity (Night Auto)", "Automatically ON at night • OFF during day", "ZHM_AutoNearestPrompt", false)
+local rackMovementToggle = createToggle(movePage, "Auto Rack Movement", "Instant TP between baking racks and display rack", "ZHM_AutoWalk", false)
+createToggle(movePage, "BakingRack Scanner", "Live scan racks, prompts and click detectors", "ZHM_BakingRackScanner", false)
+createToggle(movePage, "Expand BakingRack Prompts", "1000-stud range • clickable • no line-of-sight • instant hold", "ZHM_ExpandBakingRackPrompts", false)
+createToggle(movePage, "DisplayRack Prompt Spam", "Fire enabled prompts around DisplayRack while rack movement is active", "ZHM_SpamDisplayRackPrompts", false)
+createInfoCard(movePage, "Instant Proximity", function()
+    return "Always ON • instant prompt hold + nearest prompt automation"
+end, 52)
 createInfoCard(movePage, "BakingRack Live Scanner", function()
     return tostring(ENV.ZHM_BakingRackStatus or "Scanning BakingRacks...")
 end, 76)
@@ -5109,45 +5391,25 @@ local function detectNightForRack()
 end
 
 task.spawn(function()
-    local lastPromptNightState = nil
-
     while isCurrent() do
         local nightNow = detectNightForRack()
+        local nightSweepOwnsMovement = nightNow and ENV.ZHM_AutoSweep == true
 
-        -- Night-only instant proximity automation:
-        --   NIGHT = forced ON
-        --   DAY   = forced OFF
-        -- This is continuously enforced, so manually changing the toggle cannot
-        -- accidentally leave instant proximity enabled during daytime.
-        local desiredPromptState = nightNow == true
-        if ENV.ZHM_AutoNearestPrompt ~= desiredPromptState then
-            ENV.ZHM_AutoNearestPrompt = desiredPromptState
-            autoNearestPromptToggle.Refresh()
-        end
-
-        if lastPromptNightState ~= nightNow then
-            lastPromptNightState = nightNow
-            report(
-                "NearestPrompt",
-                nightNow
-                    and "Night detected • Instant Proximity automatically ON"
-                    or "Day detected • Instant Proximity automatically OFF"
-            )
-        end
-
-        if nightNow and not rackNightLock then
+        -- No feature is auto-enabled here. Night coordination only pauses/restores
+        -- rack movement after the user has explicitly enabled Night Auto Sweep.
+        if nightSweepOwnsMovement and not rackNightLock then
             rackNightLock = true
             rackStateBeforeNight = ENV.ZHM_AutoWalk == true
             ENV.ZHM_AutoWalk = false
             rackMovementToggle.Refresh()
-            report("AutoWalk", "Night detected • Rack Movement automatically OFF")
-        elseif not nightNow and rackNightLock then
+            report("AutoWalk", "Night Auto Sweep active • Rack Movement paused")
+        elseif not nightSweepOwnsMovement and rackNightLock then
             rackNightLock = false
             ENV.ZHM_AutoWalk = rackStateBeforeNight == true
             rackStateBeforeNight = nil
             rackMovementToggle.Refresh()
-            report("AutoWalk", ENV.ZHM_AutoWalk and "Day detected • Rack Movement restored ON" or "Day detected • Rack Movement remains OFF")
-        elseif nightNow and ENV.ZHM_AutoWalk == true then
+            report("AutoWalk", ENV.ZHM_AutoWalk and "Rack Movement restored ON" or "Rack Movement remains OFF")
+        elseif nightSweepOwnsMovement and ENV.ZHM_AutoWalk == true then
             ENV.ZHM_AutoWalk = false
             rackMovementToggle.Refresh()
         end
@@ -5157,18 +5419,24 @@ task.spawn(function()
 end)
 
 createSection(sidePage, "Side Jobs")
-createToggle(sidePage, "Night Auto Sweep", "Sweep trash prompts at night", "ZHM_AutoSweep", true)
-createToggle(sidePage, "NPC Auto TP", "LIVE scanner • OutsideWall/DisplayRack • Customer > Head > RunawayExclam • TP", "ZHM_NPCAutoTP", true)
-createToggle(sidePage, "Rolling Pin Swing", "Customer > Head > RunawayExclam • auto swing for 3 seconds • live scan", "ZHM_NPCAutoSwing", true)
+createToggle(sidePage, "Night Auto Sweep", "Sweep trash prompts at night", "ZHM_AutoSweep", false)
+createToggle(sidePage, "NPC Auto TP", "LIVE scanner • OutsideWall/DisplayRack • Customer > Head > RunawayExclam • TP", "ZHM_NPCAutoTP", false)
+createToggle(sidePage, "Rolling Pin Swing", "Customer > Head > RunawayExclam • auto swing for 3 seconds • live scan", "ZHM_NPCAutoSwing", false)
 createInfoCard(sidePage, "Live Scanner", function()
     return "Sweep: " .. tostring(ENV.ZHM_SweepStatus or "Waiting")
         .. "\nNPC: " .. tostring(ENV.ZHM_NPCStatus or "Idle")
 end, 64)
 
 createSection(extraPage, "Extra Automation")
-createToggle(extraPage, "Auto Buy All Market", "Buy all GUI Market items + world Buy prompts", "ZHM_AutoBuy", true)
-createToggle(extraPage, "Auto Upgrade", "Upgrade bakery items", "ZHM_AutoUpgrade", true)
-createToggle(extraPage, "Hide Popups", "Suppress known notifications", "ZHM_HidePopups", true)
+createToggle(extraPage, "Auto Buy All Market", "Buy all GUI Market items + world Buy prompts", "ZHM_AutoBuy", false)
+createToggle(extraPage, "Auto Buy Baking Rack", "LIVE detect Buy / Baking Rack prompt and fire it automatically", "ZHM_AutoBuyBakingRack", false)
+createInfoCard(extraPage, "Baking Rack Buyer", function()
+    return tostring(ENV.ZHM_BuyBakingRackStatus or "Auto Buy Baking Rack disabled")
+end, 54)
+createToggle(extraPage, "Auto Upgrade", "Upgrade bakery items", "ZHM_AutoUpgrade", false)
+createToggle(extraPage, "Hide Popups", "Suppress known notifications", "ZHM_HidePopups", false)
+createToggle(extraPage, "NPC Hitbox", "Expand NPC HumanoidRootPart hitbox to 8 x 6 x 8", "ZHM_NPCHitbox", false)
+createToggle(extraPage, "NPC Hitbox ESP", "Transparent hitbox ESP • requires NPC Hitbox", "ZHM_NPCHitboxESP", false, "ZHM_NPCHitbox")
 
 createSection(extraPage, "Camera / FOV")
 
@@ -5259,6 +5527,16 @@ ENV.ZHM_BuildFOVControl = function(parent)
     quickLayout.Padding = UDim.new(0, 4)
     quickLayout.Parent = quickHolder
 
+    ENV.ZHM_RefreshFOVUI = function()
+        input.Text = tostring(math.floor((tonumber(ENV.ZHM_FOV) or 70) + 0.5))
+        current.Text = (ENV.ZHM_FOVActive == true and "Current: " or "Saved: ") .. tostring(math.floor((tonumber(ENV.ZHM_FOV) or 70) + 0.5))
+        for _, child in ipairs(quickHolder:GetChildren()) do
+            if child:IsA("TextButton") then
+                child.BackgroundColor3 = tonumber(child.Text) == tonumber(ENV.ZHM_FOV) and UI_ACCENT or UI_PANEL_2
+            end
+        end
+    end
+
     local function setFOV(value)
         value = tonumber(value)
         if not value or value < 1 or value > 120 then
@@ -5267,8 +5545,7 @@ ENV.ZHM_BuildFOVControl = function(parent)
         end
 
         if ENV.ZHM_ApplyFOV and ENV.ZHM_ApplyFOV(value) then
-            input.Text = tostring(value)
-            current.Text = "Current: " .. tostring(value)
+            ENV.ZHM_RefreshFOVUI()
         end
     end
 
@@ -5309,6 +5586,78 @@ end
 
 ENV.ZHM_BuildFOVControl(extraPage)
 ENV.ZHM_BuildFOVControl = nil
+
+ENV.ZHM_RefreshAllToggles = function()
+    for _, toggleObject in pairs(toggleRegistry) do
+        if toggleObject and type(toggleObject.Refresh) == "function" then
+            toggleObject.Refresh()
+        end
+    end
+end
+
+createSection(extraPage, "Configuration")
+do
+    local card = Instance.new("Frame")
+    card.Name = "ConfigControl"
+    card.Size = UDim2.new(1, 0, 0, 92)
+    card.BackgroundColor3 = UI_PANEL
+    card.BorderSizePixel = 0
+    card.Parent = extraPage
+    addCorner(card, 8)
+    addStroke(card, UI_STROKE, 1, 0.45)
+
+    local status = Instance.new("TextLabel")
+    status.Size = UDim2.new(1, -20, 0, 24)
+    status.Position = UDim2.new(0, 10, 0, 8)
+    status.BackgroundTransparency = 1
+    status.Text = tostring(ENV.ZHM_ConfigStatus)
+    status.TextColor3 = UI_MUTED
+    status.Font = Enum.Font.Gotham
+    status.TextSize = 8
+    status.TextWrapped = true
+    status.TextXAlignment = Enum.TextXAlignment.Left
+    status.Parent = card
+
+    local holder = Instance.new("Frame")
+    holder.Size = UDim2.new(1, -20, 0, 36)
+    holder.Position = UDim2.new(0, 10, 0, 44)
+    holder.BackgroundTransparency = 1
+    holder.Parent = card
+
+    local layout = Instance.new("UIListLayout")
+    layout.FillDirection = Enum.FillDirection.Horizontal
+    layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    layout.Padding = UDim.new(0, 6)
+    layout.Parent = holder
+
+    local function configButton(textValue, callback)
+        local button = Instance.new("TextButton")
+        button.Size = UDim2.new(0, 92, 0, 32)
+        button.BackgroundColor3 = UI_PANEL_2
+        button.BorderSizePixel = 0
+        button.Text = textValue
+        button.TextColor3 = UI_TEXT
+        button.Font = Enum.Font.GothamBold
+        button.TextSize = 8
+        button.Parent = holder
+        addCorner(button, 7)
+        button.Activated:Connect(function()
+            callback()
+            status.Text = tostring(ENV.ZHM_ConfigStatus or "Ready")
+        end)
+        return button
+    end
+
+    configButton("SAVE CONFIG", function() ENV.ZHM_SaveConfig() end)
+    configButton("LOAD CONFIG", function() ENV.ZHM_LoadConfig() end)
+    configButton("ALL OFF", function() ENV.ZHM_AllFeaturesOff() end)
+
+    infoUpdaters[#infoUpdaters + 1] = function()
+        if status.Parent then
+            status.Text = tostring(ENV.ZHM_ConfigStatus or "Ready")
+        end
+    end
+end
 
 createInfoCard(extraPage, "Status", function()
     local latestFeature, latestMessage
@@ -5415,6 +5764,7 @@ task.wait(0.15)
 --// =========================================================
 
 local Config = {
+    -- Controller remains alive so the UI can enable/disable the feature at runtime.
     Enabled = true,
 
     -- Smaller and safer
@@ -5427,7 +5777,7 @@ local Config = {
     -- hasn't reset the hitbox
     VerifyDelay = 1,
 
-    ESP = true,
+    ESP = false,
 
     -- Nearly invisible ESP
     ESPTransparency = 0.94,
@@ -5477,6 +5827,7 @@ VisualFolder.Parent = CoreGui
 local GUI = Instance.new("ScreenGui")
 GUI.Name = "StableNPCHitboxUI"
 GUI.ResetOnSpawn = false
+GUI.Enabled = false
 GUI.Parent = CoreGui
 
 
@@ -5804,10 +6155,9 @@ end
 
 
 --// =========================================================
---// INITIAL SCAN
+--// INITIAL STATE
 --// =========================================================
-
-ScanNPCs()
+-- No NPC scan happens until NPC Hitbox is enabled from ZHM HUB.
 
 
 --// =========================================================
@@ -5816,78 +6166,81 @@ ScanNPCs()
 
 task.spawn(function()
 
+    local wasFeatureEnabled = false
+
+    local function ClearHitboxChanges()
+        for part in pairs(Modified) do
+            RestorePart(part)
+        end
+
+        for npc in pairs(Visuals) do
+            RemoveESP(npc)
+        end
+
+        NPCs = {}
+        NPCCount = 0
+        ActiveCount = 0
+    end
+
     while Config.Enabled do
+
+        local featureEnabled = ENV.ZHM_NPCHitbox == true
+        Config.ESP = featureEnabled and ENV.ZHM_NPCHitboxESP == true
+        GUI.Enabled = featureEnabled and Config.StatusUI == true
+
+        if not featureEnabled then
+            if wasFeatureEnabled then
+                ClearHitboxChanges()
+            end
+
+            wasFeatureEnabled = false
+            RunService.Heartbeat:Wait()
+            continue
+        end
+
+        if not wasFeatureEnabled then
+            LastScan = 0
+            LastVerify = 0
+            ScanNPCs()
+        end
+        wasFeatureEnabled = true
 
         local now = tick()
 
-
-        -- Find newly spawned NPCs
-        if now - LastScan
-            >= Config.ScanDelay
-        then
-
+        -- Find newly spawned NPCs only while the feature is enabled.
+        if now - LastScan >= Config.ScanDelay then
             ScanNPCs()
-
             LastScan = now
         end
 
-
         ActiveCount = 0
 
-
-        -- IMPORTANT:
-        -- Don't change hitboxes every Heartbeat.
-        --
-        -- Only verify roughly once per second.
-        if now - LastVerify
-            >= Config.VerifyDelay
-        then
-
-
+        -- Only verify hitbox properties roughly once per second.
+        if now - LastVerify >= Config.VerifyDelay then
             for _, npc in ipairs(NPCs) do
-
                 if npc
                     and npc.Parent
                     and not IsPlayerCharacter(npc)
                 then
-
-                    local humanoid =
-                        GetHumanoid(npc)
-
-                    local root =
-                        GetRoot(npc)
-
+                    local humanoid = GetHumanoid(npc)
+                    local root = GetRoot(npc)
 
                     if humanoid
                         and humanoid.Health > 0
                         and root
                     then
-
-
                         if ApplyHitbox(npc) then
-
                             ActiveCount += 1
-
                         end
                     end
                 end
             end
 
-
             LastVerify = now
         else
-
-            -- Count only without rewriting physics
             for _, npc in ipairs(NPCs) do
-
-                local humanoid =
-                    npc
-                    and GetHumanoid(npc)
-
-                local root =
-                    npc
-                    and GetRoot(npc)
-
+                local humanoid = npc and GetHumanoid(npc)
+                local root = npc and GetRoot(npc)
 
                 if npc
                     and npc.Parent
@@ -5895,102 +6248,56 @@ task.spawn(function()
                     and humanoid.Health > 0
                     and root
                 then
-
                     ActiveCount += 1
-
-                    -- ESP can follow automatically
-                    -- because it is attached to root.
                 end
             end
         end
 
-
-        -- Cleanup destroyed / dead NPCs
+        -- Cleanup destroyed / dead NPCs.
         for part in pairs(Modified) do
-
             if not part.Parent then
-
-                Modified[part] =
-                    nil
-
+                Modified[part] = nil
             else
-
-                local npc =
-                    part:FindFirstAncestorWhichIsA(
-                        "Model"
-                    )
-
-
-                local humanoid =
-                    npc
-                    and GetHumanoid(npc)
-
+                local npc = part:FindFirstAncestorWhichIsA("Model")
+                local humanoid = npc and GetHumanoid(npc)
 
                 if not npc
                     or IsPlayerCharacter(npc)
                     or not humanoid
                     or humanoid.Health <= 0
                 then
-
-
                     if npc then
                         RemoveESP(npc)
                     end
-
-
                     RestorePart(part)
-
                 end
             end
         end
 
-
         for npc in pairs(Visuals) do
-
             if not npc.Parent
                 or IsPlayerCharacter(npc)
+                or not Config.ESP
             then
-
                 RemoveESP(npc)
             end
         end
 
-
         Status.Text =
-            "NPC HITBOX: STABLE MODE\n"
-            ..
-            "NPCs: "
-            ..
-            tostring(NPCCount)
-            ..
-            " | Active: "
-            ..
-            tostring(ActiveCount)
-            ..
-            "\nHitbox: 8 x 6 x 8"
-            ..
-            "\nESP: 94% transparent"
-
+            "NPC HITBOX: " .. (featureEnabled and "ON" or "OFF") .. "\n"
+            .. "NPCs: " .. tostring(NPCCount)
+            .. " | Active: " .. tostring(ActiveCount)
+            .. "\nHitbox: 8 x 6 x 8"
+            .. "\nESP: " .. (Config.ESP and "ON (94% transparent)" or "OFF")
 
         RunService.Heartbeat:Wait()
     end
 
-
-    -- Restore original NPC parts
-    for part in pairs(Modified) do
-        RestorePart(part)
-    end
-
-
-    for npc in pairs(Visuals) do
-        RemoveESP(npc)
-    end
-
+    ClearHitboxChanges()
 
     pcall(function()
         GUI:Destroy()
     end)
-
 
     pcall(function()
         VisualFolder:Destroy()
