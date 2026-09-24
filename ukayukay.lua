@@ -216,12 +216,12 @@ screenGui.DisplayOrder = 9999
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 mountGui(screenGui)
 
---// MAIN WINDOW
+--// MAIN WINDOW (UPDATED: Spawns on the left side of screen)
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
-mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+mainFrame.AnchorPoint = Vector2.new(0, 0.5)
 mainFrame.Size = UDim2.new(0, 340, 0, 420)
-mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+mainFrame.Position = UDim2.new(0, 20, 0.5, 0)
 mainFrame.BackgroundColor3 = UI_BG
 mainFrame.BorderSizePixel = 0
 mainFrame.Parent = screenGui
@@ -1532,7 +1532,7 @@ end)
 local minimized = false
 local miniButton = Instance.new("TextButton")
 miniButton.Name = "MiniButton"
-miniButton.AnchorPoint = Vector2.new(0.5, 0.5)
+miniButton.AnchorPoint = Vector2.new(0, 0.5)
 miniButton.Size = UDim2.new(0, 46, 0, 46)
 miniButton.Position = mainFrame.Position
 miniButton.BackgroundColor3 = UI_PANEL
