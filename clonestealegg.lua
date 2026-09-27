@@ -3686,7 +3686,7 @@ local PlacementAttemptedAt = setmetatable({}, {__mode = "k"})
 --// MAXIMUM EGG LIMIT UI DETECTOR
 -- When the game shows:
 -- "You have reached the maximum number of eggs you can place!"
--- The current fill cycle stops only when this warning appears; Auto Place itself stays enabled.
+-- The fill cycle stops on either the live Growing Eggs cap OR this warning; Auto Place itself stays enabled.
 local MAX_EGG_LIMIT_TEXT = "maximum number of eggs you can place"
 local MAX_EGG_UI_SCAN_RATE = 1.25 -- only used while placing / waiting on MAX
 local AutoPlaceToggleController = nil
@@ -3851,7 +3851,10 @@ local function parseGrowingCounter(value)
         return nil
     end
 
-    if current < 0 or current > maximum then
+    -- IMPORTANT: allow temporary over-cap values such as 45/40.
+    -- The old parser rejected current > maximum, which made the live counter
+    -- stop updating exactly when Auto Place most needed to stop.
+    if current < 0 then
         return nil
     end
 
@@ -4252,6 +4255,14 @@ local function updateGrowingEggCount()
     publishGrowingEggState()
     refreshGrowingEggScannerCard()
 
+    -- HARD CAP: stop Auto Place as soon as the live counter reaches the limit.
+    -- This works even if the game's MAX warning popup never appears.
+    if current >= maximum then
+        stopAutoPlaceForMaxEggLimit(
+            "Growing Eggs counter " .. tostring(current) .. "/" .. tostring(maximum)
+        )
+    end
+
     if changed then
         print(
             "[ZHM] Growing Eggs LIVE:",
@@ -4288,6 +4299,36 @@ local function updateGrowingEggCount()
     end
 
     return true
+end
+
+-- Stored on State instead of top-level locals to stay under Luau's 200-register limit.
+function State.IsGrowingEggCapReached()
+    local current = tonumber(State.GrowingEggs)
+    local maximum = tonumber(State.GrowingEggMax)
+
+    return State.GrowingEggCounterReady
+        and current ~= nil
+        and maximum ~= nil
+        and maximum > 0
+        and current >= maximum
+end
+
+function State.EnforceGrowingEggCap()
+    -- Pull the newest text before every placement attempt so a 40/40 counter
+    -- stops the loop even if the UI warning is delayed or missing.
+    pcall(updateGrowingEggCount)
+
+    if State.IsGrowingEggCapReached() then
+        stopAutoPlaceForMaxEggLimit(
+            "Growing Eggs counter "
+            .. tostring(State.GrowingEggs)
+            .. "/"
+            .. tostring(State.GrowingEggMax)
+        )
+        return true
+    end
+
+    return false
 end
 
 local function lockGrowingCounter()
@@ -4667,9 +4708,10 @@ local function getNextPlotPlacementPosition()
     local xAlpha = cols > 1 and (xIndex / (cols - 1) - 0.5) or 0
     local zAlpha = rows > 1 and (zIndex / (rows - 1) - 0.5) or 0
 
-    -- Keep a safe border so eggs are not placed on the very edge of PlotSurface.
-    local xOffset = xAlpha * surface.Size.X * 0.60
-    local zOffset = zAlpha * surface.Size.Z * 0.60
+    -- Compact placement: use only 30% of the PlotSurface span so eggs sit
+    -- closer together while still keeping a safe border from the plot edge.
+    local xOffset = xAlpha * surface.Size.X * 0.30
+    local zOffset = zAlpha * surface.Size.Z * 0.30
     local localY = surface.Size.Y * 0.5 + 0.08
 
     local pointCF = surface.CFrame * CFrame.new(xOffset, localY, zOffset)
@@ -4951,7 +4993,8 @@ local function placeOneBackpackEgg(tool)
         return false
     end
 
-    if checkMaxEggLimitUI() then
+    -- Stop BEFORE equipping/clicking another egg when Growing Eggs is full.
+    if State.EnforceGrowingEggCap() or checkMaxEggLimitUI() then
         return false
     end
 
@@ -5057,6 +5100,10 @@ local function placeAllBackpackEggs(alreadyBusy, ignoreGrowingGate)
         return false
     end
 
+    if State.EnforceGrowingEggCap() then
+        return false
+    end
+
     -- METHOD 1 uses Growing Eggs == 0 as its trigger.
     -- METHOD 2 (after pickup / no target) intentionally ignores the Growing Eggs count.
     if not ignoreGrowingGate then
@@ -5105,8 +5152,8 @@ local function placeAllBackpackEggs(alreadyBusy, ignoreGrowingGate)
         and modeEnabled()
         and not State.MaxEggLimitReached do
 
-        -- This is the MAIN stop condition.
-        if checkMaxEggLimitUI() then
+        -- HARD stop conditions: live counter first, popup warning second.
+        if State.EnforceGrowingEggCap() or checkMaxEggLimitUI() then
             break
         end
 
@@ -5135,6 +5182,7 @@ local function placeAllBackpackEggs(alreadyBusy, ignoreGrowingGate)
             if not RUNNING
                 or not modeEnabled()
                 or State.MaxEggLimitReached
+                or State.EnforceGrowingEggCap()
                 or checkMaxEggLimitUI() then
                 break
             end
@@ -5145,6 +5193,23 @@ local function placeAllBackpackEggs(alreadyBusy, ignoreGrowingGate)
 
                 placed += 1
                 placedThisPass += 1
+
+                -- Give the live Growing Eggs counter a moment to reflect the
+                -- successful placement before another egg can be placed.
+                local beforeSync = tonumber(State.GrowingEggs)
+                local syncDeadline = os.clock() + 0.35
+
+                repeat
+                    task.wait(0.03)
+                    pcall(updateGrowingEggCount)
+                until State.MaxEggLimitReached
+                    or State.IsGrowingEggCapReached()
+                    or (beforeSync ~= nil and tonumber(State.GrowingEggs) ~= beforeSync)
+                    or os.clock() >= syncDeadline
+
+                if State.EnforceGrowingEggCap() then
+                    break
+                end
             end
 
             -- Small delay keeps the loop responsive while still filling quickly.
@@ -5224,7 +5289,7 @@ end
 -- LOOP:
 --   Growing Eggs == 0 -> BEGIN fill cycle
 --   keep placing/rescanning Backpack regardless of the count rising
---   maximum warning   -> STOP current fill cycle immediately
+--   Growing Eggs >= MAX OR maximum warning -> STOP current fill cycle immediately
 --   live counter == 0 and warning gone -> begin the next fill cycle
 task.spawn(function()
     while RUNNING do
@@ -5901,7 +5966,8 @@ local function tryAutoPlaceMethod2(reason)
     return placed
 end
 
-local function runAutoPickupCycle()
+-- Stored on State instead of a new top-level local for Luau register safety.
+function State.RunAutoPickupCycle()
     if State.Busy or not State.AutoPickup then
         return
     end
@@ -6279,7 +6345,7 @@ task.spawn(function()
         end
 
         if State.AutoPickup and not State.Busy then
-            runAutoPickupCycle()
+            State.RunAutoPickupCycle()
         end
 
         task.wait(AUTO_LOOP_DELAY)
