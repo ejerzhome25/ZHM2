@@ -1,0 +1,4007 @@
+--[[
+    VNDT - Rarity Auto Steal / Rarity Auto Sell
+
+    Updated from the supplied readable Luau source.
+    Changes:
+      * Removed the entire key system / key GUI / saved-key checks
+      * Renamed the interface to VNDT
+      * Added a premium responsive dark UI
+      * Added touch-friendly controls and scrolling for mobile
+      * Added mouse + touch dragging
+      * Added minimize / restore support
+      * Auto Steal now targets selected live-scanned rarities
+      * No fixed egg-search delay: rescans immediately / every frame when empty
+      * Removed continuous egg position/tween lock
+      * Highest-HP priority added as an optional toggle
+      * STRICT RETURN-FIRST: returns and confirms TreadmillBoard before any new egg scan
+      * Claim-safe pickup: stays at the egg until pickup can register
+      * No fixed delay before finding/scanning for the next egg
+      * One Character Protection toggle controls anti-push/ragdoll/stun/godmode
+      * Anti-push no longer anchors HumanoidRootPart, so egg breaking still works
+      * Auto Steal stays on the same egg until it is actually broken
+      * Waits 5 seconds after break, then blocks until steal is confirmed
+      * Blocks again until TreadmillBoard return is confirmed before any new target
+      * Waits 1 second after confirmed return before finding the next egg
+      * Auto Sell now sells only selected rarities
+      * Returns to TreadmillBoard after a successful steal
+]]
+
+--// Services
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+local CoreGui = game:GetService("CoreGui")
+local TweenService = game:GetService("TweenService")
+local CollectionService = game:GetService("CollectionService")
+local HttpService = game:GetService("HttpService")
+local VirtualUser = game:GetService("VirtualUser")
+
+local LocalPlayer = Players.LocalPlayer
+
+--// Recovered game constants
+local GUI_NAME = "VNDT"
+local GUI_TITLE = "VNDT"
+local RETURN_CFRAME = CFrame.new(-62, 4, 4)
+local RETURN_TARGET_NAME = "TreadmillBoard"
+local RETURN_HEIGHT = 3
+local EGG_PICK_RANGE = 999
+local PROMPT_RANGE = 28
+local PROMPT_FIRE_TIME = 0.35
+
+local ZONES = {
+    "Swamp Zone",
+    "Snowy Zone",
+    "Galaxy Zone",
+    "Candy Zone",
+    "Ocean Zone",
+    "Hell Zone",
+    "Forest Zone",
+    "Desert Zone",
+    "Blossom Zone",
+}
+
+
+--====================================================
+-- VNDT / ZHM FPS BOOSTER
+-- Toggleable + live detection + reversible visual changes
+--====================================================
+
+local fpsBoosterEnabled = false
+
+local FPS_REMOVE_TEXTURES = true
+local FPS_REMOVE_DECALS = true
+local FPS_REMOVE_PARTICLES = true
+local FPS_REMOVE_EFFECTS = true
+local FPS_REMOVE_SHADOWS = true
+local FPS_LOWEST_MATERIALS = true
+local FPS_REMOVE_SURFACE_APPEARANCE = true
+local FPS_REMOVE_MESH_TEXTURES = true
+local FPS_REMOVE_TERRAIN_EFFECTS = true
+local FPS_IGNORE_GUI = true
+
+local FPSOptimizedObjects = 0
+local fpsDescendantConnection = nil
+local fpsLightingConnection = nil
+local fpsRenderConnection = nil
+local fpsPeriodicToken = 0
+
+-- Cache original properties so OFF can restore what this execution changed.
+local fpsOriginalState = setmetatable({}, {__mode = "k"})
+local fpsLightingState = nil
+local fpsTerrainState = nil
+local fpsRenderingState = nil
+
+local function safeGet(instance, property)
+    local ok, value = pcall(function()
+        return instance[property]
+    end)
+    if ok then
+        return value
+    end
+    return nil
+end
+
+local function safeSet(instance, property, value)
+    pcall(function()
+        instance[property] = value
+    end)
+end
+
+local function rememberObjectState(object)
+    if not object or fpsOriginalState[object] then
+        return
+    end
+
+    local state = {}
+
+    if object:IsA("BasePart") then
+        state.CastShadow = safeGet(object, "CastShadow")
+        state.Material = safeGet(object, "Material")
+        state.MaterialVariant = safeGet(object, "MaterialVariant")
+
+        if object:IsA("MeshPart") then
+            state.RenderFidelity = safeGet(object, "RenderFidelity")
+            state.TextureID = safeGet(object, "TextureID")
+        end
+
+    elseif object:IsA("Decal") or object:IsA("Texture") then
+        state.Transparency = safeGet(object, "Transparency")
+
+    elseif object:IsA("SpecialMesh") then
+        state.TextureId = safeGet(object, "TextureId")
+
+    elseif object:IsA("SurfaceAppearance") then
+        state.ColorMap = safeGet(object, "ColorMap")
+        state.MetalnessMap = safeGet(object, "MetalnessMap")
+        state.NormalMap = safeGet(object, "NormalMap")
+        state.RoughnessMap = safeGet(object, "RoughnessMap")
+
+    elseif object:IsA("ParticleEmitter") then
+        state.Enabled = safeGet(object, "Enabled")
+        state.Rate = safeGet(object, "Rate")
+
+    elseif object:IsA("Trail") then
+        state.Enabled = safeGet(object, "Enabled")
+        state.Lifetime = safeGet(object, "Lifetime")
+
+    elseif object:IsA("Beam")
+        or object:IsA("Fire")
+        or object:IsA("Smoke")
+        or object:IsA("Sparkles")
+        or object:IsA("PostEffect") then
+
+        state.Enabled = safeGet(object, "Enabled")
+
+    elseif object:IsA("PointLight")
+        or object:IsA("SpotLight")
+        or object:IsA("SurfaceLight") then
+
+        state.Enabled = safeGet(object, "Enabled")
+        state.Shadows = safeGet(object, "Shadows")
+
+    elseif object:IsA("Atmosphere") then
+        state.Density = safeGet(object, "Density")
+        state.Haze = safeGet(object, "Haze")
+        state.Glare = safeGet(object, "Glare")
+    end
+
+    fpsOriginalState[object] = state
+end
+
+local function restoreFpsObject(object, state)
+    if not object or not object.Parent or type(state) ~= "table" then
+        return
+    end
+
+    for property, value in pairs(state) do
+        safeSet(object, property, value)
+    end
+end
+
+local function optimizeFpsObject(object)
+    if not fpsBoosterEnabled or not object then
+        return
+    end
+
+    -- Never modify VNDT/game GUI.
+    if FPS_IGNORE_GUI and object:FindFirstAncestorOfClass("ScreenGui") then
+        return
+    end
+
+    rememberObjectState(object)
+
+    if object:IsA("BasePart") then
+        if FPS_REMOVE_SHADOWS then
+            safeSet(object, "CastShadow", false)
+        end
+
+        if FPS_LOWEST_MATERIALS then
+            local transparency = safeGet(object, "Transparency")
+            if transparency == nil or transparency < 1 then
+                safeSet(object, "Material", Enum.Material.SmoothPlastic)
+            end
+            safeSet(object, "MaterialVariant", "")
+        end
+
+        if object:IsA("MeshPart") then
+            safeSet(object, "RenderFidelity", Enum.RenderFidelity.Performance)
+
+            if FPS_REMOVE_MESH_TEXTURES then
+                safeSet(object, "TextureID", "")
+            end
+        end
+
+    elseif object:IsA("Decal") then
+        if FPS_REMOVE_DECALS then
+            safeSet(object, "Transparency", 1)
+        end
+
+    elseif object:IsA("Texture") then
+        if FPS_REMOVE_TEXTURES then
+            safeSet(object, "Transparency", 1)
+        end
+
+    elseif object:IsA("SpecialMesh") then
+        if FPS_REMOVE_MESH_TEXTURES then
+            safeSet(object, "TextureId", "")
+        end
+
+    elseif object:IsA("SurfaceAppearance") then
+        -- Do not Destroy it. Blank maps so OFF can restore them.
+        if FPS_REMOVE_SURFACE_APPEARANCE then
+            safeSet(object, "ColorMap", "")
+            safeSet(object, "MetalnessMap", "")
+            safeSet(object, "NormalMap", "")
+            safeSet(object, "RoughnessMap", "")
+        end
+
+    elseif object:IsA("ParticleEmitter") then
+        if FPS_REMOVE_PARTICLES then
+            safeSet(object, "Enabled", false)
+            safeSet(object, "Rate", 0)
+        end
+
+    elseif object:IsA("Trail") then
+        if FPS_REMOVE_EFFECTS then
+            safeSet(object, "Enabled", false)
+            safeSet(object, "Lifetime", 0)
+        end
+
+    elseif object:IsA("Beam")
+        or object:IsA("Fire")
+        or object:IsA("Smoke")
+        or object:IsA("Sparkles") then
+
+        if FPS_REMOVE_EFFECTS then
+            safeSet(object, "Enabled", false)
+        end
+
+    elseif object:IsA("PointLight")
+        or object:IsA("SpotLight")
+        or object:IsA("SurfaceLight") then
+
+        if FPS_REMOVE_EFFECTS then
+            safeSet(object, "Enabled", false)
+            safeSet(object, "Shadows", false)
+        end
+
+    elseif object:IsA("PostEffect") then
+        if FPS_REMOVE_EFFECTS then
+            safeSet(object, "Enabled", false)
+        end
+
+    elseif object:IsA("Atmosphere") then
+        if FPS_REMOVE_EFFECTS then
+            safeSet(object, "Density", 0)
+            safeSet(object, "Haze", 0)
+            safeSet(object, "Glare", 0)
+        end
+    end
+
+    FPSOptimizedObjects += 1
+end
+
+local function optimizeFpsLighting()
+    if not fpsBoosterEnabled or not Lighting then
+        return
+    end
+
+    if not fpsLightingState then
+        fpsLightingState = {
+            GlobalShadows = safeGet(Lighting, "GlobalShadows"),
+            FogEnd = safeGet(Lighting, "FogEnd"),
+            Brightness = safeGet(Lighting, "Brightness"),
+            EnvironmentDiffuseScale = safeGet(Lighting, "EnvironmentDiffuseScale"),
+            EnvironmentSpecularScale = safeGet(Lighting, "EnvironmentSpecularScale"),
+            ShadowSoftness = safeGet(Lighting, "ShadowSoftness"),
+        }
+    end
+
+    safeSet(Lighting, "GlobalShadows", false)
+    safeSet(Lighting, "FogEnd", 1000000)
+    safeSet(Lighting, "Brightness", 1)
+    safeSet(Lighting, "EnvironmentDiffuseScale", 0)
+    safeSet(Lighting, "EnvironmentSpecularScale", 0)
+    safeSet(Lighting, "ShadowSoftness", 0)
+
+    -- Lighting is now guaranteed to be a real service.
+    for _, object in ipairs(Lighting:GetChildren()) do
+        optimizeFpsObject(object)
+    end
+end
+
+local function optimizeFpsTerrain()
+    if not fpsBoosterEnabled or not FPS_REMOVE_TERRAIN_EFFECTS then
+        return
+    end
+
+    local terrain = Workspace:FindFirstChildOfClass("Terrain")
+    if not terrain then
+        return
+    end
+
+    if not fpsTerrainState then
+        fpsTerrainState = {
+            terrain = terrain,
+            Decoration = safeGet(terrain, "Decoration"),
+            WaterWaveSize = safeGet(terrain, "WaterWaveSize"),
+            WaterWaveSpeed = safeGet(terrain, "WaterWaveSpeed"),
+            WaterReflectance = safeGet(terrain, "WaterReflectance"),
+            WaterTransparency = safeGet(terrain, "WaterTransparency"),
+        }
+    end
+
+    safeSet(terrain, "Decoration", false)
+    safeSet(terrain, "WaterWaveSize", 0)
+    safeSet(terrain, "WaterWaveSpeed", 0)
+    safeSet(terrain, "WaterReflectance", 0)
+    safeSet(terrain, "WaterTransparency", 1)
+end
+
+local function applyLowestRendering()
+    local rendering = settings().Rendering
+
+    if not fpsRenderingState then
+        fpsRenderingState = {}
+
+        pcall(function()
+            fpsRenderingState.QualityLevel = rendering.QualityLevel
+        end)
+        pcall(function()
+            fpsRenderingState.MeshPartDetailLevel = rendering.MeshPartDetailLevel
+        end)
+        pcall(function()
+            fpsRenderingState.EagerBulkExecution = rendering.EagerBulkExecution
+        end)
+    end
+
+    pcall(function()
+        rendering.QualityLevel = Enum.QualityLevel.Level01
+    end)
+    pcall(function()
+        rendering.MeshPartDetailLevel = Enum.MeshPartDetailLevel.Level01
+    end)
+    pcall(function()
+        rendering.EagerBulkExecution = true
+    end)
+end
+
+local function restoreRendering()
+    if not fpsRenderingState then
+        return
+    end
+
+    local rendering = settings().Rendering
+
+    if fpsRenderingState.QualityLevel ~= nil then
+        pcall(function()
+            rendering.QualityLevel = fpsRenderingState.QualityLevel
+        end)
+    end
+
+    if fpsRenderingState.MeshPartDetailLevel ~= nil then
+        pcall(function()
+            rendering.MeshPartDetailLevel = fpsRenderingState.MeshPartDetailLevel
+        end)
+    end
+
+    if fpsRenderingState.EagerBulkExecution ~= nil then
+        pcall(function()
+            rendering.EagerBulkExecution = fpsRenderingState.EagerBulkExecution
+        end)
+    end
+
+    fpsRenderingState = nil
+end
+
+local function destroyFpsCounter()
+    local playerGui = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
+    local oldGui = playerGui and playerGui:FindFirstChild("ZHM_FPS_BOOSTER")
+
+    if oldGui then
+        pcall(function()
+            oldGui:Destroy()
+        end)
+    end
+end
+
+local function createFpsCounter()
+    destroyFpsCounter()
+
+    local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "ZHM_FPS_BOOSTER"
+    screenGui.ResetOnSpawn = false
+    screenGui.IgnoreGuiInset = true
+    screenGui.DisplayOrder = 999998
+    screenGui.Parent = playerGui
+
+    local label = Instance.new("TextLabel")
+    label.Name = "FPS"
+    label.Size = UDim2.new(0, 112, 0, 25)
+    label.Position = UDim2.new(0.5, -56, 0, 7)
+    label.BackgroundTransparency = 0.25
+    label.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+    label.BorderSizePixel = 0
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 12
+    label.Text = "FPS: --"
+    label.Parent = screenGui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 7)
+    corner.Parent = label
+
+    return label
+end
+
+local function disconnectFpsConnections()
+    for _, connection in ipairs({
+        fpsDescendantConnection,
+        fpsLightingConnection,
+        fpsRenderConnection,
+    }) do
+        if connection then
+            pcall(function()
+                connection:Disconnect()
+            end)
+        end
+    end
+
+    fpsDescendantConnection = nil
+    fpsLightingConnection = nil
+    fpsRenderConnection = nil
+end
+
+local function enableFpsBooster()
+    if fpsDescendantConnection or fpsRenderConnection then
+        return
+    end
+
+    FPSOptimizedObjects = 0
+    applyLowestRendering()
+    optimizeFpsLighting()
+    optimizeFpsTerrain()
+
+    -- Initial pass.
+    local descendants = game:GetDescendants()
+    for index, object in ipairs(descendants) do
+        if not fpsBoosterEnabled then
+            break
+        end
+
+        optimizeFpsObject(object)
+
+        -- Avoid freezing large maps during the first pass.
+        if index % 400 == 0 then
+            task.wait()
+        end
+    end
+
+    if not fpsBoosterEnabled then
+        return
+    end
+
+    fpsDescendantConnection = game.DescendantAdded:Connect(function(object)
+        if not fpsBoosterEnabled then
+            return
+        end
+
+        if FPS_IGNORE_GUI and object:FindFirstAncestorOfClass("ScreenGui") then
+            return
+        end
+
+        task.defer(function()
+            optimizeFpsObject(object)
+        end)
+    end)
+
+    fpsLightingConnection = Lighting.ChildAdded:Connect(function(object)
+        if not fpsBoosterEnabled then
+            return
+        end
+
+        task.defer(function()
+            optimizeFpsObject(object)
+        end)
+    end)
+
+    fpsPeriodicToken += 1
+    local myToken = fpsPeriodicToken
+
+    task.spawn(function()
+        while fpsBoosterEnabled and myToken == fpsPeriodicToken do
+            task.wait(10)
+
+            if not fpsBoosterEnabled or myToken ~= fpsPeriodicToken then
+                break
+            end
+
+            applyLowestRendering()
+            optimizeFpsLighting()
+            optimizeFpsTerrain()
+        end
+    end)
+
+    local fpsLabel = createFpsCounter()
+    local frames = 0
+    local lastUpdate = os.clock()
+
+    fpsRenderConnection = RunService.RenderStepped:Connect(function()
+        if not fpsBoosterEnabled or not fpsLabel or not fpsLabel.Parent then
+            return
+        end
+
+        frames += 1
+        local now = os.clock()
+
+        if now - lastUpdate >= 1 then
+            local currentFps = math.floor(frames / (now - lastUpdate))
+            fpsLabel.Text = "FPS: " .. tostring(currentFps)
+            frames = 0
+            lastUpdate = now
+        end
+    end)
+end
+
+local function disableFpsBooster()
+    fpsPeriodicToken += 1
+    disconnectFpsConnections()
+    destroyFpsCounter()
+
+    -- Restore object properties changed by this execution.
+    for object, state in pairs(fpsOriginalState) do
+        restoreFpsObject(object, state)
+    end
+    fpsOriginalState = setmetatable({}, {__mode = "k"})
+
+    if fpsLightingState then
+        for property, value in pairs(fpsLightingState) do
+            safeSet(Lighting, property, value)
+        end
+        fpsLightingState = nil
+    end
+
+    if fpsTerrainState and fpsTerrainState.terrain and fpsTerrainState.terrain.Parent then
+        local terrain = fpsTerrainState.terrain
+        for property, value in pairs(fpsTerrainState) do
+            if property ~= "terrain" then
+                safeSet(terrain, property, value)
+            end
+        end
+    end
+    fpsTerrainState = nil
+
+    restoreRendering()
+end
+
+local function setFpsBoosterEnabled(enabled)
+    enabled = enabled == true
+    fpsBoosterEnabled = enabled
+
+    if enabled then
+        task.spawn(enableFpsBooster)
+    else
+        disableFpsBooster()
+    end
+end
+
+--// Runtime state
+local autoStealEnabled = false
+local autoBuyEnabled = false
+local upgradePlotEnabled = false
+local sellAllEnabled = false
+local highestHpPriorityEnabled = false -- internal: automatically follows Auto Steal
+local characterProtectionEnabled = true
+local antiAfkEnabled = true
+
+local selectedStealRarities = {}
+local selectedSellRarities = {}
+
+--// Persistent config
+-- Uses executor file APIs when available.
+local CONFIG_FILE = "VNDT_Config.json"
+local CONFIG_VERSION = 1
+local configLoaded = false
+local configSaveSerial = 0
+
+local FALLBACK_RARITIES = {
+    "Celestial",
+    "Common",
+    "Cosmic",
+    "Divine",
+    "Epic",
+    "Inferno",
+    "Legendary",
+    "Mythic",
+    "Rare",
+    "Secret",
+    "Uncommon",
+}
+
+local knownRarities = {}
+for _, rarityName in ipairs(FALLBACK_RARITIES) do
+    table.insert(knownRarities, rarityName)
+end
+
+local mainGuiStarted = false
+
+
+--// Save config / auto-load config
+local function copyBooleanMap(source)
+    local result = {}
+    for key, value in pairs(source or {}) do
+        if value == true then
+            result[tostring(key)] = true
+        end
+    end
+    return result
+end
+
+local function replaceBooleanMap(target, source)
+    for key in pairs(target) do
+        target[key] = nil
+    end
+
+    if type(source) ~= "table" then
+        return
+    end
+
+    for key, value in pairs(source) do
+        if value == true then
+            target[tostring(key)] = true
+        end
+    end
+end
+
+local function hasConfigFileApi()
+    return type(readfile) == "function" and type(writefile) == "function"
+end
+
+local function configFileExists()
+    if not hasConfigFileApi() then
+        return false
+    end
+
+    if type(isfile) == "function" then
+        local ok, exists = pcall(isfile, CONFIG_FILE)
+        if ok then
+            return exists == true
+        end
+    end
+
+    local ok, data = pcall(readfile, CONFIG_FILE)
+    return ok and type(data) == "string" and #data > 0
+end
+
+local function buildConfig()
+    return {
+        version = CONFIG_VERSION,
+
+        autoStealEnabled = autoStealEnabled,
+        autoBuyEnabled = autoBuyEnabled,
+        upgradePlotEnabled = upgradePlotEnabled,
+        sellAllEnabled = sellAllEnabled,
+        characterProtectionEnabled = characterProtectionEnabled,
+        antiAfkEnabled = antiAfkEnabled,
+        fpsBoosterEnabled = fpsBoosterEnabled,
+
+        selectedStealRarities = copyBooleanMap(selectedStealRarities),
+        selectedSellRarities = copyBooleanMap(selectedSellRarities),
+    }
+end
+
+local function saveConfigNow()
+    if not hasConfigFileApi() then
+        return false, "Executor file API unavailable"
+    end
+
+    local okEncode, encoded = pcall(function()
+        return HttpService:JSONEncode(buildConfig())
+    end)
+    if not okEncode then
+        return false, "Config encode failed"
+    end
+
+    local okWrite, err = pcall(function()
+        writefile(CONFIG_FILE, encoded)
+    end)
+
+    if not okWrite then
+        return false, tostring(err)
+    end
+
+    return true
+end
+
+local function queueSaveConfig()
+    -- Coalesce several UI changes into one write.
+    configSaveSerial += 1
+    local mySerial = configSaveSerial
+
+    task.delay(0.12, function()
+        if mySerial ~= configSaveSerial then
+            return
+        end
+        pcall(saveConfigNow)
+    end)
+end
+
+local function loadConfig()
+    if not configFileExists() then
+        return false
+    end
+
+    local okRead, raw = pcall(readfile, CONFIG_FILE)
+    if not okRead or type(raw) ~= "string" or raw == "" then
+        return false
+    end
+
+    local okDecode, data = pcall(function()
+        return HttpService:JSONDecode(raw)
+    end)
+    if not okDecode or type(data) ~= "table" then
+        return false
+    end
+
+    if type(data.autoStealEnabled) == "boolean" then
+        autoStealEnabled = data.autoStealEnabled
+    end
+    if type(data.autoBuyEnabled) == "boolean" then
+        autoBuyEnabled = data.autoBuyEnabled
+    end
+    if type(data.upgradePlotEnabled) == "boolean" then
+        upgradePlotEnabled = data.upgradePlotEnabled
+    end
+    if type(data.sellAllEnabled) == "boolean" then
+        sellAllEnabled = data.sellAllEnabled
+    end
+    if type(data.characterProtectionEnabled) == "boolean" then
+        characterProtectionEnabled = data.characterProtectionEnabled
+    end
+    if type(data.antiAfkEnabled) == "boolean" then
+        antiAfkEnabled = data.antiAfkEnabled
+    end
+    if type(data.fpsBoosterEnabled) == "boolean" then
+        fpsBoosterEnabled = data.fpsBoosterEnabled
+    end
+
+    replaceBooleanMap(selectedStealRarities, data.selectedStealRarities)
+    replaceBooleanMap(selectedSellRarities, data.selectedSellRarities)
+
+    -- Highest HP is no longer a separate user setting.
+    -- It is always ON while Auto Steal is ON.
+    highestHpPriorityEnabled = autoStealEnabled
+
+    configLoaded = true
+    return true
+end
+
+-- Load BEFORE building the UI so every saved toggle/dropdown starts correctly.
+pcall(loadConfig)
+highestHpPriorityEnabled = autoStealEnabled
+
+--// Anti AFK
+local antiAfkConnection = nil
+
+local function startAntiAfk()
+    if antiAfkConnection then
+        return
+    end
+
+    antiAfkConnection = LocalPlayer.Idled:Connect(function()
+        if not antiAfkEnabled then
+            return
+        end
+
+        pcall(function()
+            local camera = Workspace.CurrentCamera
+            local cameraCF = camera and camera.CFrame or CFrame.new()
+
+            VirtualUser:CaptureController()
+            VirtualUser:Button2Down(Vector2.new(0, 0), cameraCF)
+            task.wait(0.15)
+            VirtualUser:Button2Up(Vector2.new(0, 0), cameraCF)
+        end)
+    end)
+end
+
+startAntiAfk()
+
+--// Small compatibility helpers
+local function safeCall(fn, ...)
+    local args = table.pack(...)
+    return pcall(function()
+        return fn(table.unpack(args, 1, args.n))
+    end)
+end
+
+local function getCharacter()
+    local character = LocalPlayer.Character
+    if character then
+        return character
+    end
+    return LocalPlayer.CharacterAdded:Wait()
+end
+
+local function getRootPart(character)
+    character = character or LocalPlayer.Character
+    if not character then
+        return nil
+    end
+    return character:FindFirstChild("HumanoidRootPart")
+end
+
+
+--// VNDT Auto Steal v5 - live rarity targeting + TreadmillBoard return
+local statusSink = nil
+local rarityStatusSink = nil
+local rarityUiRefreshSink = nil
+local autoStealManagerRunning = false
+local autoStealReturning = false
+local targetLockActive = false
+local targetLockCFrame = nil
+local protectionBaseline = nil
+local protectionWorkerStarted = false
+local protectionAntiPushMover = nil
+local protectionAntiPushRoot = nil
+local protectionForceField = nil
+local protectionConstraintStates = setmetatable({}, {__mode = "k"})
+local CLAIM_TIMEOUT = 1.20
+local CLAIM_SETTLE_TIME = 0
+local CLAIM_FIRE_INTERVAL = 0
+local POST_TELEPORT_SETTLE = 0.03
+local ATTACK_INTERVAL = 0.03
+local RETURN_TIMEOUT = 0.75
+local RETURN_RETRY_INTERVAL = 0.02
+local POST_BREAK_WAIT = 5.0
+local NEXT_EGG_DELAY = 1.0
+local autoStealReturnCFrame = nil
+local moduleCache = {
+    EggTargeting = nil,
+    PickaxeController = nil,
+}
+local eggContainerCache = {}
+local lastEggContainerScan = 0
+
+local function setStatus(text, kind)
+    local prefix = "Auto Steal: "
+    local full = prefix .. tostring(text or "Idle")
+    if statusSink then
+        pcall(statusSink, full, kind)
+    end
+    print("[VNDT] " .. full)
+end
+
+local function setRarityStatus(text, kind)
+    local full = "Rarities: " .. tostring(text or "Scanning…")
+    if rarityStatusSink then
+        pcall(rarityStatusSink, full, kind)
+    end
+end
+
+local function normalizeName(value)
+    return string.lower(tostring(value or "")):gsub("[^%w]", "")
+end
+
+local function getSelectedCount(selection)
+    local count = 0
+    for _, enabled in pairs(selection) do
+        if enabled then
+            count += 1
+        end
+    end
+    return count
+end
+
+local function canonicalRarity(value)
+    if typeof(value) == "Instance" then
+        value = value.Name
+    end
+
+    if type(value) ~= "string" then
+        return nil
+    end
+
+    local normalized = normalizeName(value)
+    if normalized == "" then
+        return nil
+    end
+
+    for _, rarityName in ipairs(knownRarities) do
+        if normalizeName(rarityName) == normalized then
+            return rarityName
+        end
+    end
+
+    local best = nil
+    local bestLength = 0
+    for _, rarityName in ipairs(knownRarities) do
+        local rarityNormalized = normalizeName(rarityName)
+        if #rarityNormalized > bestLength and normalized:find(rarityNormalized, 1, true) then
+            best = rarityName
+            bestLength = #rarityNormalized
+        end
+    end
+
+    return best
+end
+
+local function sameStringList(a, b)
+    if #a ~= #b then
+        return false
+    end
+    for i = 1, #a do
+        if a[i] ~= b[i] then
+            return false
+        end
+    end
+    return true
+end
+
+local function scanRarities()
+    local found = {}
+    local foundLiveFolder = false
+
+    local folders = {}
+    local exact = game:FindFirstChild("Rarities", true)
+    if exact then
+        table.insert(folders, exact)
+    end
+
+    -- Also check the two most common client-visible locations in case there are
+    -- multiple Rarities folders.
+    for _, root in ipairs({ReplicatedStorage, Workspace}) do
+        local folder = root:FindFirstChild("Rarities", true)
+        if folder and folder ~= exact then
+            table.insert(folders, folder)
+        end
+    end
+
+    for _, folder in ipairs(folders) do
+        foundLiveFolder = true
+        for _, child in ipairs(folder:GetChildren()) do
+            local childName = tostring(child.Name or "")
+            if childName ~= "" then
+                found[childName] = true
+            end
+        end
+    end
+
+    if next(found) == nil then
+        for _, rarityName in ipairs(FALLBACK_RARITIES) do
+            found[rarityName] = true
+        end
+    end
+
+    local list = {}
+    for rarityName in pairs(found) do
+        table.insert(list, rarityName)
+    end
+
+    table.sort(list, function(a, b)
+        return string.lower(a) < string.lower(b)
+    end)
+
+    if not sameStringList(list, knownRarities) then
+        knownRarities = list
+        if rarityUiRefreshSink then
+            pcall(rarityUiRefreshSink, knownRarities)
+        end
+    end
+
+    setRarityStatus(
+        tostring(#knownRarities) .. (foundLiveFolder and " found live" or " loaded from fallback"),
+        foundLiveFolder and "success" or "warning"
+    )
+
+    return knownRarities
+end
+
+local function runRarityScanner()
+    while true do
+        pcall(scanRarities)
+        task.wait(2)
+    end
+end
+
+local function detectObjectRarityUncached(object)
+    if not object then
+        return nil
+    end
+
+    -- 1) Attributes on the object and a few ancestors.
+    local current = object
+    local ancestorDepth = 0
+    while current and current ~= game and ancestorDepth <= 5 do
+        local ok, attributes = pcall(function()
+            return current:GetAttributes()
+        end)
+
+        if ok then
+            for attributeName, attributeValue in pairs(attributes) do
+                local key = normalizeName(attributeName)
+                if key:find("rarity", 1, true) or key == "tier" or key == "quality" then
+                    local rarity = canonicalRarity(attributeValue)
+                    if rarity then
+                        return rarity
+                    end
+                end
+            end
+        end
+
+        local rarityFromName = canonicalRarity(current.Name)
+        if rarityFromName then
+            return rarityFromName
+        end
+
+        current = current.Parent
+        ancestorDepth += 1
+    end
+
+    -- 2) CollectionService tags.
+    local okTags, tags = pcall(function()
+        return CollectionService:GetTags(object)
+    end)
+    if okTags then
+        for _, tag in ipairs(tags) do
+            local rarity = canonicalRarity(tag)
+            if rarity then
+                return rarity
+            end
+        end
+    end
+
+    -- 3) Rarity StringValue/ObjectValue/labels nested inside the item.
+    local descendants = {}
+    local okDesc = pcall(function()
+        descendants = object:GetDescendants()
+    end)
+    if okDesc then
+        local inspected = 0
+        for _, child in ipairs(descendants) do
+            inspected += 1
+            if inspected > 140 then
+                break
+            end
+
+            local childName = normalizeName(child.Name)
+            if child:IsA("StringValue") then
+                if childName:find("rarity", 1, true) or childName == "tier" or childName == "quality" then
+                    local rarity = canonicalRarity(child.Value)
+                    if rarity then
+                        return rarity
+                    end
+                end
+            elseif child:IsA("ObjectValue") then
+                if childName:find("rarity", 1, true) and child.Value then
+                    local rarity = canonicalRarity(child.Value.Name)
+                    if rarity then
+                        return rarity
+                    end
+                end
+            elseif child:IsA("TextLabel") or child:IsA("TextButton") then
+                local rarity = canonicalRarity(child.Text)
+                if rarity then
+                    return rarity
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+
+local rarityDetectionCache = setmetatable({}, {__mode = "k"})
+
+local function detectObjectRarity(object)
+    if not object then
+        return nil
+    end
+
+    local cached = rarityDetectionCache[object]
+    if cached ~= nil then
+        return cached ~= false and cached or nil
+    end
+
+    local rarity = detectObjectRarityUncached(object)
+    rarityDetectionCache[object] = rarity or false
+    return rarity
+end
+
+local function getEquippedOrBackpackTool(toolName)
+    local character = LocalPlayer.Character
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
+
+    local tool = character and character:FindFirstChild(toolName)
+    if not tool and backpack then
+        tool = backpack:FindFirstChild(toolName)
+    end
+
+    if tool and tool:IsA("Tool") then
+        return tool
+    end
+    return nil
+end
+
+local function equipTool(toolName)
+    local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 5)
+    local tool = getEquippedOrBackpackTool(toolName)
+
+    if humanoid and tool then
+        pcall(function()
+            humanoid:EquipTool(tool)
+        end)
+        pcall(function()
+            GuiService.SelectedCoreObject = nil
+        end)
+        return tool
+    end
+
+    return nil
+end
+
+local function findModule(root, exactPath, moduleName)
+    local current = root
+    for _, childName in ipairs(exactPath or {}) do
+        current = current and current:FindFirstChild(childName)
+    end
+    if current and current:IsA("ModuleScript") then
+        return current
+    end
+
+    local recursive = root and root:FindFirstChild(moduleName, true)
+    if recursive and recursive:IsA("ModuleScript") then
+        return recursive
+    end
+    return nil
+end
+
+local function getPickaxeController()
+    if moduleCache.PickaxeController then
+        return moduleCache.PickaxeController
+    end
+
+    local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
+    if not playerScripts then
+        return nil
+    end
+
+    local module = findModule(playerScripts, {"Client", "Controllers", "PickaxeController"}, "PickaxeController")
+    if module then
+        local ok, result = pcall(require, module)
+        if ok then
+            moduleCache.PickaxeController = result
+            return result
+        end
+    end
+    return nil
+end
+
+local function getEggTargeting()
+    if moduleCache.EggTargeting then
+        return moduleCache.EggTargeting
+    end
+
+    local module = findModule(ReplicatedStorage, {"Shared", "EggTargeting"}, "EggTargeting")
+    if module then
+        local ok, result = pcall(require, module)
+        if ok then
+            moduleCache.EggTargeting = result
+            return result
+        end
+    end
+    return nil
+end
+
+local function findEggHitRemote()
+    local exact = ReplicatedStorage:FindFirstChild("EggHitRequest")
+    if exact and (exact:IsA("RemoteEvent") or exact:IsA("RemoteFunction")) then
+        return exact
+    end
+
+    exact = ReplicatedStorage:FindFirstChild("EggHitRequest", true)
+    if exact and (exact:IsA("RemoteEvent") or exact:IsA("RemoteFunction")) then
+        return exact
+    end
+
+    for _, object in ipairs(ReplicatedStorage:GetDescendants()) do
+        if object:IsA("RemoteEvent") or object:IsA("RemoteFunction") then
+            local n = normalizeName(object.Name)
+            if n:find("egg", 1, true) and (n:find("hit", 1, true) or n:find("attack", 1, true)) then
+                return object
+            end
+        end
+    end
+
+    return nil
+end
+
+local function getObjectCFrame(object)
+    if not object or not object.Parent then
+        return nil
+    end
+
+    if object:IsA("BasePart") then
+        return object.CFrame
+    end
+
+    if object:IsA("Model") then
+        local ok, pivot = pcall(function()
+            return object:GetPivot()
+        end)
+        if ok then
+            return pivot
+        end
+
+        local part = object.PrimaryPart or object:FindFirstChildWhichIsA("BasePart", true)
+        return part and part.CFrame or nil
+    end
+
+    return nil
+end
+
+local function isEggContainer(object)
+    if not object or not (object:IsA("Folder") or object:IsA("Model")) then
+        return false
+    end
+
+    local n = normalizeName(object.Name)
+    return n == "eggs"
+        or n == "eggmodels"
+        or n == "eggfolder"
+        or n == "spawnedeggs"
+        or n == "activeeggs"
+        or n:find("eggs", 1, true) ~= nil
+end
+
+local function getEggContainers(force)
+    local now = tick()
+    if not force and #eggContainerCache > 0 and now - lastEggContainerScan < 3 then
+        local valid = {}
+        for _, container in ipairs(eggContainerCache) do
+            if container and container.Parent then
+                table.insert(valid, container)
+            end
+        end
+        if #valid > 0 then
+            eggContainerCache = valid
+            return eggContainerCache
+        end
+    end
+
+    local found = {}
+    for _, object in ipairs(Workspace:GetDescendants()) do
+        if isEggContainer(object) then
+            table.insert(found, object)
+        end
+    end
+
+    eggContainerCache = found
+    lastEggContainerScan = now
+    return eggContainerCache
+end
+
+local function addEggCandidatesFromContainer(container, output, seen)
+    local function walk(node, depth)
+        if depth > 7 then
+            return
+        end
+
+        for _, child in ipairs(node:GetChildren()) do
+            -- IMPORTANT:
+            -- Some games nest Eggs/EggModels/SpawnedEggs containers inside each
+            -- other. Never treat a nested egg container itself as one giant egg,
+            -- because its descendant KG labels can make it look like the
+            -- highest-KG target.
+            if isEggContainer(child) then
+                walk(child, depth + 1)
+
+            elseif child:IsA("Folder") then
+                walk(child, depth + 1)
+
+            elseif child:IsA("Model") then
+                if getObjectCFrame(child) and not seen[child] then
+                    seen[child] = true
+                    table.insert(output, child)
+                end
+
+            elseif child:IsA("BasePart") then
+                if getObjectCFrame(child) and not seen[child] then
+                    seen[child] = true
+                    table.insert(output, child)
+                end
+            end
+        end
+    end
+
+    walk(container, 0)
+end
+
+local function collectAllEggCandidates()
+    local candidates = {}
+    local seen = {}
+
+    for _, container in ipairs(getEggContainers(false)) do
+        if container and container.Parent then
+            addEggCandidatesFromContainer(container, candidates, seen)
+        end
+    end
+
+    -- Fallback for games that no longer use an Eggs folder.
+    if #candidates == 0 then
+        for _, object in ipairs(Workspace:GetDescendants()) do
+            if (object:IsA("Model") or object:IsA("BasePart"))
+                and normalizeName(object.Name):find("egg", 1, true)
+                and getObjectCFrame(object)
+                and not seen[object] then
+                seen[object] = true
+                table.insert(candidates, object)
+            end
+        end
+    end
+
+    return candidates
+end
+
+
+--// Egg HP / health detection
+local function hpNumber(value)
+    if type(value) == "number" then
+        if value >= 0 and value < math.huge then
+            return value
+        end
+        return nil
+    end
+
+    if type(value) ~= "string" then
+        return nil
+    end
+
+    local cleaned = value:gsub(",", "")
+    local numberValue = tonumber(cleaned:match("[-+]?[%d]+%.?[%d]*"))
+    if numberValue and numberValue >= 0 and numberValue < math.huge then
+        return numberValue
+    end
+
+    return nil
+end
+
+local function parseHpText(value)
+    if type(value) ~= "string" then
+        return nil, nil
+    end
+
+    local raw = string.lower(value):gsub(",", "")
+
+    local current, maximum =
+        raw:match("hp%s*[:%-]?%s*([%d%.]+)%s*/%s*([%d%.]+)")
+    if not current then
+        current, maximum =
+            raw:match("health%s*[:%-]?%s*([%d%.]+)%s*/%s*([%d%.]+)")
+    end
+    if not current then
+        current, maximum =
+            raw:match("([%d%.]+)%s*/%s*([%d%.]+)%s*hp")
+    end
+
+    if current then
+        return tonumber(current), tonumber(maximum)
+    end
+
+    local single =
+        raw:match("hp%s*[:%-]?%s*([%d%.]+)")
+        or raw:match("health%s*[:%-]?%s*([%d%.]+)")
+        or raw:match("([%d%.]+)%s*hp")
+
+    if single then
+        return tonumber(single), nil
+    end
+
+    return nil, nil
+end
+
+local function isCurrentHpKey(name)
+    local key = normalizeName(name)
+    return key == "hp"
+        or key == "health"
+        or key == "currenthp"
+        or key == "currenthealth"
+        or key == "hitpoints"
+        or key == "currenthitpoints"
+        or key == "egghealth"
+        or key == "egghp"
+end
+
+local function isMaxHpKey(name)
+    local key = normalizeName(name)
+    return key == "maxhp"
+        or key == "maxhealth"
+        or key == "maximumhp"
+        or key == "maximumhealth"
+        or key == "maxhitpoints"
+end
+
+local function detectEggHp(object)
+    if not object then
+        return nil, nil
+    end
+
+    local currentHp = nil
+    local maxHp = nil
+
+    local function considerCurrent(value)
+        local n = hpNumber(value)
+        if n ~= nil then
+            currentHp = n
+        end
+    end
+
+    local function considerMax(value)
+        local n = hpNumber(value)
+        if n ~= nil then
+            maxHp = n
+        end
+    end
+
+    local function inspectInstance(instance)
+        if not instance then
+            return
+        end
+
+        if instance:IsA("Humanoid") then
+            currentHp = instance.Health
+            maxHp = instance.MaxHealth
+            return
+        end
+
+        local ok, attributes = pcall(function()
+            return instance:GetAttributes()
+        end)
+
+        if ok and type(attributes) == "table" then
+            for key, value in pairs(attributes) do
+                if isCurrentHpKey(key) then
+                    considerCurrent(value)
+                elseif isMaxHpKey(key) then
+                    considerMax(value)
+                elseif type(value) == "string" then
+                    local hp, maximum = parseHpText(value)
+                    if hp ~= nil then
+                        currentHp = hp
+                    end
+                    if maximum ~= nil then
+                        maxHp = maximum
+                    end
+                end
+            end
+        end
+
+        if instance:IsA("NumberValue") or instance:IsA("IntValue") then
+            if isCurrentHpKey(instance.Name) then
+                considerCurrent(instance.Value)
+            elseif isMaxHpKey(instance.Name) then
+                considerMax(instance.Value)
+            end
+
+        elseif instance:IsA("StringValue") then
+            if isCurrentHpKey(instance.Name) then
+                local hp, maximum = parseHpText(instance.Value)
+                currentHp = hp or hpNumber(instance.Value) or currentHp
+                maxHp = maximum or maxHp
+            elseif isMaxHpKey(instance.Name) then
+                considerMax(instance.Value)
+            else
+                local hp, maximum = parseHpText(instance.Value)
+                currentHp = hp or currentHp
+                maxHp = maximum or maxHp
+            end
+
+        elseif instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox") then
+            local hp, maximum = parseHpText(instance.Text)
+            currentHp = hp or currentHp
+            maxHp = maximum or maxHp
+        end
+    end
+
+    -- Model itself + a few ancestors.
+    local current = object
+    for _ = 1, 4 do
+        if not current then
+            break
+        end
+        inspectInstance(current)
+        current = current.Parent
+    end
+
+    -- Current HP is dynamic, so intentionally do not cache this scan.
+    local okDesc, descendants = pcall(function()
+        return object:GetDescendants()
+    end)
+
+    if okDesc and descendants then
+        local inspected = 0
+        for _, child in ipairs(descendants) do
+            inspected += 1
+            if inspected > 180 then
+                break
+            end
+
+            inspectInstance(child)
+
+            if currentHp ~= nil and maxHp ~= nil and child:IsA("Humanoid") then
+                break
+            end
+        end
+    end
+
+    -- If the game exposes only max HP, use that as a useful fallback.
+    if currentHp == nil then
+        currentHp = maxHp
+    end
+
+    return currentHp, maxHp
+end
+
+local function formatHp(hp, maxHp)
+    if hp == nil then
+        return "HP unknown"
+    end
+
+    local function fmt(n)
+        if math.abs(n - math.floor(n)) < 0.001 then
+            return tostring(math.floor(n))
+        end
+        local value = string.format("%.2f", n)
+        return value:gsub("0+$", ""):gsub("%.$", "")
+    end
+
+    if maxHp ~= nil and math.abs(maxHp - hp) > 0.001 then
+        return fmt(hp) .. "/" .. fmt(maxHp) .. " HP"
+    end
+
+    return fmt(hp) .. " HP"
+end
+
+local function chooseSelectedRarityEgg()
+    -- Fresh target scan every cycle.
+    rarityDetectionCache = setmetatable({}, {__mode = "k"})
+    eggContainerCache = {}
+    lastEggContainerScan = 0
+
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root then
+        return nil, nil, nil, nil, nil, "character"
+    end
+
+    if getSelectedCount(selectedStealRarities) == 0 then
+        return nil, nil, nil, nil, nil, "selection"
+    end
+
+    local best = nil
+    local bestCF = nil
+    local bestRarity = nil
+    local bestHp = nil
+    local bestMaxHp = nil
+    local bestDistance = math.huge
+
+    local matchedCount = 0
+    local unknownCount = 0
+    local useHp = highestHpPriorityEnabled
+
+    local function metric(value)
+        return value ~= nil and value or -math.huge
+    end
+
+    local function isBetter(hp, distance)
+        if not best then
+            return true
+        end
+
+        if useHp then
+            local hpValue = metric(hp)
+            local bestHpValue = metric(bestHp)
+
+            if hpValue ~= bestHpValue then
+                return hpValue > bestHpValue
+            end
+        end
+
+        return distance < bestDistance
+    end
+
+    for _, candidate in ipairs(collectAllEggCandidates()) do
+        if candidate and candidate.Parent and not isEggContainer(candidate) then
+            local rarity = detectObjectRarity(candidate)
+
+            if not rarity then
+                unknownCount += 1
+
+            elseif selectedStealRarities[rarity] then
+                matchedCount += 1
+
+                local cf = getObjectCFrame(candidate)
+                if cf then
+                    local distance = (root.Position - cf.Position).Magnitude
+                    local hp, maxHp = nil, nil
+
+                    if useHp then
+                        hp, maxHp = detectEggHp(candidate)
+                    end
+
+                    if isBetter(hp, distance) then
+                        best = candidate
+                        bestCF = cf
+                        bestRarity = rarity
+                        bestHp = hp
+                        bestMaxHp = maxHp
+                        bestDistance = distance
+                    end
+                end
+            end
+        end
+    end
+
+    if best then
+        return best, bestCF, bestRarity, bestHp, bestMaxHp, nil
+    end
+
+    if matchedCount == 0 and unknownCount > 0 then
+        return nil, nil, nil, nil, nil, "unknown"
+    end
+
+    return nil, nil, nil, nil, nil, "none"
+end
+
+--// Auto Steal character protection
+local STUN_ATTRIBUTE_NAMES = {
+    "Stunned",
+    "Stun",
+    "IsStunned",
+    "Ragdoll",
+    "Ragdolled",
+    "IsRagdolled",
+    "Knocked",
+    "KnockedDown",
+    "Downed",
+    "Frozen",
+    "Rooted",
+    "Immobilized",
+    "Disabled",
+}
+
+local MOVE_ENABLE_ATTRIBUTE_NAMES = {
+    "CanMove",
+    "CanWalk",
+    "CanJump",
+    "MovementEnabled",
+    "ControlsEnabled",
+}
+
+local function releaseAntiPushMover()
+    if protectionAntiPushMover then
+        pcall(function()
+            protectionAntiPushMover:Destroy()
+        end)
+    end
+
+    protectionAntiPushMover = nil
+    protectionAntiPushRoot = nil
+end
+
+
+local function ensureAntiPushMover(root)
+    if not root or not root.Parent then
+        releaseAntiPushMover()
+        return nil
+    end
+
+    if protectionAntiPushRoot == root
+        and protectionAntiPushMover
+        and protectionAntiPushMover.Parent == root then
+        return protectionAntiPushMover
+    end
+
+    releaseAntiPushMover()
+
+    -- BodyVelocity is intentionally horizontal-only here.
+    -- It resists knockback without anchoring the player, so the game's
+    -- pickaxe / hit validation can still see a normal movable character.
+    local mover = Instance.new("BodyVelocity")
+    mover.Name = "VNDT_AntiPush"
+    mover.Velocity = Vector3.zero
+    mover.MaxForce = Vector3.new(1e9, 0, 1e9)
+    mover.P = 1e6
+    mover.Parent = root
+
+    protectionAntiPushMover = mover
+    protectionAntiPushRoot = root
+
+    return mover
+end
+
+local function clearTargetLock()
+    targetLockActive = false
+    targetLockCFrame = nil
+    releaseAntiPushMover()
+end
+
+local function setTargetLock(targetCF)
+    if not targetCF then
+        clearTargetLock()
+        return
+    end
+
+    -- This flag only means "currently working on an egg".
+    -- It no longer continuously tweens or CFrames the player to that egg.
+    targetLockCFrame = targetCF + Vector3.new(0, 4, 0)
+    targetLockActive = true
+end
+
+local function captureProtectionBaseline()
+    local character = LocalPlayer.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+    if not humanoid then
+        protectionBaseline = nil
+        return
+    end
+
+    protectionBaseline = {
+        WalkSpeed = math.max(humanoid.WalkSpeed, 16),
+        JumpPower = humanoid.UseJumpPower and math.max(humanoid.JumpPower, 50) or nil,
+        JumpHeight = (not humanoid.UseJumpPower) and math.max(humanoid.JumpHeight, 7.2) or nil,
+        BreakJointsOnDeath = humanoid.BreakJointsOnDeath,
+        RequiresNeck = humanoid.RequiresNeck,
+        AutoRotate = humanoid.AutoRotate,
+    }
+end
+
+local function clearCommonStunFlags(instance)
+    if not instance then
+        return
+    end
+
+    for _, attributeName in ipairs(STUN_ATTRIBUTE_NAMES) do
+        pcall(function()
+            if instance:GetAttribute(attributeName) ~= nil then
+                instance:SetAttribute(attributeName, false)
+            end
+        end)
+    end
+
+    for _, attributeName in ipairs(MOVE_ENABLE_ATTRIBUTE_NAMES) do
+        pcall(function()
+            if instance:GetAttribute(attributeName) ~= nil then
+                instance:SetAttribute(attributeName, true)
+            end
+        end)
+    end
+
+    for _, child in ipairs(instance:GetChildren()) do
+        if child:IsA("BoolValue") then
+            local normalized = normalizeName(child.Name)
+
+            for _, flagName in ipairs(STUN_ATTRIBUTE_NAMES) do
+                if normalized == normalizeName(flagName) then
+                    pcall(function()
+                        child.Value = false
+                    end)
+                    break
+                end
+            end
+
+            for _, flagName in ipairs(MOVE_ENABLE_ATTRIBUTE_NAMES) do
+                if normalized == normalizeName(flagName) then
+                    pcall(function()
+                        child.Value = true
+                    end)
+                    break
+                end
+            end
+        end
+    end
+end
+
+local function ensureProtectionForceField(character)
+    if protectionForceField and protectionForceField.Parent == character then
+        return
+    end
+
+    if protectionForceField then
+        pcall(function()
+            protectionForceField:Destroy()
+        end)
+    end
+
+    local existing = character:FindFirstChild("VNDT_Protection")
+    if existing and existing:IsA("ForceField") then
+        protectionForceField = existing
+        return
+    end
+
+    local forceField = Instance.new("ForceField")
+    forceField.Name = "VNDT_Protection"
+    forceField.Visible = false
+    forceField.Parent = character
+    protectionForceField = forceField
+end
+
+local function suppressRagdollConstraints(character)
+    local function insideToolOrAccessory(instance)
+        local current = instance
+        while current and current ~= character do
+            if current:IsA("Tool") or current:IsA("Accessory") then
+                return true
+            end
+            current = current.Parent
+        end
+        return false
+    end
+
+    for _, descendant in ipairs(character:GetDescendants()) do
+        -- Never touch the pickaxe/tool constraints.
+        if insideToolOrAccessory(descendant) then
+            continue
+        end
+
+        if descendant:IsA("Motor6D") then
+            pcall(function()
+                descendant.Enabled = true
+            end)
+
+        elseif descendant:IsA("BallSocketConstraint")
+            or descendant:IsA("HingeConstraint")
+            or descendant:IsA("RopeConstraint") then
+
+            local hint = normalizeName(
+                tostring(descendant.Name)
+                .. " "
+                .. tostring(descendant.Parent and descendant.Parent.Name or "")
+            )
+
+            -- Only disable constraints that actually look related to ragdoll /
+            -- knockdown. Generic body/tool constraints are left alone.
+            local looksRagdoll =
+                hint:find("ragdoll", 1, true)
+                or hint:find("knock", 1, true)
+                or hint:find("stun", 1, true)
+                or hint:find("limp", 1, true)
+
+            if looksRagdoll then
+                if protectionConstraintStates[descendant] == nil then
+                    protectionConstraintStates[descendant] = descendant.Enabled
+                end
+
+                pcall(function()
+                    descendant.Enabled = false
+                end)
+            end
+        end
+    end
+end
+
+local function cleanupCharacterProtection()
+    releaseAntiPushMover()
+
+    if protectionForceField then
+        pcall(function()
+            protectionForceField:Destroy()
+        end)
+        protectionForceField = nil
+    end
+
+    for constraint, originalEnabled in pairs(protectionConstraintStates) do
+        if constraint and constraint.Parent then
+            pcall(function()
+                constraint.Enabled = originalEnabled
+            end)
+        end
+        protectionConstraintStates[constraint] = nil
+    end
+
+    local character = LocalPlayer.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+    if humanoid then
+        pcall(function()
+            humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
+            humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+            humanoid:SetStateEnabled(Enum.HumanoidStateType.Physics, true)
+            humanoid.PlatformStand = false
+            humanoid.Sit = false
+
+            if protectionBaseline then
+                humanoid.BreakJointsOnDeath = protectionBaseline.BreakJointsOnDeath
+                humanoid.RequiresNeck = protectionBaseline.RequiresNeck
+                humanoid.AutoRotate = protectionBaseline.AutoRotate
+            end
+        end)
+    end
+end
+
+local function protectCharacterStep()
+    if not characterProtectionEnabled or not autoStealEnabled then
+        cleanupCharacterProtection()
+        return
+    end
+
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+    if not character or not root or not humanoid then
+        return
+    end
+
+    if not protectionBaseline then
+        captureProtectionBaseline()
+    end
+
+    -- Strong anti-ragdoll / anti-knockdown.
+    pcall(function()
+        humanoid.PlatformStand = false
+        humanoid.Sit = false
+        humanoid.AutoRotate = true
+        humanoid.BreakJointsOnDeath = false
+        humanoid.RequiresNeck = false
+
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.Physics, false)
+    end)
+
+    local state = humanoid:GetState()
+    if state == Enum.HumanoidStateType.Ragdoll
+        or state == Enum.HumanoidStateType.FallingDown
+        or state == Enum.HumanoidStateType.Physics
+        or state == Enum.HumanoidStateType.Seated then
+
+        pcall(function()
+            humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+        end)
+    end
+
+    suppressRagdollConstraints(character)
+
+    -- Stronger anti-stun: restore movement and common local stun flags.
+    if protectionBaseline then
+        pcall(function()
+            if humanoid.WalkSpeed < protectionBaseline.WalkSpeed then
+                humanoid.WalkSpeed = protectionBaseline.WalkSpeed
+            end
+
+            if humanoid.UseJumpPower then
+                local desired = protectionBaseline.JumpPower or 50
+                if humanoid.JumpPower < desired then
+                    humanoid.JumpPower = desired
+                end
+            else
+                local desired = protectionBaseline.JumpHeight or 7.2
+                if humanoid.JumpHeight < desired then
+                    humanoid.JumpHeight = desired
+                end
+            end
+        end)
+    end
+
+    clearCommonStunFlags(LocalPlayer)
+    clearCommonStunFlags(character)
+    clearCommonStunFlags(humanoid)
+
+    -- Best-effort godmode.
+    ensureProtectionForceField(character)
+    pcall(function()
+        if humanoid.MaxHealth > 0 and humanoid.Health > 0
+            and humanoid.Health < humanoid.MaxHealth then
+            humanoid.Health = humanoid.MaxHealth
+        end
+    end)
+
+    -- Strong anti-push WITHOUT anchoring and WITHOUT continuous tween/CFrame.
+    -- This keeps the character movable from the game's point of view so the
+    -- pickaxe can continue breaking eggs normally.
+    if targetLockActive and not autoStealReturning then
+        local mover = ensureAntiPushMover(root)
+
+        if mover then
+            pcall(function()
+                mover.Velocity = Vector3.zero
+                mover.MaxForce = Vector3.new(1e9, 0, 1e9)
+            end)
+        end
+
+        -- Kill horizontal knockback immediately, but leave Y velocity alone
+        -- so gravity/floor behavior remains normal.
+        pcall(function()
+            local velocity = root.AssemblyLinearVelocity
+            root.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
+            root.AssemblyAngularVelocity = Vector3.zero
+            root.Anchored = false
+        end)
+    else
+        releaseAntiPushMover()
+
+        -- Safety: never leave the character anchored by protection.
+        pcall(function()
+            root.Anchored = false
+        end)
+    end
+
+end
+
+local function startProtectionWorker()
+    if protectionWorkerStarted then
+        return
+    end
+
+    protectionWorkerStarted = true
+
+    RunService.Heartbeat:Connect(function()
+        pcall(protectCharacterStep)
+    end)
+
+    LocalPlayer.CharacterAdded:Connect(function()
+        protectionBaseline = nil
+        protectionAntiPushMover = nil
+        protectionAntiPushRoot = nil
+        protectionForceField = nil
+
+        if characterProtectionEnabled and autoStealEnabled then
+            task.defer(captureProtectionBaseline)
+        end
+    end)
+end
+
+startProtectionWorker()
+
+local function teleportCharacter(targetCF)
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not character or not root or not targetCF then
+        return false
+    end
+
+    local target = targetCF + Vector3.new(0, 4, 0)
+    local ok = pcall(function()
+        character:PivotTo(target)
+    end)
+    if not ok then
+        ok = pcall(function()
+            root.CFrame = target
+        end)
+    end
+    return ok
+end
+
+local function getPromptWorldPosition(prompt)
+    local current = prompt and prompt.Parent
+    while current and current ~= Workspace do
+        if current:IsA("Attachment") then
+            return current.WorldPosition
+        elseif current:IsA("BasePart") then
+            return current.Position
+        elseif current:IsA("Model") then
+            local ok, pivot = pcall(function()
+                return current:GetPivot()
+            end)
+            if ok then
+                return pivot.Position
+            end
+        end
+        current = current.Parent
+    end
+    return nil
+end
+
+local function findPickupPrompt(targetEgg, maxDistance)
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root then
+        return nil
+    end
+
+    if targetEgg and targetEgg.Parent then
+        if targetEgg:IsA("ProximityPrompt") and targetEgg.Enabled then
+            return targetEgg
+        end
+        for _, object in ipairs(targetEgg:GetDescendants()) do
+            if object:IsA("ProximityPrompt") and object.Enabled then
+                return object
+            end
+        end
+    end
+
+    local nearest, nearestDistance = nil, maxDistance or 40
+    for _, object in ipairs(Workspace:GetDescendants()) do
+        if object:IsA("ProximityPrompt") and object.Enabled then
+            local pos = getPromptWorldPosition(object)
+            if pos then
+                local distance = (root.Position - pos).Magnitude
+                if distance <= nearestDistance then
+                    nearest = object
+                    nearestDistance = distance
+                end
+            end
+        end
+    end
+    return nearest
+end
+
+local function firePromptInstant(prompt)
+    if not prompt or not prompt.Parent then
+        return false
+    end
+
+    pcall(function()
+        prompt.HoldDuration = 0
+        prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, 50)
+        prompt.RequiresLineOfSight = false
+    end)
+
+    if type(fireproximityprompt) == "function" then
+        local variants = {
+            function() fireproximityprompt(prompt, 0, true) end,
+            function() fireproximityprompt(prompt, 0) end,
+            function() fireproximityprompt(prompt) end,
+        }
+        for _, callback in ipairs(variants) do
+            if pcall(callback) then
+                return true
+            end
+        end
+    end
+
+    local ok = pcall(function()
+        prompt:InputHoldBegin()
+        task.wait(0.03)
+        prompt:InputHoldEnd()
+    end)
+    return ok
+end
+
+local function getPickedEggFromModule(preferredEgg)
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root then
+        return preferredEgg
+    end
+
+    local eggTargeting = getEggTargeting()
+    local pickaxeController = getPickaxeController()
+    local lastHandledEgg = nil
+
+    if pickaxeController and type(pickaxeController.GetLastHandledEgg) == "function" then
+        local ok, result = pcall(pickaxeController.GetLastHandledEgg)
+        if not ok then
+            ok, result = pcall(pickaxeController.GetLastHandledEgg, pickaxeController)
+        end
+        if ok then
+            lastHandledEgg = result
+        end
+    end
+
+    if eggTargeting and type(eggTargeting.Pick) == "function" then
+        local pick = eggTargeting.Pick
+        local attempts = {
+            function() return pick(root.Position, EGG_PICK_RANGE, lastHandledEgg, EGG_PICK_RANGE) end,
+            function() return pick(eggTargeting, root.Position, EGG_PICK_RANGE, lastHandledEgg, EGG_PICK_RANGE) end,
+        }
+        for _, callback in ipairs(attempts) do
+            local ok, result = pcall(callback)
+            if ok and result then
+                return result
+            end
+        end
+    end
+
+    return preferredEgg
+end
+
+local function attackEggOnce(preferredEgg)
+    local didAnything = false
+    local tool = equipTool("Pickaxe")
+
+    if tool then
+        pcall(function()
+            tool:Activate()
+        end)
+        didAnything = true
+    end
+
+    local remote = findEggHitRemote()
+    local target = getPickedEggFromModule(preferredEgg)
+    if remote and target then
+        if remote:IsA("RemoteEvent") then
+            local ok = pcall(function()
+                remote:FireServer(target)
+            end)
+            didAnything = didAnything or ok
+        elseif remote:IsA("RemoteFunction") then
+            local ok = pcall(function()
+                remote:InvokeServer(target)
+            end)
+            didAnything = didAnything or ok
+        end
+    end
+
+    return didAnything, tool ~= nil, remote ~= nil, target ~= nil
+end
+
+local function getReturnCFrame()
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    return root and root.CFrame or RETURN_CFRAME
+end
+
+local function getTreadmillBoardCFrame(object)
+    if not object or not object.Parent then
+        return nil
+    end
+
+    if object:IsA("BasePart") then
+        return object.CFrame * CFrame.new(0, (object.Size.Y * 0.5) + RETURN_HEIGHT, 0)
+    end
+
+    if object:IsA("Model") then
+        local ok, boxCF, boxSize = pcall(function()
+            local cf, size = object:GetBoundingBox()
+            return cf, size
+        end)
+        if ok and boxCF and boxSize then
+            return boxCF * CFrame.new(0, (boxSize.Y * 0.5) + RETURN_HEIGHT, 0)
+        end
+
+        local part = object.PrimaryPart or object:FindFirstChildWhichIsA("BasePart", true)
+        if part then
+            return part.CFrame * CFrame.new(0, (part.Size.Y * 0.5) + RETURN_HEIGHT, 0)
+        end
+    end
+
+    if object:IsA("Folder") then
+        local part = object:FindFirstChildWhichIsA("BasePart", true)
+        if part then
+            return part.CFrame * CFrame.new(0, (part.Size.Y * 0.5) + RETURN_HEIGHT, 0)
+        end
+    end
+
+    return nil
+end
+
+local function findTreadmillBoard()
+    local wanted = normalizeName(RETURN_TARGET_NAME)
+    local anchorPosition = autoStealReturnCFrame and autoStealReturnCFrame.Position or nil
+    local bestObject = nil
+    local bestCFrame = nil
+    local bestDistance = math.huge
+
+    local direct = Workspace:FindFirstChild(RETURN_TARGET_NAME, true)
+    if direct then
+        local cf = getTreadmillBoardCFrame(direct)
+        if cf then
+            bestObject = direct
+            bestCFrame = cf
+            if anchorPosition then
+                bestDistance = (cf.Position - anchorPosition).Magnitude
+            else
+                bestDistance = 0
+            end
+        end
+    end
+
+    for _, object in ipairs(Workspace:GetDescendants()) do
+        if normalizeName(object.Name) == wanted then
+            local cf = getTreadmillBoardCFrame(object)
+            if cf then
+                local distance = anchorPosition and (cf.Position - anchorPosition).Magnitude or 0
+                if not bestCFrame or distance < bestDistance then
+                    bestObject = object
+                    bestCFrame = cf
+                    bestDistance = distance
+                end
+            end
+        end
+    end
+
+    return bestObject, bestCFrame
+end
+
+
+--// Claim-safe pickup
+local function isPromptGoneOrDisabled(prompt)
+    if not prompt then
+        return true
+    end
+
+    if not prompt.Parent then
+        return true
+    end
+
+    local ok, enabled = pcall(function()
+        return prompt.Enabled
+    end)
+
+    return ok and enabled == false
+end
+
+local function isEggGone(egg)
+    return not egg or not egg.Parent
+end
+
+local function claimEggBeforeReturn(egg, prompt, rarity, pickupPosition)
+    setStatus(
+        "Stealing " .. tostring(rarity) .. " egg • waiting for claim confirmation",
+        "working"
+    )
+
+    local activePrompt = prompt
+    local lastFire = 0
+    local lastStatus = 0
+
+    -- STRICT CLAIM BARRIER:
+    -- The original egg disappearing means it BROKE, not that it was stolen.
+    -- Therefore, only the pickup prompt disappearing / disabling after we fire it
+    -- counts as a confirmed claim.
+    while autoStealEnabled do
+        if activePrompt and activePrompt.Parent then
+            local enabled = true
+            pcall(function()
+                enabled = activePrompt.Enabled
+            end)
+
+            if not enabled then
+                setStatus("Steal confirmed • pickup prompt disabled", "success")
+                return true
+            end
+
+            if tick() - lastFire >= 0.02 then
+                firePromptInstant(activePrompt)
+                lastFire = tick()
+            end
+        elseif activePrompt then
+            -- A prompt that existed and then disappeared after steal attempts
+            -- is treated as server/client claim confirmation.
+            setStatus("Steal confirmed • pickup prompt removed", "success")
+            return true
+        else
+            -- The broken egg may create its pickup prompt slightly later.
+            activePrompt = findPickupPromptNearPosition(pickupPosition, 20)
+        end
+
+        if tick() - lastStatus >= 0.75 then
+            setStatus("Waiting for egg steal to register…", "working")
+            lastStatus = tick()
+        end
+
+        RunService.Heartbeat:Wait()
+    end
+
+    return false
+end
+
+local function returnFromSteal()
+    -- Returning must never fight the egg protection.
+    clearTargetLock()
+
+    if autoStealReturning then
+        while autoStealReturning and autoStealEnabled do
+            RunService.Heartbeat:Wait()
+        end
+        return not autoStealReturning
+    end
+
+    autoStealReturning = true
+
+    local function finish(result)
+        autoStealReturning = false
+        return result
+    end
+
+    local board, destination = findTreadmillBoard()
+    if not destination then
+        destination = autoStealReturnCFrame or RETURN_CFRAME
+        setStatus("TreadmillBoard not found • using fallback return", "warning")
+    else
+        setStatus("Returning to TreadmillBoard • waiting for arrival", "working")
+    end
+
+    local arriveDistance = 8
+    local lastTeleport = 0
+    local lastStatus = 0
+
+    -- STRICT RETURN BARRIER:
+    -- Do not release the cycle based on a timeout. A new egg cannot be scanned
+    -- until the character is actually back at the return destination.
+    while autoStealEnabled do
+        local character = LocalPlayer.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+
+        if character and root then
+            local distance = (root.Position - destination.Position).Magnitude
+
+            if distance <= arriveDistance then
+                pcall(function()
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    root.AssemblyAngularVelocity = Vector3.zero
+                end)
+
+                setStatus("Return confirmed • finding next egg", "success")
+                return finish(true)
+            end
+
+            if tick() - lastTeleport >= RETURN_RETRY_INTERVAL then
+                local ok = pcall(function()
+                    character:PivotTo(destination)
+                end)
+
+                if not ok then
+                    pcall(function()
+                        root.CFrame = destination
+                    end)
+                end
+
+                pcall(function()
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    root.AssemblyAngularVelocity = Vector3.zero
+                end)
+
+                lastTeleport = tick()
+            end
+
+            if tick() - lastStatus >= 0.75 then
+                setStatus(
+                    "Waiting for TreadmillBoard return • "
+                    .. string.format("%.1f", distance) .. " studs",
+                    "working"
+                )
+                lastStatus = tick()
+            end
+        else
+            setStatus("Waiting for character before return…", "warning")
+        end
+
+        RunService.Heartbeat:Wait()
+    end
+
+    return finish(false)
+end
+
+
+--// Strict target break detection
+local function findPromptOnTargetEgg(egg)
+    if not egg or not egg.Parent then
+        return nil
+    end
+
+    if egg:IsA("ProximityPrompt") and egg.Enabled then
+        return egg
+    end
+
+    for _, object in ipairs(egg:GetDescendants()) do
+        if object:IsA("ProximityPrompt") and object.Enabled then
+            return object
+        end
+    end
+
+    return nil
+end
+
+local function findPickupPromptNearPosition(position, maxDistance)
+    if not position then
+        return nil
+    end
+
+    local nearestPreferred = nil
+    local nearestPreferredDistance = maxDistance or 18
+    local nearestAny = nil
+    local nearestAnyDistance = maxDistance or 18
+
+    for _, object in ipairs(Workspace:GetDescendants()) do
+        if object:IsA("ProximityPrompt") and object.Enabled then
+            local promptPosition = getPromptWorldPosition(object)
+            if promptPosition then
+                local distance = (position - promptPosition).Magnitude
+
+                if distance <= nearestAnyDistance then
+                    nearestAny = object
+                    nearestAnyDistance = distance
+                end
+
+                local hint = normalizeName(
+                    tostring(object.Name)
+                    .. " "
+                    .. tostring(object.ActionText)
+                    .. " "
+                    .. tostring(object.ObjectText)
+                )
+
+                local looksLikeEggPickup =
+                    hint:find("steal", 1, true)
+                    or hint:find("pickup", 1, true)
+                    or hint:find("collect", 1, true)
+                    or hint:find("take", 1, true)
+                    or hint:find("egg", 1, true)
+
+                if looksLikeEggPickup and distance <= nearestPreferredDistance then
+                    nearestPreferred = object
+                    nearestPreferredDistance = distance
+                end
+            end
+        end
+    end
+
+    return nearestPreferred or nearestAny
+end
+
+local function targetEggIsBroken(egg)
+    if not egg or not egg.Parent then
+        return true, nil
+    end
+
+    local prompt = findPromptOnTargetEgg(egg)
+    if prompt then
+        return true, prompt
+    end
+
+    local hp = detectEggHp(egg)
+    if hp ~= nil and hp <= 0 then
+        return true, nil
+    end
+
+    local ok, attributes = pcall(function()
+        return egg:GetAttributes()
+    end)
+
+    if ok and type(attributes) == "table" then
+        for name, value in pairs(attributes) do
+            local key = normalizeName(name)
+            if (key == "broken" or key == "isbroken" or key == "destroyed" or key == "dead")
+                and value == true then
+                return true, nil
+            end
+        end
+    end
+
+    return false, nil
+end
+
+local function runAutoStealCycle()
+    if not autoStealEnabled then
+        return false
+    end
+
+    -- Never scan another egg while the previous return is still active.
+    while autoStealReturning and autoStealEnabled do
+        RunService.Heartbeat:Wait()
+    end
+
+    if not autoStealEnabled then
+        return false
+    end
+
+    local egg, eggCF, rarity, eggHp, eggMaxHp, reason = chooseSelectedRarityEgg()
+
+    if not egg or not eggCF then
+        if reason == "selection" then
+            setStatus("Select at least one rarity", "warning")
+        elseif reason == "unknown" then
+            setStatus("Eggs found but rarity could not be detected", "warning")
+        elseif reason == "character" then
+            setStatus("Character not ready", "error")
+        else
+            setStatus("No selected-rarity eggs found", "warning")
+        end
+
+        RunService.Heartbeat:Wait()
+        return false
+    end
+
+    if highestHpPriorityEnabled then
+        setStatus(
+            "Highest HP: " .. formatHp(eggHp, eggMaxHp)
+            .. " • " .. tostring(rarity) .. " • teleporting",
+            eggHp ~= nil and "working" or "warning"
+        )
+    else
+        setStatus(
+            "Fast target • nearest " .. tostring(rarity) .. " egg • teleporting",
+            "working"
+        )
+    end
+
+    if not teleportCharacter(eggCF) then
+        clearTargetLock()
+        setStatus("Teleport failed", "error")
+        RunService.Heartbeat:Wait()
+        return false
+    end
+
+    -- Marks the period where strong anti-push can temporarily anchor the root.
+    -- There is still NO continuous tween or continuous CFrame-to-egg behavior.
+    setTargetLock(eggCF)
+
+    task.wait(POST_TELEPORT_SETTLE)
+
+    local originalEggPosition = eggCF.Position
+    local prompt = nil
+    local lastDetailUpdate = 0
+
+    -- IMPORTANT:
+    -- No break timeout anymore. Once an egg is selected, VNDT keeps attacking
+    -- THIS SAME EGG until it is actually broken/stealable or disappears.
+    while autoStealEnabled do
+        local broken, targetPrompt = targetEggIsBroken(egg)
+
+        if targetPrompt then
+            prompt = targetPrompt
+            setStatus("Egg broken • pickup ready", "success")
+            break
+        end
+
+        if broken then
+            setStatus("Egg broken • waiting for pickup prompt", "success")
+
+            -- The broken egg may be replaced by a new pickup model/prompt.
+            local promptDeadline = tick() + 1.5
+            while autoStealEnabled and tick() < promptDeadline and not prompt do
+                prompt = findPickupPromptNearPosition(originalEggPosition, 20)
+                if not prompt then
+                    RunService.Heartbeat:Wait()
+                end
+            end
+
+            break
+        end
+
+        local didAnything, hasTool, hasRemote, hasTarget = attackEggOnce(egg)
+
+        if tick() - lastDetailUpdate > 0.65 then
+            local liveHp, liveMaxHp = detectEggHp(egg)
+
+            if not hasTool then
+                setStatus("Same egg locked • Pickaxe not found", "error")
+            elseif not hasRemote and not didAnything then
+                setStatus("Same egg locked • no egg-hit remote", "error")
+            elseif liveHp ~= nil then
+                setStatus(
+                    "Breaking same " .. tostring(rarity)
+                    .. " egg • " .. formatHp(liveHp, liveMaxHp),
+                    "working"
+                )
+            elseif hasTool and not hasRemote then
+                setStatus("Breaking same egg via Pickaxe activation…", "working")
+            elseif hasRemote and not hasTarget then
+                setStatus("Same egg locked • target unavailable", "warning")
+            else
+                setStatus("Breaking same " .. tostring(rarity) .. " egg…", "working")
+            end
+
+            lastDetailUpdate = tick()
+        end
+
+        task.wait(ATTACK_INTERVAL)
+    end
+
+    if not autoStealEnabled then
+        clearTargetLock()
+        return false
+    end
+
+    -- At this point the selected egg has actually broken/disappeared.
+    -- Wait 5 seconds BEFORE pickup/claim, as requested.
+    if autoStealEnabled then
+        setStatus("Egg broken • waiting 5 seconds before claim", "success")
+
+        local waitUntil = tick() + POST_BREAK_WAIT
+        while autoStealEnabled and tick() < waitUntil do
+            RunService.Heartbeat:Wait()
+        end
+    end
+
+    if not autoStealEnabled then
+        clearTargetLock()
+        return false
+    end
+
+    -- STRICT PICKUP-PROMPT BARRIER:
+    -- Do not give up and do not find another egg just because the pickup prompt
+    -- has not spawned yet.
+    while autoStealEnabled and not prompt do
+        prompt = findPickupPromptNearPosition(originalEggPosition, 20)
+
+        if not prompt then
+            setStatus("Egg broken • waiting for steal prompt…", "working")
+            RunService.Heartbeat:Wait()
+        end
+    end
+
+    if not autoStealEnabled then
+        clearTargetLock()
+        return false
+    end
+
+    setStatus(
+        "Stealing broken " .. tostring(rarity) .. " egg",
+        "success"
+    )
+
+    local claimed = claimEggBeforeReturn(
+        egg,
+        prompt,
+        rarity,
+        originalEggPosition
+    )
+
+    if not autoStealEnabled then
+        clearTargetLock()
+        return false
+    end
+
+    -- A failed/unconfirmed steal is not allowed to advance to another egg.
+    while autoStealEnabled and not claimed do
+        prompt = findPickupPromptNearPosition(originalEggPosition, 20)
+
+        if prompt then
+            claimed = claimEggBeforeReturn(
+                egg,
+                prompt,
+                rarity,
+                originalEggPosition
+            )
+        else
+            setStatus("Steal not confirmed • waiting for pickup prompt…", "warning")
+            RunService.Heartbeat:Wait()
+        end
+    end
+
+    if not autoStealEnabled then
+        clearTargetLock()
+        return false
+    end
+
+    -- Release egg protection only after steal confirmation.
+    clearTargetLock()
+
+    -- STRICT RETURN BARRIER:
+    -- This call does not finish until TreadmillBoard arrival is confirmed.
+    local returned = returnFromSteal()
+
+    -- The manager cannot start another cycle until this function returns.
+    while autoStealEnabled and not returned do
+        returned = returnFromSteal()
+        if not returned then
+            RunService.Heartbeat:Wait()
+        end
+    end
+
+    return returned == true
+end
+local function runAutoStealManager()
+    if autoStealManagerRunning then
+        return
+    end
+
+    autoStealManagerRunning = true
+    autoStealReturnCFrame = getReturnCFrame()
+    protectionBaseline = nil
+    captureProtectionBaseline()
+
+    task.spawn(function()
+        while autoStealEnabled do
+            -- Never enter a fresh cycle while the previous cycle is still returning.
+            while autoStealReturning and autoStealEnabled do
+                RunService.Heartbeat:Wait()
+            end
+
+            if not autoStealEnabled then
+                break
+            end
+
+            local ok, completedOrError = pcall(runAutoStealCycle)
+            if not ok then
+                setStatus("Error: " .. tostring(completedOrError), "error")
+            end
+
+            if autoStealEnabled then
+                -- Rebuild target discovery before EVERY loop so newly spawned
+                -- eggs and newly spawned eggs are always seen.
+                eggContainerCache = {}
+                lastEggContainerScan = 0
+                rarityDetectionCache = setmetatable({}, {__mode = "k"})
+
+                if ok and completedOrError == true then
+                    -- Only wait after a FULL successful:
+                    -- break -> claim -> return.
+                    setStatus("Returned • scanning next selected-rarity egg", "success")
+                    task.wait(NEXT_EGG_DELAY)
+                else
+                    -- No target: rescan quickly instead of
+                    -- sleeping a whole second or behaving like a one-shot.
+                    task.wait(0.05)
+                end
+            end
+        end
+
+        autoStealManagerRunning = false
+        autoStealReturnCFrame = nil
+        clearTargetLock()
+        cleanupCharacterProtection()
+        protectionBaseline = nil
+        setStatus("Idle", "idle")
+    end)
+end
+
+local function runAutoSteal()
+    runAutoStealManager()
+end
+
+--// Auto Buy Pickaxe
+local function getOwnedPickaxeTiers(config)
+    local owned = {}
+
+    if config and config.DefaultTier ~= nil then
+        owned[config.DefaultTier] = true
+    end
+
+    local equippedTier = LocalPlayer:GetAttribute("PickaxeTier")
+    if typeof(equippedTier) == "number" then
+        owned[equippedTier] = true
+    end
+
+    local encodedOwned = LocalPlayer:GetAttribute("OwnedPickaxes")
+    if typeof(encodedOwned) == "string" then
+        for token in string.gmatch(encodedOwned, "[^,]+") do
+            local tier = tonumber(token)
+            if tier then
+                owned[tier] = true
+            end
+        end
+    end
+
+    return owned
+end
+
+local function equipBestOwnedPickaxe(config, remote)
+    local owned = getOwnedPickaxeTiers(config)
+    local bestTier = config.DefaultTier
+
+    for tier in pairs(owned) do
+        if tier > bestTier then
+            bestTier = tier
+        end
+    end
+
+    local equippedTier = LocalPlayer:GetAttribute("PickaxeTier")
+    if equippedTier ~= bestTier then
+        remote:FireServer("Equip", bestTier)
+    end
+end
+
+local function autoBuyPickaxePass()
+    local shared = ReplicatedStorage:WaitForChild("Shared")
+    local config = require(shared:WaitForChild("PickaxeConfig"))
+    local remote = ReplicatedStorage:WaitForChild("PickaxeShopRequest")
+
+    equipBestOwnedPickaxe(config, remote)
+
+    local cash = LocalPlayer:GetAttribute("Cash")
+    if typeof(cash) ~= "number" then
+        return
+    end
+
+    local owned = getOwnedPickaxeTiers(config)
+
+    for tier, tierInfo in pairs(config.Tiers) do
+        local price = tierInfo.Price
+
+        if price ~= nil and not owned[tier] and cash >= price then
+            remote:FireServer("Buy", tier)
+            task.wait(0.3)
+            equipBestOwnedPickaxe(config, remote)
+        end
+    end
+end
+
+local function runAutoBuyPickaxe()
+    while autoBuyEnabled do
+        pcall(autoBuyPickaxePass)
+        task.wait(0.5)
+    end
+end
+
+--// Upgrade Plot
+local function upgradePlotOnce()
+    local remote = ReplicatedStorage:WaitForChild("UpgradePlotRequest")
+    remote:FireServer()
+end
+
+local function runUpgradePlot()
+    while upgradePlotEnabled do
+        pcall(upgradePlotOnce)
+        task.wait(1)
+    end
+end
+
+--// Auto Sell - selected rarities only
+local function sellSelectedRarityTools()
+    if getSelectedCount(selectedSellRarities) == 0 then
+        return 0
+    end
+
+    local shared = ReplicatedStorage:FindFirstChild("Shared")
+    if not shared then
+        return 0
+    end
+
+    local configModule = shared:FindFirstChild("BackpackSellConfig")
+    if not configModule or not configModule:IsA("ModuleScript") then
+        return 0
+    end
+
+    local okConfig, config = pcall(require, configModule)
+    if not okConfig or type(config) ~= "table" then
+        return 0
+    end
+
+    local remote = nil
+    if config.RemoteName then
+        remote = ReplicatedStorage:FindFirstChild(config.RemoteName)
+            or ReplicatedStorage:FindFirstChild(config.RemoteName, true)
+    end
+    if not remote then
+        return 0
+    end
+
+    local tools = {}
+    local seen = {}
+
+    local function collect(container)
+        if not container then
+            return
+        end
+
+        for _, object in ipairs(container:GetChildren()) do
+            if object:IsA("Tool") and not seen[object] then
+                local sellable = true
+                if type(config.IsSellable) == "function" then
+                    local ok, result = pcall(config.IsSellable, object)
+                    sellable = ok and result == true
+                end
+
+                if sellable then
+                    local rarity = detectObjectRarity(object)
+                    if rarity and selectedSellRarities[rarity] then
+                        seen[object] = true
+                        table.insert(tools, object)
+                    end
+                end
+            end
+        end
+    end
+
+    collect(LocalPlayer.Character)
+    collect(LocalPlayer:FindFirstChild("Backpack"))
+
+    if #tools == 0 then
+        return 0
+    end
+
+    if remote:IsA("RemoteFunction") then
+        pcall(function()
+            remote:InvokeServer(tools)
+        end)
+    elseif remote:IsA("RemoteEvent") then
+        pcall(function()
+            remote:FireServer(tools)
+        end)
+    end
+
+    return #tools
+end
+
+local function runSellAll()
+    while sellAllEnabled do
+        pcall(sellSelectedRarityTools)
+        task.wait(0.5)
+    end
+end
+
+--// VNDT premium UI
+local THEME = {
+    background = Color3.fromRGB(10, 11, 17),
+    surface = Color3.fromRGB(18, 20, 30),
+    surface2 = Color3.fromRGB(25, 28, 42),
+    card = Color3.fromRGB(30, 33, 49),
+    cardHover = Color3.fromRGB(35, 39, 58),
+    accent = Color3.fromRGB(126, 92, 255),
+    accent2 = Color3.fromRGB(76, 153, 255),
+    success = Color3.fromRGB(67, 214, 143),
+    danger = Color3.fromRGB(255, 91, 114),
+    text = Color3.fromRGB(246, 247, 252),
+    muted = Color3.fromRGB(156, 164, 187),
+    line = Color3.fromRGB(61, 66, 91),
+    shadow = Color3.fromRGB(0, 0, 0),
+}
+
+local function getUiParent()
+    if type(gethui) == "function" then
+        local ok, result = pcall(gethui)
+        if ok and result then
+            return result
+        end
+    end
+    return CoreGui
+end
+
+local function addCorner(parent, radius)
+    local item = Instance.new("UICorner")
+    item.CornerRadius = UDim.new(0, radius or 10)
+    item.Parent = parent
+    return item
+end
+
+local function addStroke(parent, color, thickness, transparency)
+    local item = Instance.new("UIStroke")
+    item.Color = color or THEME.line
+    item.Thickness = thickness or 1
+    item.Transparency = transparency or 0
+    item.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    item.Parent = parent
+    return item
+end
+
+local function addPadding(parent, left, right, top, bottom)
+    local pad = Instance.new("UIPadding")
+    pad.PaddingLeft = UDim.new(0, left or 0)
+    pad.PaddingRight = UDim.new(0, right or left or 0)
+    pad.PaddingTop = UDim.new(0, top or 0)
+    pad.PaddingBottom = UDim.new(0, bottom or top or 0)
+    pad.Parent = parent
+    return pad
+end
+
+local function tween(object, duration, properties)
+    local info = TweenInfo.new(duration or 0.18, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+    local animation = TweenService:Create(object, info, properties)
+    animation:Play()
+    return animation
+end
+
+local function makeText(parent, text, size, color, font, alignment)
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Text = text or ""
+    label.TextColor3 = color or THEME.text
+    label.TextSize = size or 14
+    -- VNDT compact UI: keep all visible text bold for readability.
+    label.Font = Enum.Font.GothamBold
+    label.TextXAlignment = alignment or Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Center
+    label.Parent = parent
+    return label
+end
+
+local function makeTouchDraggable(handle, frame)
+    local dragging = false
+    local dragInput = nil
+    local dragStart = nil
+    local startPosition = nil
+
+    handle.Active = true
+
+    handle.InputBegan:Connect(function(input)
+        local inputType = input.UserInputType
+        if inputType == Enum.UserInputType.MouseButton1
+            or inputType == Enum.UserInputType.Touch then
+
+            dragging = true
+            dragStart = input.Position
+            startPosition = frame.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    handle.InputChanged:Connect(function(input)
+        local inputType = input.UserInputType
+        if inputType == Enum.UserInputType.MouseMovement
+            or inputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging and dragStart and startPosition then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(
+                startPosition.X.Scale,
+                startPosition.X.Offset + delta.X,
+                startPosition.Y.Scale,
+                startPosition.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+local function getResponsiveSize()
+    local camera = Workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
+
+    -- Smaller footprint while keeping text comfortably readable.
+    local width = math.clamp(math.floor(viewport.X * 0.82), 280, 340)
+    local height = math.clamp(math.floor(viewport.Y * 0.68), 320, 455)
+
+    if viewport.X >= 700 then
+        width = 340
+    end
+
+    return width, height
+end
+
+local function createSectionLabel(parent, text, order)
+    local row = Instance.new("Frame")
+    row.Name = text:gsub("%s+", "") .. "Section"
+    row.Size = UDim2.new(1, 0, 0, 22)
+    row.BackgroundTransparency = 1
+    row.LayoutOrder = order
+    row.Parent = parent
+
+    local label = makeText(row, string.upper(text), 10, THEME.muted, Enum.Font.GothamBold)
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.TextTransparency = 0.05
+
+    return row
+end
+
+
+local function createActionRow(parent, labelText, description, buttonText, order, onActivated)
+    local row = Instance.new("Frame")
+    row.Name = labelText:gsub("%W+", "") .. "Action"
+    row.Size = UDim2.new(1, 0, 0, 54)
+    row.BackgroundColor3 = THEME.card
+    row.BorderSizePixel = 0
+    row.LayoutOrder = order
+    row.Parent = parent
+    addCorner(row, 10)
+    addStroke(row, THEME.line, 1, 0.45)
+
+    local label = makeText(row, labelText, 13, THEME.text, Enum.Font.GothamBold)
+    label.Position = UDim2.new(0, 11, 0, 6)
+    label.Size = UDim2.new(1, -92, 0, 20)
+
+    local sub = makeText(row, description or "", 9, THEME.muted, Enum.Font.GothamBold)
+    sub.Position = UDim2.new(0, 11, 0, 27)
+    sub.Size = UDim2.new(1, -92, 0, 17)
+    sub.TextTruncate = Enum.TextTruncate.AtEnd
+
+    local button = Instance.new("TextButton")
+    button.Name = "ActionButton"
+    button.AutoButtonColor = false
+    button.AnchorPoint = Vector2.new(1, 0.5)
+    button.Position = UDim2.new(1, -9, 0.5, 0)
+    button.Size = UDim2.fromOffset(70, 28)
+    button.BackgroundColor3 = THEME.accent
+    button.BorderSizePixel = 0
+    button.Text = buttonText or "RUN"
+    button.TextColor3 = THEME.text
+    button.TextSize = 10
+    button.Font = Enum.Font.GothamBold
+    button.Parent = row
+    addCorner(button, 8)
+
+    button.Activated:Connect(function()
+        tween(button, 0.08, {BackgroundTransparency = 0.18})
+        task.delay(0.10, function()
+            if button and button.Parent then
+                tween(button, 0.10, {BackgroundTransparency = 0})
+            end
+        end)
+
+        if onActivated then
+            task.spawn(onActivated)
+        end
+    end)
+
+    return row
+end
+
+local function createToggleRow(parent, labelText, description, order, initialValue, onChanged)
+    local row = Instance.new("Frame")
+    row.Name = labelText:gsub("%W+", "") .. "Toggle"
+    row.Size = UDim2.new(1, 0, 0, 54)
+    row.BackgroundColor3 = THEME.card
+    row.BorderSizePixel = 0
+    row.LayoutOrder = order
+    row.Parent = parent
+    addCorner(row, 10)
+    addStroke(row, THEME.line, 1, 0.45)
+
+    local label = makeText(row, labelText, 13, THEME.text, Enum.Font.GothamBold)
+    label.Position = UDim2.new(0, 11, 0, 6)
+    label.Size = UDim2.new(1, -76, 0, 20)
+
+    local sub = makeText(row, description or "", 10, THEME.muted, Enum.Font.GothamBold)
+    sub.Position = UDim2.new(0, 11, 0, 27)
+    sub.Size = UDim2.new(1, -76, 0, 17)
+    sub.TextTruncate = Enum.TextTruncate.AtEnd
+
+    local button = Instance.new("TextButton")
+    button.Name = "Switch"
+    button.AutoButtonColor = false
+    button.Text = ""
+    button.Size = UDim2.fromOffset(44, 26)
+    button.AnchorPoint = Vector2.new(1, 0.5)
+    button.Position = UDim2.new(1, -10, 0.5, 0)
+    button.BackgroundColor3 = initialValue and THEME.accent or Color3.fromRGB(55, 59, 77)
+    button.BorderSizePixel = 0
+    button.Parent = row
+    addCorner(button, 13)
+
+    local knob = Instance.new("Frame")
+    knob.Name = "Knob"
+    knob.Size = UDim2.fromOffset(20, 20)
+    knob.AnchorPoint = Vector2.new(0.5, 0.5)
+    knob.Position = initialValue and UDim2.new(1, -13, 0.5, 0) or UDim2.new(0, 13, 0.5, 0)
+    knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    knob.BorderSizePixel = 0
+    knob.Parent = button
+    addCorner(knob, 10)
+
+    local enabled = initialValue == true
+
+    local function render(instant)
+        local targetColor = enabled and THEME.accent or Color3.fromRGB(55, 59, 77)
+        local targetPosition = enabled and UDim2.new(1, -13, 0.5, 0) or UDim2.new(0, 13, 0.5, 0)
+
+        if instant then
+            button.BackgroundColor3 = targetColor
+            knob.Position = targetPosition
+        else
+            tween(button, 0.16, {BackgroundColor3 = targetColor})
+            tween(knob, 0.16, {Position = targetPosition})
+        end
+    end
+
+    button.Activated:Connect(function()
+        enabled = not enabled
+        render(false)
+        if onChanged then
+            task.spawn(function()
+                onChanged(enabled)
+            end)
+        end
+    end)
+
+    return {
+        Frame = row,
+        Button = button,
+        Get = function()
+            return enabled
+        end,
+        Set = function(value)
+            enabled = value == true
+            render(false)
+            if onChanged then
+                task.spawn(function()
+                    onChanged(enabled)
+                end)
+            end
+        end,
+    }
+end
+
+
+local function createMultiSelectDropdown(parent, labelText, description, order, selectionTable, onChanged)
+    local wrapper = Instance.new("Frame")
+    wrapper.Name = labelText:gsub("%W+", "") .. "Dropdown"
+    wrapper.Size = UDim2.new(1, 0, 0, 54)
+    wrapper.AutomaticSize = Enum.AutomaticSize.Y
+    wrapper.BackgroundColor3 = THEME.surface
+    wrapper.BorderSizePixel = 0
+    wrapper.LayoutOrder = order
+    wrapper.Parent = parent
+    addCorner(wrapper, 10)
+    addStroke(wrapper, THEME.line, 1, 0.45)
+    addPadding(wrapper, 6, 6, 6, 6)
+
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 5)
+    layout.Parent = wrapper
+
+    local header = Instance.new("TextButton")
+    header.Name = "Header"
+    header.Size = UDim2.new(1, 0, 0, 44)
+    header.BackgroundColor3 = THEME.card
+    header.BorderSizePixel = 0
+    header.AutoButtonColor = false
+    header.Text = ""
+    header.LayoutOrder = 1
+    header.Parent = wrapper
+    addCorner(header, 8)
+
+    local title = makeText(header, labelText, 13, THEME.text, Enum.Font.GothamBold)
+    title.Position = UDim2.fromOffset(10, 3)
+    title.Size = UDim2.new(1, -46, 0, 19)
+
+    local summary = makeText(header, description or "None selected", 9, THEME.muted, Enum.Font.GothamBold)
+    summary.Position = UDim2.fromOffset(10, 22)
+    summary.Size = UDim2.new(1, -46, 0, 16)
+    summary.TextTruncate = Enum.TextTruncate.AtEnd
+
+    local arrow = makeText(header, "⌄", 18, THEME.muted, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+    arrow.AnchorPoint = Vector2.new(1, 0.5)
+    arrow.Position = UDim2.new(1, -6, 0.5, 0)
+    arrow.Size = UDim2.fromOffset(28, 28)
+
+    local options = Instance.new("Frame")
+    options.Name = "Options"
+    options.Size = UDim2.new(1, 0, 0, 0)
+    options.AutomaticSize = Enum.AutomaticSize.Y
+    options.BackgroundTransparency = 1
+    options.Visible = false
+    options.LayoutOrder = 2
+    options.Parent = wrapper
+
+    local optionsLayout = Instance.new("UIListLayout")
+    optionsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    optionsLayout.Padding = UDim.new(0, 4)
+    optionsLayout.Parent = options
+
+    local currentOptions = {}
+    local opened = false
+
+    local function selectedNames()
+        local names = {}
+        for _, rarityName in ipairs(currentOptions) do
+            if selectionTable[rarityName] then
+                table.insert(names, rarityName)
+            end
+        end
+        return names
+    end
+
+    local function updateSummary()
+        local names = selectedNames()
+        if #names == 0 then
+            summary.Text = "None selected"
+        elseif #names <= 2 then
+            summary.Text = table.concat(names, ", ")
+        else
+            summary.Text = tostring(#names) .. " rarities selected"
+        end
+    end
+
+    local function renderOption(button, check, rarityName)
+        local selected = selectionTable[rarityName] == true
+        button.BackgroundColor3 = selected and Color3.fromRGB(43, 39, 75) or THEME.card
+        check.BackgroundColor3 = selected and THEME.accent or Color3.fromRGB(54, 58, 76)
+        check.Text = selected and "✓" or ""
+    end
+
+    local function refresh(list)
+        currentOptions = {}
+        for _, rarityName in ipairs(list or {}) do
+            table.insert(currentOptions, rarityName)
+        end
+
+        for _, child in ipairs(options:GetChildren()) do
+            if child ~= optionsLayout then
+                child:Destroy()
+            end
+        end
+
+        for index, rarityName in ipairs(currentOptions) do
+            local option = Instance.new("TextButton")
+            option.Name = "Option_" .. tostring(index)
+            option.Size = UDim2.new(1, 0, 0, 34)
+            option.BackgroundColor3 = THEME.card
+            option.BorderSizePixel = 0
+            option.AutoButtonColor = false
+            option.Text = ""
+            option.LayoutOrder = index
+            option.Parent = options
+            addCorner(option, 9)
+
+            local check = Instance.new("TextLabel")
+            check.Size = UDim2.fromOffset(22, 22)
+            check.Position = UDim2.fromOffset(6, 6)
+            check.BackgroundColor3 = Color3.fromRGB(54, 58, 76)
+            check.BorderSizePixel = 0
+            check.Text = ""
+            check.TextColor3 = THEME.text
+            check.TextSize = 13
+            check.Font = Enum.Font.GothamBold
+            check.Parent = option
+            addCorner(check, 6)
+
+            local label = makeText(option, rarityName, 11, THEME.text, Enum.Font.GothamBold)
+            label.Position = UDim2.fromOffset(36, 0)
+            label.Size = UDim2.new(1, -42, 1, 0)
+
+            renderOption(option, check, rarityName)
+
+            option.Activated:Connect(function()
+                selectionTable[rarityName] = not selectionTable[rarityName]
+                renderOption(option, check, rarityName)
+                updateSummary()
+                if onChanged then
+                    task.spawn(function()
+                        onChanged(rarityName, selectionTable[rarityName])
+                    end)
+                end
+            end)
+        end
+
+        updateSummary()
+    end
+
+    header.Activated:Connect(function()
+        opened = not opened
+        options.Visible = opened
+        arrow.Text = opened and "⌃" or "⌄"
+    end)
+
+    refresh(knownRarities)
+
+    return {
+        Frame = wrapper,
+        Refresh = refresh,
+        GetSelection = function()
+            return selectionTable
+        end,
+        Close = function()
+            opened = false
+            options.Visible = false
+            arrow.Text = "⌄"
+        end,
+    }
+end
+
+local function launchMainGui()
+    if mainGuiStarted then
+        return
+    end
+    mainGuiStarted = true
+
+    local uiParent = getUiParent()
+
+    for _, oldName in ipairs({
+        "VNDT",
+        "BreakAndStealEggGUI",
+        "SpiritualGamingKeyGUI",
+    }) do
+        local existing = uiParent:FindFirstChild(oldName) or CoreGui:FindFirstChild(oldName)
+        if existing then
+            pcall(function()
+                existing:Destroy()
+            end)
+        end
+    end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = GUI_NAME
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.DisplayOrder = 999
+    gui.Parent = uiParent
+
+    local mainWidth, mainHeight = getResponsiveSize()
+    local expandedSize = UDim2.fromOffset(mainWidth, mainHeight)
+
+    -- Compact minimized bar dimensions.
+    local MINIMIZED_WIDTH = 150
+    local MINIMIZED_HEIGHT = 42
+
+    local shadow = Instance.new("Frame")
+    shadow.Name = "Shadow"
+    shadow.AnchorPoint = Vector2.new(0.5, 0.5)
+    shadow.Position = UDim2.fromScale(0.5, 0.5)
+    shadow.Size = UDim2.new(0, mainWidth + 12, 0, mainHeight + 12)
+    shadow.BackgroundColor3 = THEME.shadow
+    shadow.BackgroundTransparency = 0.45
+    shadow.BorderSizePixel = 0
+    shadow.Parent = gui
+    addCorner(shadow, 16)
+
+    local mainFrame = Instance.new("Frame")
+    mainFrame.Name = "MainFrame"
+    mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+    mainFrame.Position = UDim2.fromScale(0.5, 0.5)
+    mainFrame.Size = expandedSize
+    mainFrame.BackgroundColor3 = THEME.background
+    mainFrame.BorderSizePixel = 0
+    mainFrame.ClipsDescendants = true
+    mainFrame.Active = true
+    mainFrame.Parent = gui
+    addCorner(mainFrame, 14)
+    addStroke(mainFrame, Color3.fromRGB(82, 87, 116), 1, 0.35)
+
+    local gradient = Instance.new("UIGradient")
+    gradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(19, 18, 31)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(10, 11, 17)),
+    })
+    gradient.Rotation = 115
+    gradient.Parent = mainFrame
+
+    local header = Instance.new("Frame")
+    header.Name = "Header"
+    header.Size = UDim2.new(1, 0, 0, 48)
+    header.BackgroundTransparency = 1
+    header.Active = true
+    header.Parent = mainFrame
+
+    local brandDot = Instance.new("Frame")
+    brandDot.Size = UDim2.fromOffset(28, 28)
+    brandDot.Position = UDim2.fromOffset(10, 10)
+    brandDot.BackgroundColor3 = THEME.accent
+    brandDot.BorderSizePixel = 0
+    brandDot.Parent = header
+    addCorner(brandDot, 11)
+
+    local brandGradient = Instance.new("UIGradient")
+    brandGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, THEME.accent),
+        ColorSequenceKeypoint.new(1, THEME.accent2),
+    })
+    brandGradient.Rotation = 35
+    brandGradient.Parent = brandDot
+
+    local brandLetter = makeText(brandDot, "V", 15, THEME.text, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+    brandLetter.Size = UDim2.fromScale(1, 1)
+
+    local title = makeText(header, GUI_TITLE, 15, THEME.text, Enum.Font.GothamBold)
+    title.Position = UDim2.fromOffset(58, 10)
+    title.Size = UDim2.new(1, -94, 0, 21)
+
+    local subtitle = makeText(header, "Automation Hub", 9, THEME.muted, Enum.Font.GothamBold)
+    subtitle.Position = UDim2.fromOffset(58, 32)
+    subtitle.Size = UDim2.new(1, -94, 0, 15)
+
+    local minimize = Instance.new("TextButton")
+    minimize.Name = "Minimize"
+    minimize.AutoButtonColor = false
+    minimize.AnchorPoint = Vector2.new(1, 0)
+    minimize.Position = UDim2.new(1, -9, 0, 9)
+    minimize.Size = UDim2.fromOffset(32, 28)
+    minimize.BackgroundColor3 = THEME.surface2
+    minimize.Text = "—"
+    minimize.TextColor3 = THEME.text
+    minimize.TextSize = 17
+    minimize.Font = Enum.Font.GothamBold
+    minimize.BorderSizePixel = 0
+    minimize.Parent = header
+    addCorner(minimize, 8)
+    addStroke(minimize, THEME.line, 1, 0.4)
+
+    local divider = Instance.new("Frame")
+    divider.Position = UDim2.new(0, 10, 0, 47)
+    divider.Size = UDim2.new(1, -20, 0, 1)
+    divider.BackgroundColor3 = THEME.line
+    divider.BackgroundTransparency = 0.55
+    divider.BorderSizePixel = 0
+    divider.Parent = mainFrame
+
+    local content = Instance.new("ScrollingFrame")
+    content.Name = "Content"
+    content.Position = UDim2.fromOffset(8, 55)
+    content.Size = UDim2.new(1, -16, 1, -63)
+    content.BackgroundTransparency = 1
+    content.BorderSizePixel = 0
+    content.ScrollBarThickness = 2
+    content.ScrollBarImageColor3 = THEME.accent
+    content.ScrollingDirection = Enum.ScrollingDirection.Y
+    content.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
+    content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    content.CanvasSize = UDim2.new(0, 0, 0, 0)
+    content.Parent = mainFrame
+    addPadding(content, 1, 3, 1, 5)
+
+    local contentLayout = Instance.new("UIListLayout")
+    contentLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    contentLayout.Padding = UDim.new(0, 6)
+    contentLayout.Parent = content
+
+    local hero = Instance.new("Frame")
+    hero.Name = "StatusCard"
+    hero.Size = UDim2.new(1, 0, 0, 78)
+    hero.BackgroundColor3 = THEME.surface
+    hero.BorderSizePixel = 0
+    hero.LayoutOrder = 1
+    hero.Parent = content
+    addCorner(hero, 10)
+    addStroke(hero, THEME.line, 1, 0.45)
+
+    local heroGradient = Instance.new("UIGradient")
+    heroGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(35, 29, 61)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(20, 25, 40)),
+    })
+    heroGradient.Rotation = 20
+    heroGradient.Parent = hero
+
+    local statusTitle = makeText(hero, "VNDT READY", 13, THEME.text, Enum.Font.GothamBold)
+    statusTitle.Position = UDim2.fromOffset(10, 8)
+    statusTitle.Size = UDim2.new(1, -92, 0, 19)
+
+    local statusSub = makeText(hero, "Auto Steal: Idle", 10, THEME.muted, Enum.Font.GothamBold)
+    statusSub.Position = UDim2.fromOffset(10, 29)
+    statusSub.Size = UDim2.new(1, -20, 0, 17)
+    statusSub.TextTruncate = Enum.TextTruncate.AtEnd
+
+    local rarityStatus = makeText(hero, "Rarities: Scanning…", 9, THEME.muted, Enum.Font.GothamBold)
+    rarityStatus.Position = UDim2.fromOffset(10, 49)
+    rarityStatus.Size = UDim2.new(1, -20, 0, 16)
+    rarityStatus.TextTruncate = Enum.TextTruncate.AtEnd
+
+    statusSink = function(message, kind)
+        if not statusSub or not statusSub.Parent then
+            return
+        end
+
+        statusSub.Text = tostring(message)
+        if kind == "error" then
+            statusSub.TextColor3 = THEME.danger
+        elseif kind == "success" then
+            statusSub.TextColor3 = THEME.success
+        elseif kind == "warning" then
+            statusSub.TextColor3 = Color3.fromRGB(255, 191, 92)
+        elseif kind == "working" then
+            statusSub.TextColor3 = THEME.accent2
+        else
+            statusSub.TextColor3 = THEME.muted
+        end
+    end
+
+    rarityStatusSink = function(message, kind)
+        if not rarityStatus or not rarityStatus.Parent then
+            return
+        end
+
+        rarityStatus.Text = tostring(message)
+        if kind == "success" then
+            rarityStatus.TextColor3 = THEME.success
+        elseif kind == "warning" then
+            rarityStatus.TextColor3 = Color3.fromRGB(255, 191, 92)
+        else
+            rarityStatus.TextColor3 = THEME.muted
+        end
+    end
+
+    local badge = Instance.new("TextLabel")
+    badge.AnchorPoint = Vector2.new(1, 0)
+    badge.Position = UDim2.new(1, -8, 0, 8)
+    badge.Size = UDim2.fromOffset(68, 22)
+    badge.BackgroundColor3 = Color3.fromRGB(29, 70, 58)
+    badge.Text = "KEYLESS"
+    badge.TextColor3 = THEME.success
+    badge.TextSize = 9
+    badge.Font = Enum.Font.GothamBold
+    badge.BorderSizePixel = 0
+    badge.Parent = hero
+    addCorner(badge, 7)
+    addStroke(badge, THEME.success, 1, 0.62)
+
+    createSectionLabel(content, "Auto Steal", 2)
+
+    createToggleRow(
+        content,
+        "Auto Steal",
+        "Targets selected rarities • instant next-target scan",
+        3,
+        autoStealEnabled,
+        function(enabled)
+            autoStealEnabled = enabled
+            highestHpPriorityEnabled = enabled
+            queueSaveConfig()
+            if enabled then
+                if getSelectedCount(selectedStealRarities) == 0 then
+                    setStatus("Select at least one rarity", "warning")
+                else
+                    setStatus("Enabled • scanning selected rarities", "working")
+                end
+                task.spawn(runAutoSteal)
+            else
+                setStatus("Stopping…", "idle")
+            end
+        end
+    )
+
+    local stealRarityDropdown = createMultiSelectDropdown(
+        content,
+        "Steal Rarities",
+        "Select one or more egg rarities",
+        4,
+        selectedStealRarities,
+        function()
+            queueSaveConfig()
+            if autoStealEnabled and not autoStealManagerRunning then
+                task.spawn(runAutoSteal)
+            end
+        end
+    )
+
+    createToggleRow(
+        content,
+        "Character Protection",
+        "Anti-push + anti-ragdoll + anti-stun + godmode • break-safe",
+        5,
+        characterProtectionEnabled,
+        function(enabled)
+            characterProtectionEnabled = enabled
+            queueSaveConfig()
+
+            if enabled then
+                protectionBaseline = nil
+                captureProtectionBaseline()
+                setStatus("Character Protection enabled", "success")
+            else
+                cleanupCharacterProtection()
+                setStatus("Character Protection disabled", "warning")
+            end
+        end
+    )
+
+    createSectionLabel(content, "Utilities", 6)
+
+    createToggleRow(
+        content,
+        "Anti AFK",
+        "Prevents Roblox idle disconnects",
+        7,
+        antiAfkEnabled,
+        function(enabled)
+            antiAfkEnabled = enabled
+            queueSaveConfig()
+            setStatus(
+                enabled and "Anti AFK enabled" or "Anti AFK disabled",
+                enabled and "success" or "warning"
+            )
+        end
+    )
+
+    createToggleRow(
+        content,
+        "FPS Booster",
+        "Low graphics • removes effects/textures • FPS counter",
+        8,
+        fpsBoosterEnabled,
+        function(enabled)
+            setFpsBoosterEnabled(enabled)
+            queueSaveConfig()
+
+            setStatus(
+                enabled and "FPS Booster enabled" or "FPS Booster disabled • visuals restored",
+                enabled and "success" or "warning"
+            )
+        end
+    )
+
+    createActionRow(
+        content,
+        "Save Config",
+        "Changes auto-save • tap to save now",
+        "SAVE",
+        9,
+        function()
+            local ok, err = saveConfigNow()
+            if ok then
+                setStatus("Config saved • auto-load ready", "success")
+            else
+                setStatus("Config save unavailable: " .. tostring(err), "warning")
+            end
+        end
+    )
+
+    createToggleRow(
+        content,
+        "Auto Buy Pickaxe",
+        "Buys and equips the best affordable tier",
+        10,
+        autoBuyEnabled,
+        function(enabled)
+            autoBuyEnabled = enabled
+            queueSaveConfig()
+            if enabled then
+                task.spawn(runAutoBuyPickaxe)
+            end
+        end
+    )
+
+    createToggleRow(
+        content,
+        "Upgrade Plot",
+        "Continuously requests the next plot upgrade",
+        11,
+        upgradePlotEnabled,
+        function(enabled)
+            upgradePlotEnabled = enabled
+            queueSaveConfig()
+            if enabled then
+                task.spawn(runUpgradePlot)
+            end
+        end
+    )
+
+    createSectionLabel(content, "Auto Sell", 12)
+
+    createToggleRow(
+        content,
+        "Auto Sell",
+        "Sells only the rarities selected below",
+        13,
+        sellAllEnabled,
+        function(enabled)
+            sellAllEnabled = enabled
+            queueSaveConfig()
+            if enabled then
+                task.spawn(runSellAll)
+            end
+        end
+    )
+
+    local sellRarityDropdown = createMultiSelectDropdown(
+        content,
+        "Sell Rarities",
+        "Selected rarities will be sold automatically",
+        14,
+        selectedSellRarities,
+        function()
+            queueSaveConfig()
+        end
+    )
+
+    rarityUiRefreshSink = function(list)
+        if stealRarityDropdown and stealRarityDropdown.Refresh then
+            stealRarityDropdown.Refresh(list)
+        end
+        if sellRarityDropdown and sellRarityDropdown.Refresh then
+            sellRarityDropdown.Refresh(list)
+        end
+    end
+
+    scanRarities()
+    task.spawn(runRarityScanner)
+
+    local footer = Instance.new("Frame")
+    footer.Size = UDim2.new(1, 0, 0, 28)
+    footer.BackgroundTransparency = 1
+    footer.LayoutOrder = 15
+    footer.Parent = content
+
+    local footerText = makeText(
+        footer,
+        "VNDT  •  Config auto-saves  •  FPS toggle",
+        9,
+        THEME.muted,
+        Enum.Font.GothamBold,
+        Enum.TextXAlignment.Center
+    )
+    footerText.Size = UDim2.fromScale(1, 1)
+
+    makeTouchDraggable(header, mainFrame)
+
+    local minimized = false
+
+    local function syncShadow()
+        shadow.Position = mainFrame.Position
+        shadow.Size = UDim2.new(
+            mainFrame.Size.X.Scale,
+            mainFrame.Size.X.Offset + 12,
+            mainFrame.Size.Y.Scale,
+            mainFrame.Size.Y.Offset + 12
+        )
+        shadow.Visible = mainFrame.Visible
+    end
+
+    mainFrame:GetPropertyChangedSignal("Position"):Connect(syncShadow)
+    mainFrame:GetPropertyChangedSignal("Size"):Connect(syncShadow)
+
+    minimize.Activated:Connect(function()
+        minimized = not minimized
+
+        if minimized then
+            content.Visible = false
+            divider.Visible = false
+            brandDot.Visible = false
+            subtitle.Visible = false
+
+            -- Reposition title/buttons for the tiny minimized bar.
+            title.Position = UDim2.fromOffset(12, 0)
+            title.Size = UDim2.new(1, -52, 1, 0)
+            title.TextSize = 13
+
+            minimize.Text = "+"
+            minimize.Position = UDim2.new(1, -7, 0.5, 0)
+            minimize.AnchorPoint = Vector2.new(1, 0.5)
+            minimize.Size = UDim2.fromOffset(28, 26)
+
+            tween(mainFrame, 0.16, {
+                Size = UDim2.fromOffset(MINIMIZED_WIDTH, MINIMIZED_HEIGHT)
+            })
+        else
+            content.Visible = true
+            divider.Visible = true
+            brandDot.Visible = true
+            subtitle.Visible = true
+
+            title.Position = UDim2.fromOffset(46, 4)
+            title.Size = UDim2.new(1, -94, 0, 21)
+            title.TextSize = 15
+
+            minimize.Text = "—"
+            minimize.AnchorPoint = Vector2.new(1, 0)
+            minimize.Position = UDim2.new(1, -9, 0, 9)
+            minimize.Size = UDim2.fromOffset(32, 28)
+
+            tween(mainFrame, 0.16, {Size = expandedSize})
+        end
+    end)
+
+    local camera = Workspace.CurrentCamera
+    if camera then
+        camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+            local newWidth, newHeight = getResponsiveSize()
+            mainWidth = newWidth
+            mainHeight = newHeight
+            expandedSize = UDim2.fromOffset(mainWidth, mainHeight)
+
+            if minimized then
+                mainFrame.Size = UDim2.fromOffset(MINIMIZED_WIDTH, MINIMIZED_HEIGHT)
+            else
+                mainFrame.Size = expandedSize
+            end
+
+            syncShadow()
+        end)
+    end
+
+    -- Auto-resume saved ON states after the UI has loaded.
+    if configLoaded then
+        highestHpPriorityEnabled = autoStealEnabled
+
+        if autoStealEnabled and getSelectedCount(selectedStealRarities) > 0 then
+            task.spawn(runAutoSteal)
+        end
+
+        if autoBuyEnabled then
+            task.spawn(runAutoBuyPickaxe)
+        end
+
+        if upgradePlotEnabled then
+            task.spawn(runUpgradePlot)
+        end
+
+        if sellAllEnabled then
+            task.spawn(runSellAll)
+        end
+
+        if fpsBoosterEnabled then
+            setFpsBoosterEnabled(true)
+        end
+
+        task.defer(function()
+            setStatus("Saved config auto-loaded", "success")
+        end)
+    end
+
+    syncShadow()
+end
+
+--// Keyless entry point
+launchMainGui()
