@@ -1,9 +1,31 @@
-// VNDT / ZHM hosted loader endpoint
-// YouTube: https://www.youtube.com/watch?v=dQw4w9WgXcQ
+// VNDT / ZHM loader
+// Browser / Discord -> YouTube
+// Script HTTP clients -> Lua source
+
+const YOUTUBE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
 
 export default function handler(req, res) {
   if (req.method !== "GET") {
     res.status(405).send("Method Not Allowed");
+    return;
+  }
+
+  const ua = String(req.headers["user-agent"] || "").toLowerCase();
+
+  // Normal browsers and common link-preview crawlers get the YouTube page.
+  // This creates the YouTube-style preview when the loader URL is shared.
+  const isBrowserOrPreview =
+    ua.includes("mozilla") ||
+    ua.includes("discordbot") ||
+    ua.includes("twitterbot") ||
+    ua.includes("facebookexternalhit") ||
+    ua.includes("telegrambot") ||
+    ua.includes("whatsapp") ||
+    ua.includes("slackbot");
+
+  if (isBrowserOrPreview) {
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    res.redirect(302, YOUTUBE_URL);
     return;
   }
 
@@ -14,11 +36,7 @@ export default function handler(req, res) {
     return;
   }
 
-  const banner =
-    "--[[ VNDT YOUTUBE: https://www.youtube.com/watch?v=dQw4w9WgXcQ ]]\n";
-
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
-  res.setHeader("Pragma", "no-cache");
-  res.status(200).send(banner + source);
+  res.status(200).send(source);
 }
