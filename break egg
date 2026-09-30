@@ -21,9 +21,12 @@
       * Auto Steal stays on the same egg until it is actually broken
       * Waits 5 seconds after break, then blocks until steal is confirmed
       * Blocks again until TreadmillBoard return is confirmed before any new target
-      * Waits 1 second after confirmed return before finding the next egg
+      * Waits 0.5 second after confirmed return before finding the next egg
       * Auto Sell now sells only selected rarities
       * Returns to TreadmillBoard after a successful steal
+      * FIX: reduced top-level locals to prevent Luau register-limit compile errors
+      * FIX: restored exact EggTargeting.Pick resolution on every EggHitRequest
+      * OPTIMIZED: expensive HP/break scans throttled while hit loop stays Heartbeat-fast
 ]]
 
 --// Services
@@ -614,7 +617,7 @@ local selectedSellRarities = {}
 --// Persistent config
 -- Uses executor file APIs when available.
 local CONFIG_FILE = "VNDT_Config.json"
-local CONFIG_VERSION = 1
+local CONFIG_VERSION = 2
 local configLoaded = false
 local configSaveSerial = 0
 
@@ -1005,22 +1008,27 @@ local protectionAntiPushMover = nil
 local protectionAntiPushRoot = nil
 local protectionForceField = nil
 local protectionConstraintStates = setmetatable({}, {__mode = "k"})
-local CLAIM_TIMEOUT = 1.20
-local CLAIM_SETTLE_TIME = 0
-local CLAIM_FIRE_INTERVAL = 0
 local POST_TELEPORT_SETTLE = 0.03
-local ATTACK_INTERVAL = 0.03
-local RETURN_TIMEOUT = 0.75
+-- Fast hit mode: no fixed artificial delay.
+-- One valid EggHitRequest is sent per Heartbeat so EggTargeting can resolve
+-- the exact server-accepted egg instance on every hit.
+local ATTACK_INTERVAL = 0
 local RETURN_RETRY_INTERVAL = 0.02
 local POST_BREAK_WAIT = 5.0
-local NEXT_EGG_DELAY = 1.0
+local NEXT_EGG_DELAY = 0.5
 local autoStealReturnCFrame = nil
 local moduleCache = {
     EggTargeting = nil,
     PickaxeController = nil,
 }
-local eggContainerCache = {}
-local lastEggContainerScan = 0
+-- Consolidated runtime cache: keeps top-level locals safely below Luau's limit.
+local eggScanState = {
+    containers = {},
+    lastContainerScan = 0,
+    fallback = {},
+    lastFallbackScan = 0,
+    fallbackInterval = 1.5,
+}
 
 local function setStatus(text, kind)
     local prefix = "Auto Steal: "
@@ -1028,7 +1036,6 @@ local function setStatus(text, kind)
     if statusSink then
         pcall(statusSink, full, kind)
     end
-    print("[VNDT] " .. full)
 end
 
 local function setRarityStatus(text, kind)
@@ -1041,6 +1048,10 @@ end
 local function normalizeName(value)
     return string.lower(tostring(value or "")):gsub("[^%w]", "")
 end
+
+
+--// Egg-opening skip system removed for lower runtime overhead.
+
 
 local function getSelectedCount(selection)
     local count = 0
@@ -1159,7 +1170,7 @@ end
 local function runRarityScanner()
     while true do
         pcall(scanRarities)
-        task.wait(2)
+        task.wait(5)
     end
 end
 
@@ -1354,14 +1365,22 @@ local function getEggTargeting()
     return nil
 end
 
+local cachedEggHitRemote = nil
+
 local function findEggHitRemote()
+    if cachedEggHitRemote and cachedEggHitRemote.Parent then
+        return cachedEggHitRemote
+    end
+
     local exact = ReplicatedStorage:FindFirstChild("EggHitRequest")
     if exact and (exact:IsA("RemoteEvent") or exact:IsA("RemoteFunction")) then
+        cachedEggHitRemote = exact
         return exact
     end
 
     exact = ReplicatedStorage:FindFirstChild("EggHitRequest", true)
     if exact and (exact:IsA("RemoteEvent") or exact:IsA("RemoteFunction")) then
+        cachedEggHitRemote = exact
         return exact
     end
 
@@ -1369,6 +1388,7 @@ local function findEggHitRemote()
         if object:IsA("RemoteEvent") or object:IsA("RemoteFunction") then
             local n = normalizeName(object.Name)
             if n:find("egg", 1, true) and (n:find("hit", 1, true) or n:find("attack", 1, true)) then
+                cachedEggHitRemote = object
                 return object
             end
         end
@@ -1417,17 +1437,17 @@ end
 
 local function getEggContainers(force)
     local now = tick()
-    if not force and #eggContainerCache > 0 and now - lastEggContainerScan < 3 then
+    -- Keep both positive AND negative scan results briefly. This prevents a
+    -- full Workspace:GetDescendants() scan every retry when no container exists.
+    if not force and now - eggScanState.lastContainerScan < 3 then
         local valid = {}
-        for _, container in ipairs(eggContainerCache) do
+        for _, container in ipairs(eggScanState.containers) do
             if container and container.Parent then
                 table.insert(valid, container)
             end
         end
-        if #valid > 0 then
-            eggContainerCache = valid
-            return eggContainerCache
-        end
+        eggScanState.containers = valid
+        return eggScanState.containers
     end
 
     local found = {}
@@ -1437,9 +1457,9 @@ local function getEggContainers(force)
         end
     end
 
-    eggContainerCache = found
-    lastEggContainerScan = now
-    return eggContainerCache
+    eggScanState.containers = found
+    eggScanState.lastContainerScan = now
+    return eggScanState.containers
 end
 
 local function addEggCandidatesFromContainer(container, output, seen)
@@ -1488,17 +1508,34 @@ local function collectAllEggCandidates()
         end
     end
 
-    -- Fallback for games that no longer use an Eggs folder.
+    -- Fallback for games that no longer use an Eggs folder. Throttled so an
+    -- empty map does not trigger a full Workspace scan on every auto-steal retry.
     if #candidates == 0 then
-        for _, object in ipairs(Workspace:GetDescendants()) do
-            if (object:IsA("Model") or object:IsA("BasePart"))
-                and normalizeName(object.Name):find("egg", 1, true)
-                and getObjectCFrame(object)
-                and not seen[object] then
-                seen[object] = true
-                table.insert(candidates, object)
+        local now = tick()
+        if now - eggScanState.lastFallbackScan >= eggScanState.fallbackInterval then
+            local freshFallback = {}
+            for _, object in ipairs(Workspace:GetDescendants()) do
+                if (object:IsA("Model") or object:IsA("BasePart"))
+                    and normalizeName(object.Name):find("egg", 1, true)
+                    and getObjectCFrame(object) then
+                    table.insert(freshFallback, object)
+                end
+            end
+            eggScanState.fallback = freshFallback
+            eggScanState.lastFallbackScan = now
+        end
+
+        local validFallback = {}
+        for _, object in ipairs(eggScanState.fallback) do
+            if object and object.Parent then
+                table.insert(validFallback, object)
+                if not seen[object] then
+                    seen[object] = true
+                    table.insert(candidates, object)
+                end
             end
         end
+        eggScanState.fallback = validFallback
     end
 
     return candidates
@@ -1724,11 +1761,8 @@ local function formatHp(hp, maxHp)
 end
 
 local function chooseSelectedRarityEgg()
-    -- Fresh target scan every cycle.
-    rarityDetectionCache = setmetatable({}, {__mode = "k"})
-    eggContainerCache = {}
-    lastEggContainerScan = 0
-
+    -- Use live children from cached containers. Container discovery itself is
+    -- throttled, avoiding repeated full-workspace scans during empty periods.
     local character = LocalPlayer.Character
     local root = character and character:FindFirstChild("HumanoidRootPart")
     if not root then
@@ -2198,8 +2232,13 @@ local function startProtectionWorker()
 
     protectionWorkerStarted = true
 
-    RunService.Heartbeat:Connect(function()
-        pcall(protectCharacterStep)
+    -- Character protection does not need to traverse the character at render
+    -- frequency. 10 Hz keeps anti-stun/anti-ragdoll responsive with far less CPU.
+    task.spawn(function()
+        while true do
+            pcall(protectCharacterStep)
+            task.wait(0.10)
+        end
     end)
 
     LocalPlayer.CharacterAdded:Connect(function()
@@ -2253,40 +2292,6 @@ local function getPromptWorldPosition(prompt)
         current = current.Parent
     end
     return nil
-end
-
-local function findPickupPrompt(targetEgg, maxDistance)
-    local character = LocalPlayer.Character
-    local root = character and character:FindFirstChild("HumanoidRootPart")
-    if not root then
-        return nil
-    end
-
-    if targetEgg and targetEgg.Parent then
-        if targetEgg:IsA("ProximityPrompt") and targetEgg.Enabled then
-            return targetEgg
-        end
-        for _, object in ipairs(targetEgg:GetDescendants()) do
-            if object:IsA("ProximityPrompt") and object.Enabled then
-                return object
-            end
-        end
-    end
-
-    local nearest, nearestDistance = nil, maxDistance or 40
-    for _, object in ipairs(Workspace:GetDescendants()) do
-        if object:IsA("ProximityPrompt") and object.Enabled then
-            local pos = getPromptWorldPosition(object)
-            if pos then
-                local distance = (root.Position - pos).Magnitude
-                if distance <= nearestDistance then
-                    nearest = object
-                    nearestDistance = distance
-                end
-            end
-        end
-    end
-    return nearest
 end
 
 local function firePromptInstant(prompt)
@@ -2361,8 +2366,10 @@ end
 
 local function attackEggOnce(preferredEgg)
     local didAnything = false
-    local tool = equipTool("Pickaxe")
 
+    -- Keep the working behavior: make sure Pickaxe is equipped/activated,
+    -- then resolve EggTargeting.Pick for the current server-accepted egg.
+    local tool = equipTool("Pickaxe")
     if tool then
         pcall(function()
             tool:Activate()
@@ -2372,6 +2379,7 @@ local function attackEggOnce(preferredEgg)
 
     local remote = findEggHitRemote()
     local target = getPickedEggFromModule(preferredEgg)
+
     if remote and target then
         if remote:IsA("RemoteEvent") then
             local ok = pcall(function()
@@ -2469,26 +2477,6 @@ end
 
 
 --// Claim-safe pickup
-local function isPromptGoneOrDisabled(prompt)
-    if not prompt then
-        return true
-    end
-
-    if not prompt.Parent then
-        return true
-    end
-
-    local ok, enabled = pcall(function()
-        return prompt.Enabled
-    end)
-
-    return ok and enabled == false
-end
-
-local function isEggGone(egg)
-    return not egg or not egg.Parent
-end
-
 local function claimEggBeforeReturn(egg, prompt, rarity, pickupPosition)
     setStatus(
         "Stealing " .. tostring(rarity) .. " egg • waiting for claim confirmation",
@@ -2777,7 +2765,7 @@ local function runAutoStealCycle()
         return false
     end
 
-    -- Marks the period where strong anti-push can temporarily anchor the root.
+    -- Marks the period where anti-push protection is active.
     -- There is still NO continuous tween or continuous CFrame-to-egg behavior.
     setTargetLock(eggCF)
 
@@ -2786,12 +2774,23 @@ local function runAutoStealCycle()
     local originalEggPosition = eggCF.Position
     local prompt = nil
     local lastDetailUpdate = 0
+    local lastBreakCheck = 0
+    local BREAK_CHECK_INTERVAL = 0.06
 
     -- IMPORTANT:
-    -- No break timeout anymore. Once an egg is selected, VNDT keeps attacking
-    -- THIS SAME EGG until it is actually broken/stealable or disappears.
+    -- Hitting remains every Heartbeat. Only the expensive descendant/HP break
+    -- scan is throttled, which lowers CPU usage without slowing FireServer hits.
     while autoStealEnabled do
-        local broken, targetPrompt = targetEggIsBroken(egg)
+        local broken = false
+        local targetPrompt = nil
+
+        -- Egg removal is cheap to detect and is checked every frame.
+        if not egg or not egg.Parent then
+            broken = true
+        elseif tick() - lastBreakCheck >= BREAK_CHECK_INTERVAL then
+            broken, targetPrompt = targetEggIsBroken(egg)
+            lastBreakCheck = tick()
+        end
 
         if targetPrompt then
             prompt = targetPrompt
@@ -2807,7 +2806,7 @@ local function runAutoStealCycle()
             while autoStealEnabled and tick() < promptDeadline and not prompt do
                 prompt = findPickupPromptNearPosition(originalEggPosition, 20)
                 if not prompt then
-                    RunService.Heartbeat:Wait()
+                    task.wait(0.05)
                 end
             end
 
@@ -2816,7 +2815,7 @@ local function runAutoStealCycle()
 
         local didAnything, hasTool, hasRemote, hasTarget = attackEggOnce(egg)
 
-        if tick() - lastDetailUpdate > 0.65 then
+        if tick() - lastDetailUpdate > 1.0 then
             local liveHp, liveMaxHp = detectEggHp(egg)
 
             if not hasTool then
@@ -2840,7 +2839,13 @@ local function runAutoStealCycle()
             lastDetailUpdate = tick()
         end
 
-        task.wait(ATTACK_INTERVAL)
+        -- Zero fixed delay while still yielding once so Roblox can replicate HP
+        -- and EggTargeting/PickaxeController can update the currently handled egg.
+        if ATTACK_INTERVAL > 0 then
+            task.wait(ATTACK_INTERVAL)
+        else
+            RunService.Heartbeat:Wait()
+        end
     end
 
     if not autoStealEnabled then
@@ -2872,7 +2877,7 @@ local function runAutoStealCycle()
 
         if not prompt then
             setStatus("Egg broken • waiting for steal prompt…", "working")
-            RunService.Heartbeat:Wait()
+            task.wait(0.05)
         end
     end
 
@@ -2911,7 +2916,7 @@ local function runAutoStealCycle()
             )
         else
             setStatus("Steal not confirmed • waiting for pickup prompt…", "warning")
-            RunService.Heartbeat:Wait()
+            task.wait(0.05)
         end
     end
 
@@ -2964,13 +2969,9 @@ local function runAutoStealManager()
             end
 
             if autoStealEnabled then
-                -- Rebuild target discovery before EVERY loop so newly spawned
-                -- eggs and newly spawned eggs are always seen.
-                eggContainerCache = {}
-                lastEggContainerScan = 0
-                rarityDetectionCache = setmetatable({}, {__mode = "k"})
-
                 if ok and completedOrError == true then
+                    -- A completed egg can invalidate cached rarity/target objects.
+                    rarityDetectionCache = setmetatable({}, {__mode = "k"})
                     -- Only wait after a FULL successful:
                     -- break -> claim -> return.
                     setStatus("Returned • scanning next selected-rarity egg", "success")
@@ -2978,7 +2979,7 @@ local function runAutoStealManager()
                 else
                     -- No target: rescan quickly instead of
                     -- sleeping a whole second or behaving like a one-shot.
-                    task.wait(0.05)
+                    task.wait(0.15)
                 end
             end
         end
@@ -3971,6 +3972,7 @@ function UI.launchMainGui()
 
     UI.createSectionLabel(content, "Utilities", 6)
 
+
     UI.createToggleRow(
         content,
         "Anti AFK",
@@ -3998,7 +4000,7 @@ function UI.launchMainGui()
         content,
         "FPS Booster",
         "Low graphics • removes effects/textures • FPS counter",
-        8,
+        9,
         fpsBoosterEnabled,
         function(enabled)
             setFpsBoosterEnabled(enabled)
@@ -4016,7 +4018,7 @@ function UI.launchMainGui()
         "Save Config",
         "Changes auto-save • tap to save now",
         "SAVE",
-        9,
+        10,
         function()
             local ok, err = saveConfigNow()
             if ok then
@@ -4031,7 +4033,7 @@ function UI.launchMainGui()
         content,
         "Auto Buy Pickaxe",
         "Buys and equips the best affordable tier",
-        10,
+        11,
         autoBuyEnabled,
         function(enabled)
             autoBuyEnabled = enabled
@@ -4046,7 +4048,7 @@ function UI.launchMainGui()
         content,
         "Upgrade Plot",
         "Continuously requests the next plot upgrade",
-        11,
+        12,
         upgradePlotEnabled,
         function(enabled)
             upgradePlotEnabled = enabled
@@ -4057,13 +4059,13 @@ function UI.launchMainGui()
         end
     )
 
-    UI.createSectionLabel(content, "Auto Sell", 12)
+    UI.createSectionLabel(content, "Auto Sell", 13)
 
     UI.createToggleRow(
         content,
         "Auto Sell",
         "Sells only the rarities selected below",
-        13,
+        14,
         sellAllEnabled,
         function(enabled)
             sellAllEnabled = enabled
@@ -4078,7 +4080,7 @@ function UI.launchMainGui()
         content,
         "Sell Rarities",
         "Selected rarities will be sold automatically",
-        14,
+        15,
         selectedSellRarities,
         function()
             queueSaveConfig()
@@ -4100,7 +4102,7 @@ function UI.launchMainGui()
     local footer = Instance.new("Frame")
     footer.Size = UDim2.new(1, 0, 0, 28)
     footer.BackgroundTransparency = 1
-    footer.LayoutOrder = 15
+    footer.LayoutOrder = 16
     footer.Parent = content
 
     local footerText = UI.makeText(
