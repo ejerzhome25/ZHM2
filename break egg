@@ -25,7 +25,8 @@
       * Auto Sell now sells only selected rarities
       * Returns to TreadmillBoard after a successful steal
       * FIX: reduced top-level locals to prevent Luau register-limit compile errors
-      * FIX: restored exact EggTargeting.Pick resolution on every EggHitRequest
+      * FIX: restored exact EggTargeting.Pick resolution before each rapid burst
+      * RAPID HIT: 4 zero-delay EggHitRequest calls per Heartbeat
       * OPTIMIZED: expensive HP/break scans throttled while hit loop stays Heartbeat-fast
 ]]
 
@@ -1009,10 +1010,12 @@ local protectionAntiPushRoot = nil
 local protectionForceField = nil
 local protectionConstraintStates = setmetatable({}, {__mode = "k"})
 local POST_TELEPORT_SETTLE = 0.03
--- Fast hit mode: no fixed artificial delay.
--- One valid EggHitRequest is sent per Heartbeat so EggTargeting can resolve
--- the exact server-accepted egg instance on every hit.
+-- Rapid hit mode: no fixed artificial delay.
+-- Resolve the correct server-accepted egg once per Heartbeat, then send a
+-- short zero-delay burst to that exact target. Keeping the burst small avoids
+-- the lag/broken targeting caused by huge FireServer spam.
 local ATTACK_INTERVAL = 0
+local RAPID_HIT_BURST = 4
 local RETURN_RETRY_INTERVAL = 0.02
 local POST_BREAK_WAIT = 5.0
 local NEXT_EGG_DELAY = 0.5
@@ -2364,11 +2367,11 @@ local function getPickedEggFromModule(preferredEgg)
     return preferredEgg
 end
 
-local function attackEggOnce(preferredEgg)
+local function attackEggRapid(preferredEgg)
     local didAnything = false
+    local successfulHits = 0
 
-    -- Keep the working behavior: make sure Pickaxe is equipped/activated,
-    -- then resolve EggTargeting.Pick for the current server-accepted egg.
+    -- Equip/activate only once for this Heartbeat.
     local tool = equipTool("Pickaxe")
     if tool then
         pcall(function()
@@ -2378,23 +2381,39 @@ local function attackEggOnce(preferredEgg)
     end
 
     local remote = findEggHitRemote()
+
+    -- IMPORTANT: resolve the exact game-accepted egg before firing.
+    -- Do not send the outer scanned model directly unless targeting falls back to it.
     local target = getPickedEggFromModule(preferredEgg)
 
     if remote and target then
         if remote:IsA("RemoteEvent") then
-            local ok = pcall(function()
-                remote:FireServer(target)
-            end)
-            didAnything = didAnything or ok
+            -- Zero-delay rapid burst. All calls use the same freshly resolved
+            -- target for this Heartbeat, so targeting stays correct.
+            for _ = 1, RAPID_HIT_BURST do
+                local ok = pcall(function()
+                    remote:FireServer(target)
+                end)
+                if ok then
+                    successfulHits += 1
+                    didAnything = true
+                end
+            end
+
         elseif remote:IsA("RemoteFunction") then
+            -- RemoteFunctions can yield; keep these to one call per Heartbeat
+            -- so a slow server response cannot freeze the whole automation.
             local ok = pcall(function()
                 remote:InvokeServer(target)
             end)
-            didAnything = didAnything or ok
+            if ok then
+                successfulHits = 1
+                didAnything = true
+            end
         end
     end
 
-    return didAnything, tool ~= nil, remote ~= nil, target ~= nil
+    return didAnything, tool ~= nil, remote ~= nil, target ~= nil, successfulHits
 end
 
 local function getReturnCFrame()
@@ -2778,8 +2797,8 @@ local function runAutoStealCycle()
     local BREAK_CHECK_INTERVAL = 0.06
 
     -- IMPORTANT:
-    -- Hitting remains every Heartbeat. Only the expensive descendant/HP break
-    -- scan is throttled, which lowers CPU usage without slowing FireServer hits.
+    -- Rapid-hit burst runs every Heartbeat. Only the expensive descendant/HP
+    -- break scan is throttled, keeping FireServer bursts fast while reducing CPU use.
     while autoStealEnabled do
         local broken = false
         local targetPrompt = nil
@@ -2813,7 +2832,7 @@ local function runAutoStealCycle()
             break
         end
 
-        local didAnything, hasTool, hasRemote, hasTarget = attackEggOnce(egg)
+        local didAnything, hasTool, hasRemote, hasTarget, rapidHits = attackEggRapid(egg)
 
         if tick() - lastDetailUpdate > 1.0 then
             local liveHp, liveMaxHp = detectEggHp(egg)
@@ -2824,23 +2843,23 @@ local function runAutoStealCycle()
                 setStatus("Same egg locked • no egg-hit remote", "error")
             elseif liveHp ~= nil then
                 setStatus(
-                    "Breaking same " .. tostring(rarity)
+                    "Rapid hitting same " .. tostring(rarity)
                     .. " egg • " .. formatHp(liveHp, liveMaxHp),
                     "working"
                 )
             elseif hasTool and not hasRemote then
-                setStatus("Breaking same egg via Pickaxe activation…", "working")
+                setStatus("Rapid hitting same egg via Pickaxe activation…", "working")
             elseif hasRemote and not hasTarget then
                 setStatus("Same egg locked • target unavailable", "warning")
             else
-                setStatus("Breaking same " .. tostring(rarity) .. " egg…", "working")
+                setStatus("Rapid hitting same " .. tostring(rarity) .. " egg…", "working")
             end
 
             lastDetailUpdate = tick()
         end
 
-        -- Zero fixed delay while still yielding once so Roblox can replicate HP
-        -- and EggTargeting/PickaxeController can update the currently handled egg.
+        -- No delay inside the rapid burst. Yield once after each burst so Roblox
+        -- can replicate HP and EggTargeting/PickaxeController can refresh safely.
         if ATTACK_INTERVAL > 0 then
             task.wait(ATTACK_INTERVAL)
         else
