@@ -39,8 +39,14 @@ local TweenService = game:GetService("TweenService")
 local CollectionService = game:GetService("CollectionService")
 local HttpService = game:GetService("HttpService")
 local VirtualUser = game:GetService("VirtualUser")
+local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local LocalPlayer = Players.LocalPlayer
+
+--// Device detection
+local IS_TOUCH_DEVICE = UserInputService.TouchEnabled == true
+local HAS_KEYBOARD = UserInputService.KeyboardEnabled == true
+local IS_MOBILE = IS_TOUCH_DEVICE and not HAS_KEYBOARD
 
 --// Recovered game constants
 local GUI_NAME = "VNDT"
@@ -423,8 +429,8 @@ local function createFpsCounter()
 
     local label = Instance.new("TextLabel")
     label.Name = "FPS"
-    label.Size = UDim2.new(0, 112, 0, 25)
-    label.Position = UDim2.new(0.5, -56, 0, 7)
+    label.Size = IS_TOUCH_DEVICE and UDim2.new(0, 96, 0, 24) or UDim2.new(0, 112, 0, 25)
+    label.Position = IS_TOUCH_DEVICE and UDim2.new(0.5, -48, 0, 36) or UDim2.new(0.5, -56, 0, 7)
     label.BackgroundTransparency = 0.25
     label.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
     label.BorderSizePixel = 0
@@ -479,8 +485,9 @@ local function enableFpsBooster()
         optimizeFpsObject(object)
 
         -- Avoid freezing large maps during the first pass.
-        if index % 400 == 0 then
-            task.wait()
+        local batchSize = IS_TOUCH_DEVICE and 180 or 400
+        if index % batchSize == 0 then
+            task.wait(IS_TOUCH_DEVICE and 0.02 or 0)
         end
     end
 
@@ -517,7 +524,7 @@ local function enableFpsBooster()
 
     task.spawn(function()
         while fpsBoosterEnabled and myToken == fpsPeriodicToken do
-            task.wait(10)
+            task.wait(IS_TOUCH_DEVICE and 15 or 10)
 
             if not fpsBoosterEnabled or myToken ~= fpsPeriodicToken then
                 break
@@ -788,31 +795,176 @@ pcall(loadConfig)
 highestHpPriorityEnabled = autoStealEnabled
 
 --// Anti AFK
-local antiAfkConnection = nil
+local antiAfkIdleConnection = nil
+local antiAfkWorkerToken = 0
+local disabledIdleConnections = {}
 
-local function startAntiAfk()
-    if antiAfkConnection then
+local function performAntiAfkActivity()
+    if not antiAfkEnabled then
         return
     end
 
-    antiAfkConnection = LocalPlayer.Idled:Connect(function()
-        if not antiAfkEnabled then
-            return
-        end
+    local camera = Workspace.CurrentCamera
+    local cameraCF = camera and camera.CFrame or CFrame.new()
+
+    -- VirtualUser works as the main cross-platform fallback.
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:Button1Down(Vector2.new(1, 1), cameraCF)
+        task.wait(0.04)
+        VirtualUser:Button1Up(Vector2.new(1, 1), cameraCF)
+    end)
+
+    if IS_TOUCH_DEVICE then
+        -- Mobile/touch executors differ in how SendTouchEvent is exposed.
+        -- Try common signatures safely; failures are ignored.
+        local viewport = camera and camera.ViewportSize or Vector2.new(400, 800)
+        local x = math.floor(viewport.X * 0.5)
+        local y = math.floor(viewport.Y * 0.82)
 
         pcall(function()
-            local camera = Workspace.CurrentCamera
-            local cameraCF = camera and camera.CFrame or CFrame.new()
-
-            VirtualUser:CaptureController()
-            VirtualUser:Button2Down(Vector2.new(0, 0), cameraCF)
-            task.wait(0.15)
-            VirtualUser:Button2Up(Vector2.new(0, 0), cameraCF)
+            VirtualInputManager:SendTouchEvent(0, 0, x, y)
+            task.wait(0.03)
+            VirtualInputManager:SendTouchEvent(0, 2, x, y)
         end)
+
+        pcall(function()
+            VirtualInputManager:SendTouchEvent(
+                0,
+                Enum.UserInputState.Begin,
+                x,
+                y
+            )
+            task.wait(0.03)
+            VirtualInputManager:SendTouchEvent(
+                0,
+                Enum.UserInputState.End,
+                x,
+                y
+            )
+        end)
+    else
+        -- Desktop fallback: tiny mouse movement + harmless key pulse.
+        pcall(function()
+            local pos = UserInputService:GetMouseLocation()
+            VirtualInputManager:SendMouseMoveEvent(pos.X + 1, pos.Y, game)
+            task.wait(0.03)
+            VirtualInputManager:SendMouseMoveEvent(pos.X, pos.Y, game)
+        end)
+
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.LeftShift, false, game)
+            task.wait(0.02)
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
+        end)
+    end
+end
+
+local function disableRobloxIdleConnections()
+    disabledIdleConnections = {}
+
+    if type(getconnections) ~= "function" then
+        return
+    end
+
+    local ok, connections = pcall(function()
+        return getconnections(LocalPlayer.Idled)
+    end)
+
+    if not ok or type(connections) ~= "table" then
+        return
+    end
+
+    for _, connection in ipairs(connections) do
+        local disabled = false
+
+        if connection and type(connection.Disable) == "function" then
+            local success = pcall(function()
+                connection:Disable()
+            end)
+            disabled = success
+        elseif connection and type(connection.Disconnect) == "function" then
+            -- Do NOT permanently disconnect if Disable isn't available.
+            -- Keep fallback activity methods instead.
+            disabled = false
+        end
+
+        if disabled then
+            table.insert(disabledIdleConnections, connection)
+        end
+    end
+end
+
+local function restoreRobloxIdleConnections()
+    for _, connection in ipairs(disabledIdleConnections) do
+        if connection and type(connection.Enable) == "function" then
+            pcall(function()
+                connection:Enable()
+            end)
+        end
+    end
+
+    disabledIdleConnections = {}
+end
+
+local function stopAntiAfk()
+    antiAfkWorkerToken += 1
+
+    if antiAfkIdleConnection then
+        pcall(function()
+            antiAfkIdleConnection:Disconnect()
+        end)
+        antiAfkIdleConnection = nil
+    end
+
+    restoreRobloxIdleConnections()
+end
+
+local function startAntiAfk()
+    stopAntiAfk()
+
+    if not antiAfkEnabled then
+        return
+    end
+
+    disableRobloxIdleConnections()
+
+    -- Immediate response when Roblox reports Idled.
+    antiAfkIdleConnection = LocalPlayer.Idled:Connect(function()
+        if antiAfkEnabled then
+            task.spawn(performAntiAfkActivity)
+        end
+    end)
+
+    -- Proactive keep-alive:
+    -- do not rely only on Idled, because some clients/executors do not fire it
+    -- consistently before Roblox's idle timeout.
+    antiAfkWorkerToken += 1
+    local myToken = antiAfkWorkerToken
+
+    task.spawn(function()
+        -- Initial pulse after a short delay.
+        task.wait(2)
+
+        while antiAfkEnabled and myToken == antiAfkWorkerToken do
+            performAntiAfkActivity()
+
+            -- Keep well below Roblox's idle timeout without spamming input.
+            local keepAliveSteps = IS_TOUCH_DEVICE and 6 or 9
+            for _ = 1, keepAliveSteps do
+                if not antiAfkEnabled or myToken ~= antiAfkWorkerToken then
+                    break
+                end
+                task.wait(5)
+            end
+        end
     end)
 end
 
-startAntiAfk()
+-- Apply the saved/default state.
+if antiAfkEnabled then
+    task.defer(startAntiAfk)
+end
 
 --// Small compatibility helpers
 local function safeCall(fn, ...)
@@ -3016,6 +3168,8 @@ local function runSellAll()
 end
 
 --// VNDT premium UI
+local UI = {}
+
 local THEME = {
     background = Color3.fromRGB(10, 11, 17),
     surface = Color3.fromRGB(18, 20, 30),
@@ -3032,7 +3186,7 @@ local THEME = {
     shadow = Color3.fromRGB(0, 0, 0),
 }
 
-local function getUiParent()
+function UI.getUiParent()
     if type(gethui) == "function" then
         local ok, result = pcall(gethui)
         if ok and result then
@@ -3042,14 +3196,14 @@ local function getUiParent()
     return CoreGui
 end
 
-local function addCorner(parent, radius)
+function UI.addCorner(parent, radius)
     local item = Instance.new("UICorner")
     item.CornerRadius = UDim.new(0, radius or 10)
     item.Parent = parent
     return item
 end
 
-local function addStroke(parent, color, thickness, transparency)
+function UI.addStroke(parent, color, thickness, transparency)
     local item = Instance.new("UIStroke")
     item.Color = color or THEME.line
     item.Thickness = thickness or 1
@@ -3059,7 +3213,7 @@ local function addStroke(parent, color, thickness, transparency)
     return item
 end
 
-local function addPadding(parent, left, right, top, bottom)
+function UI.addPadding(parent, left, right, top, bottom)
     local pad = Instance.new("UIPadding")
     pad.PaddingLeft = UDim.new(0, left or 0)
     pad.PaddingRight = UDim.new(0, right or left or 0)
@@ -3069,14 +3223,14 @@ local function addPadding(parent, left, right, top, bottom)
     return pad
 end
 
-local function tween(object, duration, properties)
+function UI.tween(object, duration, properties)
     local info = TweenInfo.new(duration or 0.18, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
     local animation = TweenService:Create(object, info, properties)
     animation:Play()
     return animation
 end
 
-local function makeText(parent, text, size, color, font, alignment)
+function UI.makeText(parent, text, size, color, font, alignment)
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
     label.Text = text or ""
@@ -3090,7 +3244,7 @@ local function makeText(parent, text, size, color, font, alignment)
     return label
 end
 
-local function makeTouchDraggable(handle, frame)
+function UI.makeTouchDraggable(handle, frame)
     local dragging = false
     local dragInput = nil
     local dragStart = nil
@@ -3098,49 +3252,103 @@ local function makeTouchDraggable(handle, frame)
 
     handle.Active = true
 
+    local function clampFrameToViewport(position)
+        local camera = Workspace.CurrentCamera
+        local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
+        local size = frame.AbsoluteSize
+
+        -- Frame uses center anchor.
+        local halfW = size.X * 0.5
+        local halfH = size.Y * 0.5
+
+        local targetX = viewport.X * position.X.Scale + position.X.Offset
+        local targetY = viewport.Y * position.Y.Scale + position.Y.Offset
+
+        local margin = IS_TOUCH_DEVICE and 8 or 4
+        targetX = math.clamp(targetX, halfW + margin, viewport.X - halfW - margin)
+        targetY = math.clamp(targetY, halfH + margin, viewport.Y - halfH - margin)
+
+        return UDim2.fromOffset(targetX, targetY)
+    end
+
     handle.InputBegan:Connect(function(input)
         local inputType = input.UserInputType
-        if inputType == Enum.UserInputType.MouseButton1
-            or inputType == Enum.UserInputType.Touch then
-
-            dragging = true
-            dragStart = input.Position
-            startPosition = frame.Position
-
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
-            end)
+        if inputType ~= Enum.UserInputType.MouseButton1
+            and inputType ~= Enum.UserInputType.Touch then
+            return
         end
+
+        -- Don't start a drag when tapping the minimize/restore button area.
+        local screenX = input.Position.X
+        local rightEdge = handle.AbsolutePosition.X + handle.AbsoluteSize.X
+        local reserved = IS_TOUCH_DEVICE and 54 or 44
+        if screenX >= rightEdge - reserved then
+            return
+        end
+
+        dragging = true
+        dragInput = input
+        dragStart = input.Position
+        startPosition = frame.Position
+
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End
+                or input.UserInputState == Enum.UserInputState.Cancel then
+                dragging = false
+                dragInput = nil
+            end
+        end)
     end)
 
     handle.InputChanged:Connect(function(input)
-        local inputType = input.UserInputType
-        if inputType == Enum.UserInputType.MouseMovement
-            or inputType == Enum.UserInputType.Touch then
-            dragInput = input
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+            if dragging then
+                dragInput = input
+            end
         end
     end)
 
     UserInputService.InputChanged:Connect(function(input)
-        if input == dragInput and dragging and dragStart and startPosition then
-            local delta = input.Position - dragStart
-            frame.Position = UDim2.new(
-                startPosition.X.Scale,
-                startPosition.X.Offset + delta.X,
-                startPosition.Y.Scale,
-                startPosition.Y.Offset + delta.Y
-            )
+        if not dragging or not dragStart or not startPosition then
+            return
         end
+
+        if input ~= dragInput
+            and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+
+        local delta = input.Position - dragStart
+        local proposed = UDim2.new(
+            startPosition.X.Scale,
+            startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale,
+            startPosition.Y.Offset + delta.Y
+        )
+
+        frame.Position = clampFrameToViewport(proposed)
     end)
 end
 
-local function getResponsiveSize()
+function UI.getResponsiveSize()
     local camera = Workspace.CurrentCamera
     local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
 
-    -- Smaller footprint while keeping text comfortably readable.
+    if IS_TOUCH_DEVICE then
+        -- Never exceed the actual mobile viewport.
+        local width = math.clamp(viewport.X - 24, 260, 320)
+        local height = math.clamp(viewport.Y - 110, 300, 430)
+
+        -- Landscape phones need a shorter panel.
+        if viewport.X > viewport.Y then
+            width = math.clamp(viewport.X * 0.52, 280, 340)
+            height = math.clamp(viewport.Y - 44, 280, 360)
+        end
+
+        return math.floor(width), math.floor(height)
+    end
+
     local width = math.clamp(math.floor(viewport.X * 0.82), 280, 340)
     local height = math.clamp(math.floor(viewport.Y * 0.68), 320, 455)
 
@@ -3151,7 +3359,7 @@ local function getResponsiveSize()
     return width, height
 end
 
-local function createSectionLabel(parent, text, order)
+function UI.createSectionLabel(parent, text, order)
     local row = Instance.new("Frame")
     row.Name = text:gsub("%s+", "") .. "Section"
     row.Size = UDim2.new(1, 0, 0, 22)
@@ -3159,7 +3367,7 @@ local function createSectionLabel(parent, text, order)
     row.LayoutOrder = order
     row.Parent = parent
 
-    local label = makeText(row, string.upper(text), 10, THEME.muted, Enum.Font.GothamBold)
+    local label = UI.makeText(row, string.upper(text), 10, THEME.muted, Enum.Font.GothamBold)
     label.Size = UDim2.new(1, 0, 1, 0)
     label.TextTransparency = 0.05
 
@@ -3167,22 +3375,22 @@ local function createSectionLabel(parent, text, order)
 end
 
 
-local function createActionRow(parent, labelText, description, buttonText, order, onActivated)
+function UI.createActionRow(parent, labelText, description, buttonText, order, onActivated)
     local row = Instance.new("Frame")
     row.Name = labelText:gsub("%W+", "") .. "Action"
-    row.Size = UDim2.new(1, 0, 0, 54)
+    row.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 58 or 54)
     row.BackgroundColor3 = THEME.card
     row.BorderSizePixel = 0
     row.LayoutOrder = order
     row.Parent = parent
-    addCorner(row, 10)
-    addStroke(row, THEME.line, 1, 0.45)
+    UI.addCorner(row, 10)
+    UI.addStroke(row, THEME.line, 1, 0.45)
 
-    local label = makeText(row, labelText, 13, THEME.text, Enum.Font.GothamBold)
+    local label = UI.makeText(row, labelText, 13, THEME.text, Enum.Font.GothamBold)
     label.Position = UDim2.new(0, 11, 0, 6)
     label.Size = UDim2.new(1, -92, 0, 20)
 
-    local sub = makeText(row, description or "", 9, THEME.muted, Enum.Font.GothamBold)
+    local sub = UI.makeText(row, description or "", 9, THEME.muted, Enum.Font.GothamBold)
     sub.Position = UDim2.new(0, 11, 0, 27)
     sub.Size = UDim2.new(1, -92, 0, 17)
     sub.TextTruncate = Enum.TextTruncate.AtEnd
@@ -3192,7 +3400,7 @@ local function createActionRow(parent, labelText, description, buttonText, order
     button.AutoButtonColor = false
     button.AnchorPoint = Vector2.new(1, 0.5)
     button.Position = UDim2.new(1, -9, 0.5, 0)
-    button.Size = UDim2.fromOffset(70, 28)
+    button.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(72, 32) or UDim2.fromOffset(70, 28)
     button.BackgroundColor3 = THEME.accent
     button.BorderSizePixel = 0
     button.Text = buttonText or "RUN"
@@ -3200,13 +3408,13 @@ local function createActionRow(parent, labelText, description, buttonText, order
     button.TextSize = 10
     button.Font = Enum.Font.GothamBold
     button.Parent = row
-    addCorner(button, 8)
+    UI.addCorner(button, 8)
 
     button.Activated:Connect(function()
-        tween(button, 0.08, {BackgroundTransparency = 0.18})
+        UI.tween(button, 0.08, {BackgroundTransparency = 0.18})
         task.delay(0.10, function()
             if button and button.Parent then
-                tween(button, 0.10, {BackgroundTransparency = 0})
+                UI.tween(button, 0.10, {BackgroundTransparency = 0})
             end
         end)
 
@@ -3218,22 +3426,22 @@ local function createActionRow(parent, labelText, description, buttonText, order
     return row
 end
 
-local function createToggleRow(parent, labelText, description, order, initialValue, onChanged)
+function UI.createToggleRow(parent, labelText, description, order, initialValue, onChanged)
     local row = Instance.new("Frame")
     row.Name = labelText:gsub("%W+", "") .. "Toggle"
-    row.Size = UDim2.new(1, 0, 0, 54)
+    row.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 58 or 54)
     row.BackgroundColor3 = THEME.card
     row.BorderSizePixel = 0
     row.LayoutOrder = order
     row.Parent = parent
-    addCorner(row, 10)
-    addStroke(row, THEME.line, 1, 0.45)
+    UI.addCorner(row, 10)
+    UI.addStroke(row, THEME.line, 1, 0.45)
 
-    local label = makeText(row, labelText, 13, THEME.text, Enum.Font.GothamBold)
+    local label = UI.makeText(row, labelText, 13, THEME.text, Enum.Font.GothamBold)
     label.Position = UDim2.new(0, 11, 0, 6)
     label.Size = UDim2.new(1, -76, 0, 20)
 
-    local sub = makeText(row, description or "", 10, THEME.muted, Enum.Font.GothamBold)
+    local sub = UI.makeText(row, description or "", 10, THEME.muted, Enum.Font.GothamBold)
     sub.Position = UDim2.new(0, 11, 0, 27)
     sub.Size = UDim2.new(1, -76, 0, 17)
     sub.TextTruncate = Enum.TextTruncate.AtEnd
@@ -3242,36 +3450,38 @@ local function createToggleRow(parent, labelText, description, order, initialVal
     button.Name = "Switch"
     button.AutoButtonColor = false
     button.Text = ""
-    button.Size = UDim2.fromOffset(44, 26)
+    button.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(50, 30) or UDim2.fromOffset(44, 26)
     button.AnchorPoint = Vector2.new(1, 0.5)
     button.Position = UDim2.new(1, -10, 0.5, 0)
     button.BackgroundColor3 = initialValue and THEME.accent or Color3.fromRGB(55, 59, 77)
     button.BorderSizePixel = 0
     button.Parent = row
-    addCorner(button, 13)
+    UI.addCorner(button, 13)
 
     local knob = Instance.new("Frame")
     knob.Name = "Knob"
-    knob.Size = UDim2.fromOffset(20, 20)
+    knob.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(22, 22) or UDim2.fromOffset(20, 20)
     knob.AnchorPoint = Vector2.new(0.5, 0.5)
-    knob.Position = initialValue and UDim2.new(1, -13, 0.5, 0) or UDim2.new(0, 13, 0.5, 0)
+    local knobOffset = IS_TOUCH_DEVICE and 15 or 13
+    knob.Position = initialValue and UDim2.new(1, -knobOffset, 0.5, 0) or UDim2.new(0, knobOffset, 0.5, 0)
     knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
     knob.BorderSizePixel = 0
     knob.Parent = button
-    addCorner(knob, 10)
+    UI.addCorner(knob, 10)
 
     local enabled = initialValue == true
 
     local function render(instant)
         local targetColor = enabled and THEME.accent or Color3.fromRGB(55, 59, 77)
-        local targetPosition = enabled and UDim2.new(1, -13, 0.5, 0) or UDim2.new(0, 13, 0.5, 0)
+        local knobOffset = IS_TOUCH_DEVICE and 15 or 13
+        local targetPosition = enabled and UDim2.new(1, -knobOffset, 0.5, 0) or UDim2.new(0, knobOffset, 0.5, 0)
 
         if instant then
             button.BackgroundColor3 = targetColor
             knob.Position = targetPosition
         else
-            tween(button, 0.16, {BackgroundColor3 = targetColor})
-            tween(knob, 0.16, {Position = targetPosition})
+            UI.tween(button, 0.16, {BackgroundColor3 = targetColor})
+            UI.tween(knob, 0.16, {Position = targetPosition})
         end
     end
 
@@ -3304,7 +3514,7 @@ local function createToggleRow(parent, labelText, description, order, initialVal
 end
 
 
-local function createMultiSelectDropdown(parent, labelText, description, order, selectionTable, onChanged)
+function UI.createMultiSelectDropdown(parent, labelText, description, order, selectionTable, onChanged)
     local wrapper = Instance.new("Frame")
     wrapper.Name = labelText:gsub("%W+", "") .. "Dropdown"
     wrapper.Size = UDim2.new(1, 0, 0, 54)
@@ -3313,9 +3523,9 @@ local function createMultiSelectDropdown(parent, labelText, description, order, 
     wrapper.BorderSizePixel = 0
     wrapper.LayoutOrder = order
     wrapper.Parent = parent
-    addCorner(wrapper, 10)
-    addStroke(wrapper, THEME.line, 1, 0.45)
-    addPadding(wrapper, 6, 6, 6, 6)
+    UI.addCorner(wrapper, 10)
+    UI.addStroke(wrapper, THEME.line, 1, 0.45)
+    UI.addPadding(wrapper, 6, 6, 6, 6)
 
     local layout = Instance.new("UIListLayout")
     layout.SortOrder = Enum.SortOrder.LayoutOrder
@@ -3324,25 +3534,25 @@ local function createMultiSelectDropdown(parent, labelText, description, order, 
 
     local header = Instance.new("TextButton")
     header.Name = "Header"
-    header.Size = UDim2.new(1, 0, 0, 44)
+    header.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 48 or 44)
     header.BackgroundColor3 = THEME.card
     header.BorderSizePixel = 0
     header.AutoButtonColor = false
     header.Text = ""
     header.LayoutOrder = 1
     header.Parent = wrapper
-    addCorner(header, 8)
+    UI.addCorner(header, 8)
 
-    local title = makeText(header, labelText, 13, THEME.text, Enum.Font.GothamBold)
+    local title = UI.makeText(header, labelText, 13, THEME.text, Enum.Font.GothamBold)
     title.Position = UDim2.fromOffset(10, 3)
     title.Size = UDim2.new(1, -46, 0, 19)
 
-    local summary = makeText(header, description or "None selected", 9, THEME.muted, Enum.Font.GothamBold)
+    local summary = UI.makeText(header, description or "None selected", 9, THEME.muted, Enum.Font.GothamBold)
     summary.Position = UDim2.fromOffset(10, 22)
     summary.Size = UDim2.new(1, -46, 0, 16)
     summary.TextTruncate = Enum.TextTruncate.AtEnd
 
-    local arrow = makeText(header, "⌄", 18, THEME.muted, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+    local arrow = UI.makeText(header, "⌄", 18, THEME.muted, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
     arrow.AnchorPoint = Vector2.new(1, 0.5)
     arrow.Position = UDim2.new(1, -6, 0.5, 0)
     arrow.Size = UDim2.fromOffset(28, 28)
@@ -3407,18 +3617,18 @@ local function createMultiSelectDropdown(parent, labelText, description, order, 
         for index, rarityName in ipairs(currentOptions) do
             local option = Instance.new("TextButton")
             option.Name = "Option_" .. tostring(index)
-            option.Size = UDim2.new(1, 0, 0, 34)
+            option.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 40 or 34)
             option.BackgroundColor3 = THEME.card
             option.BorderSizePixel = 0
             option.AutoButtonColor = false
             option.Text = ""
             option.LayoutOrder = index
             option.Parent = options
-            addCorner(option, 9)
+            UI.addCorner(option, 9)
 
             local check = Instance.new("TextLabel")
-            check.Size = UDim2.fromOffset(22, 22)
-            check.Position = UDim2.fromOffset(6, 6)
+            check.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(24, 24) or UDim2.fromOffset(22, 22)
+            check.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(8, 8) or UDim2.fromOffset(6, 6)
             check.BackgroundColor3 = Color3.fromRGB(54, 58, 76)
             check.BorderSizePixel = 0
             check.Text = ""
@@ -3426,10 +3636,10 @@ local function createMultiSelectDropdown(parent, labelText, description, order, 
             check.TextSize = 13
             check.Font = Enum.Font.GothamBold
             check.Parent = option
-            addCorner(check, 6)
+            UI.addCorner(check, 6)
 
-            local label = makeText(option, rarityName, 11, THEME.text, Enum.Font.GothamBold)
-            label.Position = UDim2.fromOffset(36, 0)
+            local label = UI.makeText(option, rarityName, 11, THEME.text, Enum.Font.GothamBold)
+            label.Position = UDim2.fromOffset(IS_TOUCH_DEVICE and 42 or 36, 0)
             label.Size = UDim2.new(1, -42, 1, 0)
 
             renderOption(option, check, rarityName)
@@ -3471,13 +3681,13 @@ local function createMultiSelectDropdown(parent, labelText, description, order, 
     }
 end
 
-local function launchMainGui()
+function UI.launchMainGui()
     if mainGuiStarted then
         return
     end
     mainGuiStarted = true
 
-    local uiParent = getUiParent()
+    local uiParent = UI.getUiParent()
 
     for _, oldName in ipairs({
         "VNDT",
@@ -3500,12 +3710,12 @@ local function launchMainGui()
     gui.DisplayOrder = 999
     gui.Parent = uiParent
 
-    local mainWidth, mainHeight = getResponsiveSize()
+    local mainWidth, mainHeight = UI.getResponsiveSize()
     local expandedSize = UDim2.fromOffset(mainWidth, mainHeight)
 
     -- Compact minimized bar dimensions.
-    local MINIMIZED_WIDTH = 150
-    local MINIMIZED_HEIGHT = 42
+    local MINIMIZED_WIDTH = IS_TOUCH_DEVICE and 138 or 150
+    local MINIMIZED_HEIGHT = IS_TOUCH_DEVICE and 40 or 42
 
     local shadow = Instance.new("Frame")
     shadow.Name = "Shadow"
@@ -3516,7 +3726,7 @@ local function launchMainGui()
     shadow.BackgroundTransparency = 0.45
     shadow.BorderSizePixel = 0
     shadow.Parent = gui
-    addCorner(shadow, 16)
+    UI.addCorner(shadow, 16)
 
     local mainFrame = Instance.new("Frame")
     mainFrame.Name = "MainFrame"
@@ -3528,8 +3738,8 @@ local function launchMainGui()
     mainFrame.ClipsDescendants = true
     mainFrame.Active = true
     mainFrame.Parent = gui
-    addCorner(mainFrame, 14)
-    addStroke(mainFrame, Color3.fromRGB(82, 87, 116), 1, 0.35)
+    UI.addCorner(mainFrame, 14)
+    UI.addStroke(mainFrame, Color3.fromRGB(82, 87, 116), 1, 0.35)
 
     local gradient = Instance.new("UIGradient")
     gradient.Color = ColorSequence.new({
@@ -3552,7 +3762,7 @@ local function launchMainGui()
     brandDot.BackgroundColor3 = THEME.accent
     brandDot.BorderSizePixel = 0
     brandDot.Parent = header
-    addCorner(brandDot, 11)
+    UI.addCorner(brandDot, 11)
 
     local brandGradient = Instance.new("UIGradient")
     brandGradient.Color = ColorSequence.new({
@@ -3562,14 +3772,14 @@ local function launchMainGui()
     brandGradient.Rotation = 35
     brandGradient.Parent = brandDot
 
-    local brandLetter = makeText(brandDot, "V", 15, THEME.text, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+    local brandLetter = UI.makeText(brandDot, "V", 15, THEME.text, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
     brandLetter.Size = UDim2.fromScale(1, 1)
 
-    local title = makeText(header, GUI_TITLE, 15, THEME.text, Enum.Font.GothamBold)
+    local title = UI.makeText(header, GUI_TITLE, 15, THEME.text, Enum.Font.GothamBold)
     title.Position = UDim2.fromOffset(58, 10)
     title.Size = UDim2.new(1, -94, 0, 21)
 
-    local subtitle = makeText(header, "Automation Hub", 9, THEME.muted, Enum.Font.GothamBold)
+    local subtitle = UI.makeText(header, "Automation Hub", 9, THEME.muted, Enum.Font.GothamBold)
     subtitle.Position = UDim2.fromOffset(58, 32)
     subtitle.Size = UDim2.new(1, -94, 0, 15)
 
@@ -3578,7 +3788,7 @@ local function launchMainGui()
     minimize.AutoButtonColor = false
     minimize.AnchorPoint = Vector2.new(1, 0)
     minimize.Position = UDim2.new(1, -9, 0, 9)
-    minimize.Size = UDim2.fromOffset(32, 28)
+    minimize.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(38, 34) or UDim2.fromOffset(32, 28)
     minimize.BackgroundColor3 = THEME.surface2
     minimize.Text = "—"
     minimize.TextColor3 = THEME.text
@@ -3586,8 +3796,8 @@ local function launchMainGui()
     minimize.Font = Enum.Font.GothamBold
     minimize.BorderSizePixel = 0
     minimize.Parent = header
-    addCorner(minimize, 8)
-    addStroke(minimize, THEME.line, 1, 0.4)
+    UI.addCorner(minimize, 8)
+    UI.addStroke(minimize, THEME.line, 1, 0.4)
 
     local divider = Instance.new("Frame")
     divider.Position = UDim2.new(0, 10, 0, 47)
@@ -3603,14 +3813,16 @@ local function launchMainGui()
     content.Size = UDim2.new(1, -16, 1, -63)
     content.BackgroundTransparency = 1
     content.BorderSizePixel = 0
-    content.ScrollBarThickness = 2
+    content.ScrollBarThickness = IS_TOUCH_DEVICE and 4 or 2
     content.ScrollBarImageColor3 = THEME.accent
     content.ScrollingDirection = Enum.ScrollingDirection.Y
+    content.Active = true
+    content.ScrollingEnabled = true
     content.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
     content.AutomaticCanvasSize = Enum.AutomaticSize.Y
     content.CanvasSize = UDim2.new(0, 0, 0, 0)
     content.Parent = mainFrame
-    addPadding(content, 1, 3, 1, 5)
+    UI.addPadding(content, 1, 3, 1, 5)
 
     local contentLayout = Instance.new("UIListLayout")
     contentLayout.SortOrder = Enum.SortOrder.LayoutOrder
@@ -3624,8 +3836,8 @@ local function launchMainGui()
     hero.BorderSizePixel = 0
     hero.LayoutOrder = 1
     hero.Parent = content
-    addCorner(hero, 10)
-    addStroke(hero, THEME.line, 1, 0.45)
+    UI.addCorner(hero, 10)
+    UI.addStroke(hero, THEME.line, 1, 0.45)
 
     local heroGradient = Instance.new("UIGradient")
     heroGradient.Color = ColorSequence.new({
@@ -3635,16 +3847,16 @@ local function launchMainGui()
     heroGradient.Rotation = 20
     heroGradient.Parent = hero
 
-    local statusTitle = makeText(hero, "VNDT READY", 13, THEME.text, Enum.Font.GothamBold)
+    local statusTitle = UI.makeText(hero, "VNDT READY", 13, THEME.text, Enum.Font.GothamBold)
     statusTitle.Position = UDim2.fromOffset(10, 8)
     statusTitle.Size = UDim2.new(1, -92, 0, 19)
 
-    local statusSub = makeText(hero, "Auto Steal: Idle", 10, THEME.muted, Enum.Font.GothamBold)
+    local statusSub = UI.makeText(hero, "Auto Steal: Idle", 10, THEME.muted, Enum.Font.GothamBold)
     statusSub.Position = UDim2.fromOffset(10, 29)
     statusSub.Size = UDim2.new(1, -20, 0, 17)
     statusSub.TextTruncate = Enum.TextTruncate.AtEnd
 
-    local rarityStatus = makeText(hero, "Rarities: Scanning…", 9, THEME.muted, Enum.Font.GothamBold)
+    local rarityStatus = UI.makeText(hero, "Rarities: Scanning…", 9, THEME.muted, Enum.Font.GothamBold)
     rarityStatus.Position = UDim2.fromOffset(10, 49)
     rarityStatus.Size = UDim2.new(1, -20, 0, 16)
     rarityStatus.TextTruncate = Enum.TextTruncate.AtEnd
@@ -3694,12 +3906,12 @@ local function launchMainGui()
     badge.Font = Enum.Font.GothamBold
     badge.BorderSizePixel = 0
     badge.Parent = hero
-    addCorner(badge, 7)
-    addStroke(badge, THEME.success, 1, 0.62)
+    UI.addCorner(badge, 7)
+    UI.addStroke(badge, THEME.success, 1, 0.62)
 
-    createSectionLabel(content, "Auto Steal", 2)
+    UI.createSectionLabel(content, "Auto Steal", 2)
 
-    createToggleRow(
+    UI.createToggleRow(
         content,
         "Auto Steal",
         "Targets selected rarities • instant next-target scan",
@@ -3722,7 +3934,7 @@ local function launchMainGui()
         end
     )
 
-    local stealRarityDropdown = createMultiSelectDropdown(
+    local stealRarityDropdown = UI.createMultiSelectDropdown(
         content,
         "Steal Rarities",
         "Select one or more egg rarities",
@@ -3736,7 +3948,7 @@ local function launchMainGui()
         end
     )
 
-    createToggleRow(
+    UI.createToggleRow(
         content,
         "Character Protection",
         "Anti-push + anti-ragdoll + anti-stun + godmode • break-safe",
@@ -3757,9 +3969,9 @@ local function launchMainGui()
         end
     )
 
-    createSectionLabel(content, "Utilities", 6)
+    UI.createSectionLabel(content, "Utilities", 6)
 
-    createToggleRow(
+    UI.createToggleRow(
         content,
         "Anti AFK",
         "Prevents Roblox idle disconnects",
@@ -3768,14 +3980,21 @@ local function launchMainGui()
         function(enabled)
             antiAfkEnabled = enabled
             queueSaveConfig()
+
+            if enabled then
+                startAntiAfk()
+            else
+                stopAntiAfk()
+            end
+
             setStatus(
-                enabled and "Anti AFK enabled" or "Anti AFK disabled",
+                enabled and "Anti AFK enabled • active keep-alive" or "Anti AFK disabled",
                 enabled and "success" or "warning"
             )
         end
     )
 
-    createToggleRow(
+    UI.createToggleRow(
         content,
         "FPS Booster",
         "Low graphics • removes effects/textures • FPS counter",
@@ -3792,7 +4011,7 @@ local function launchMainGui()
         end
     )
 
-    createActionRow(
+    UI.createActionRow(
         content,
         "Save Config",
         "Changes auto-save • tap to save now",
@@ -3808,7 +4027,7 @@ local function launchMainGui()
         end
     )
 
-    createToggleRow(
+    UI.createToggleRow(
         content,
         "Auto Buy Pickaxe",
         "Buys and equips the best affordable tier",
@@ -3823,7 +4042,7 @@ local function launchMainGui()
         end
     )
 
-    createToggleRow(
+    UI.createToggleRow(
         content,
         "Upgrade Plot",
         "Continuously requests the next plot upgrade",
@@ -3838,9 +4057,9 @@ local function launchMainGui()
         end
     )
 
-    createSectionLabel(content, "Auto Sell", 12)
+    UI.createSectionLabel(content, "Auto Sell", 12)
 
-    createToggleRow(
+    UI.createToggleRow(
         content,
         "Auto Sell",
         "Sells only the rarities selected below",
@@ -3855,7 +4074,7 @@ local function launchMainGui()
         end
     )
 
-    local sellRarityDropdown = createMultiSelectDropdown(
+    local sellRarityDropdown = UI.createMultiSelectDropdown(
         content,
         "Sell Rarities",
         "Selected rarities will be sold automatically",
@@ -3884,9 +4103,11 @@ local function launchMainGui()
     footer.LayoutOrder = 15
     footer.Parent = content
 
-    local footerText = makeText(
+    local footerText = UI.makeText(
         footer,
-        "VNDT  •  Config auto-saves  •  FPS toggle",
+        IS_TOUCH_DEVICE
+            and "VNDT  •  Mobile mode  •  Config auto-saves"
+            or "VNDT  •  Config auto-saves  •  FPS toggle",
         9,
         THEME.muted,
         Enum.Font.GothamBold,
@@ -3894,7 +4115,7 @@ local function launchMainGui()
     )
     footerText.Size = UDim2.fromScale(1, 1)
 
-    makeTouchDraggable(header, mainFrame)
+    UI.makeTouchDraggable(header, mainFrame)
 
     local minimized = false
 
@@ -3929,9 +4150,9 @@ local function launchMainGui()
             minimize.Text = "+"
             minimize.Position = UDim2.new(1, -7, 0.5, 0)
             minimize.AnchorPoint = Vector2.new(1, 0.5)
-            minimize.Size = UDim2.fromOffset(28, 26)
+            minimize.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(34, 30) or UDim2.fromOffset(28, 26)
 
-            tween(mainFrame, 0.16, {
+            UI.tween(mainFrame, 0.16, {
                 Size = UDim2.fromOffset(MINIMIZED_WIDTH, MINIMIZED_HEIGHT)
             })
         else
@@ -3947,16 +4168,16 @@ local function launchMainGui()
             minimize.Text = "—"
             minimize.AnchorPoint = Vector2.new(1, 0)
             minimize.Position = UDim2.new(1, -9, 0, 9)
-            minimize.Size = UDim2.fromOffset(32, 28)
+            minimize.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(38, 34) or UDim2.fromOffset(32, 28)
 
-            tween(mainFrame, 0.16, {Size = expandedSize})
+            UI.tween(mainFrame, 0.16, {Size = expandedSize})
         end
     end)
 
     local camera = Workspace.CurrentCamera
     if camera then
         camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
-            local newWidth, newHeight = getResponsiveSize()
+            local newWidth, newHeight = UI.getResponsiveSize()
             mainWidth = newWidth
             mainHeight = newHeight
             expandedSize = UDim2.fromOffset(mainWidth, mainHeight)
@@ -3995,6 +4216,10 @@ local function launchMainGui()
             setFpsBoosterEnabled(true)
         end
 
+        if antiAfkEnabled then
+            startAntiAfk()
+        end
+
         task.defer(function()
             setStatus("Saved config auto-loaded", "success")
         end)
@@ -4004,4 +4229,4 @@ local function launchMainGui()
 end
 
 --// Keyless entry point
-launchMainGui()
+UI.launchMainGui()
