@@ -12,8 +12,6 @@ export default function handler(req, res) {
 
   const ua = String(req.headers["user-agent"] || "").toLowerCase();
 
-  // Normal browsers and common link-preview crawlers get the YouTube page.
-  // This creates the YouTube-style preview when the loader URL is shared.
   const isBrowserOrPreview =
     ua.includes("mozilla") ||
     ua.includes("discordbot") ||
@@ -29,7 +27,7 @@ export default function handler(req, res) {
     return;
   }
 
-  const source = process.env.LUA_SOURCE;
+  const source = process.env.LUA_SOURCE_NEW || process.env.LUA_SOURCE;
 
   if (!source) {
     res.status(503).send('warn("VNDT loader source is not configured.")');
