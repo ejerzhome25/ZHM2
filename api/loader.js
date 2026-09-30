@@ -3,7 +3,7 @@
 // Browser -> YouTube
 // Script HTTP clients -> Lua source
 
-const YOUTUBE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+const YOUTUBE_URL = "https://m.youtube.com/watch?v=dQw4w9WgXcQ";
 const THUMBNAIL = "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg";
 
 export default function handler(req, res) {
