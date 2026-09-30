@@ -14,9 +14,11 @@ export default function handler(req, res) {
     return;
   }
 
-  const banner = "-- YouTube: https://www.youtube.com/watch?v=dQw4w9WgXcQ\n";
+  const banner =
+    "--[[ VNDT YOUTUBE: https://www.youtube.com/watch?v=dQw4w9WgXcQ ]]\n";
 
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  res.setHeader("Cache-Control", "no-store, max-age=0");
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.setHeader("Pragma", "no-cache");
   res.status(200).send(banner + source);
 }
