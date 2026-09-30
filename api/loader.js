@@ -1,5 +1,6 @@
 // VNDT / ZHM hosted loader endpoint
 // YouTube: https://www.youtube.com/watch?v=dQw4w9WgXcQ
+
 export default function handler(req, res) {
   if (req.method !== "GET") {
     res.status(405).send("Method Not Allowed");
@@ -13,7 +14,9 @@ export default function handler(req, res) {
     return;
   }
 
+  const banner = "-- YouTube: https://www.youtube.com/watch?v=dQw4w9WgXcQ\n";
+
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.setHeader("Cache-Control", "no-store, max-age=0");
-  res.status(200).send(source);
+  res.status(200).send(banner + source);
 }
