@@ -1,6 +1,7 @@
 // ZHM loader
-// HTML clients (Discord/browser) -> preview page
-// Non-HTML clients (Roblox/executors) -> Lua source
+// Discord crawler -> preview metadata
+// Real browser navigation -> YouTube
+// Roblox/executor HTTP -> Lua source
 
 const YOUTUBE_URL = "https://m.youtube.com/watch?v=dQw4w9WgXcQ";
 const THUMBNAIL = "https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg";
@@ -12,7 +13,6 @@ function previewHtml() {
   <meta charset="utf-8">
   <title>Rick Astley - Never Gonna Give You Up</title>
   <link rel="canonical" href="${YOUTUBE_URL}">
-
   <meta property="og:site_name" content="YouTube">
   <meta property="og:type" content="website">
   <meta property="og:title" content="Rick Astley - Never Gonna Give You Up">
@@ -22,15 +22,11 @@ function previewHtml() {
   <meta property="og:image:secure_url" content="${THUMBNAIL}">
   <meta property="og:image:width" content="1280">
   <meta property="og:image:height" content="720">
-
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Rick Astley - Never Gonna Give You Up">
   <meta name="twitter:description" content="Watch on YouTube">
   <meta name="twitter:image" content="${THUMBNAIL}">
-
   <meta name="theme-color" content="#ff0000">
-  <meta http-equiv="refresh" content="0;url=${YOUTUBE_URL}">
-  <script>window.location.replace(${JSON.stringify(YOUTUBE_URL)});</script>
 </head>
 <body>
   <a href="${YOUTUBE_URL}">Watch on YouTube</a>
@@ -40,25 +36,25 @@ function previewHtml() {
 
 export default function handler(req, res) {
   const ua = String(req.headers["user-agent"] || "").toLowerCase();
-  const accept = String(req.headers["accept"] || "").toLowerCase();
+  const fetchDest = String(req.headers["sec-fetch-dest"] || "").toLowerCase();
+  const fetchMode = String(req.headers["sec-fetch-mode"] || "").toLowerCase();
 
-  const wantsHtml =
-    accept.includes("text/html") ||
+  const isDiscord =
     ua.includes("discordbot") ||
-    ua.includes("discord") ||
-    ua.includes("mozilla") ||
-    ua.includes("twitterbot") ||
-    ua.includes("facebookexternalhit") ||
-    ua.includes("telegrambot") ||
-    ua.includes("whatsapp") ||
-    ua.includes("slackbot") ||
-    ua.includes("embedly") ||
-    ua.includes("iframely");
+    ua.includes("discord");
+
+  // Real browser page navigations normally send Sec-Fetch-* navigation headers.
+  // Do NOT use generic Mozilla/Accept checks because some mobile executors mimic them.
+  const isBrowserNavigation =
+    fetchDest === "document" ||
+    fetchMode === "navigate";
 
   if (req.method === "HEAD") {
     res.setHeader(
       "Content-Type",
-      wantsHtml ? "text/html; charset=utf-8" : "text/plain; charset=utf-8"
+      (isDiscord || isBrowserNavigation)
+        ? "text/html; charset=utf-8"
+        : "text/plain; charset=utf-8"
     );
     res.setHeader("Cache-Control", "no-store, max-age=0");
     res.status(200).end();
@@ -70,10 +66,16 @@ export default function handler(req, res) {
     return;
   }
 
-  if (wantsHtml) {
+  if (isDiscord) {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Cache-Control", "no-store, max-age=0");
     res.status(200).send(previewHtml());
+    return;
+  }
+
+  if (isBrowserNavigation) {
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    res.redirect(302, YOUTUBE_URL);
     return;
   }
 
