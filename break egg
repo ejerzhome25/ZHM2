@@ -54,6 +54,8 @@
       * RAPID HIT: 4 zero-delay EggHitRequest calls per Heartbeat
       * OPTIMIZED: expensive HP/break scans throttled while hit loop stays Heartbeat-fast
       * REGISTER FIX: scoped FPS + Anti-AFK internals to stay below Luau 200-local limit
+      * CONFLICT FIX: strict movement ownership prevents Auto Place Eggs and Auto Steal from teleporting/equipping at the same time
+      * STRICT PRIORITY STOP: Auto Hatch / Auto Place immediately interrupt the current Auto Steal cycle, then Auto Steal resumes afterward
 ]]
 
 --// Services
@@ -2230,9 +2232,12 @@ PetEggAutomation = (function()
     end
 
     local function waitForStealToBeIdle()
+        -- placementRequested is already TRUE before this runs. The active
+        -- Auto Steal cycle sees that priority flag and aborts immediately.
+        -- We only wait for its movement lock to be released before placing.
         while placementRequested and stealBusyCheck() do
-            report("Eggs queued • finishing current Auto Steal cycle first", "warning")
-            task.wait(0.08)
+            report("Auto Place priority • stopping current Auto Steal", "warning")
+            task.wait(0.03)
         end
         return placementRequested
     end
@@ -2791,6 +2796,10 @@ local rarityStatusSink = nil
 local rarityUiRefreshSink = nil
 local autoStealManagerRunning = false
 local autoStealReturning = false
+-- Strict movement ownership for Auto Steal. This becomes true BEFORE a new
+-- steal cycle can teleport/scan/attack, so Auto Place Eggs can never start
+-- in the small window before targetLockActive is enabled.
+local autoStealCycleBusy = false
 local targetLockActive = false
 local targetLockCFrame = nil
 local protectionBaseline = nil
@@ -2804,7 +2813,10 @@ local protectionLastDeepScan = -math.huge
 
 if PetEggAutomation and PetEggAutomation.SetStealBusyCheck then
     PetEggAutomation.SetStealBusyCheck(function()
-        return targetLockActive or autoStealReturning
+        -- Treat the ENTIRE steal cycle as busy, not only the target-lock/return
+        -- phases. This prevents Auto Place Eggs from teleporting/equipping an
+        -- egg while Auto Steal is selecting a target or beginning a teleport.
+        return autoStealCycleBusy or targetLockActive or autoStealReturning
     end)
 end
 local POST_TELEPORT_SETTLE = 0.03
@@ -4377,6 +4389,32 @@ local function findTreadmillBoard()
 end
 
 
+--// Strict higher-priority interruption for Auto Steal
+-- Auto Hatch > Auto Place Eggs > Auto Steal.
+-- When either higher-priority task is requested, the current steal cycle yields
+-- immediately instead of finishing the egg first. The Auto Steal toggle remains
+-- ON, so the manager automatically resumes after the priority task completes.
+local function autoStealPriorityRequested()
+    return PetEggAutomation
+        and PetEggAutomation.ShouldBlockSteal
+        and PetEggAutomation.ShouldBlockSteal() == true
+end
+
+local function stopCurrentStealForPriority()
+    if not autoStealPriorityRequested() then
+        return false
+    end
+
+    clearTargetLock()
+
+    local reason = PetEggAutomation.GetBlockReason
+        and PetEggAutomation.GetBlockReason()
+        or "Egg automation"
+
+    setStatus("Stopped current Auto Steal • " .. tostring(reason) .. " has priority", "warning")
+    return true
+end
+
 --// Claim-safe pickup
 local function claimEggBeforeReturn(egg, prompt, rarity, pickupPosition)
     setStatus(
@@ -4392,7 +4430,7 @@ local function claimEggBeforeReturn(egg, prompt, rarity, pickupPosition)
     -- The original egg disappearing means it BROKE, not that it was stolen.
     -- Therefore, only the pickup prompt disappearing / disabling after we fire it
     -- counts as a confirmed claim.
-    while autoStealEnabled do
+    while autoStealEnabled and not autoStealPriorityRequested() do
         if activePrompt and activePrompt.Parent then
             local enabled = true
             pcall(function()
@@ -4434,8 +4472,12 @@ local function returnFromSteal()
     clearTargetLock()
 
     if autoStealReturning then
-        while autoStealReturning and autoStealEnabled do
+        while autoStealReturning and autoStealEnabled and not autoStealPriorityRequested() do
             RunService.Heartbeat:Wait()
+        end
+        if autoStealPriorityRequested() then
+            stopCurrentStealForPriority()
+            return false
         end
         return not autoStealReturning
     end
@@ -4462,7 +4504,7 @@ local function returnFromSteal()
     -- STRICT RETURN BARRIER:
     -- Do not release the cycle based on a timeout. A new egg cannot be scanned
     -- until the character is actually back at the return destination.
-    while autoStealEnabled do
+    while autoStealEnabled and not autoStealPriorityRequested() do
         local character = LocalPlayer.Character
         local root = character and character:FindFirstChild("HumanoidRootPart")
 
@@ -4513,6 +4555,9 @@ local function returnFromSteal()
         RunService.Heartbeat:Wait()
     end
 
+    if autoStealPriorityRequested() then
+        stopCurrentStealForPriority()
+    end
     return finish(false)
 end
 
@@ -4620,12 +4665,16 @@ local function runAutoStealCycle()
         return false
     end
 
+    if stopCurrentStealForPriority() then
+        return false
+    end
+
     -- Never scan another egg while the previous return is still active.
-    while autoStealReturning and autoStealEnabled do
+    while autoStealReturning and autoStealEnabled and not autoStealPriorityRequested() do
         RunService.Heartbeat:Wait()
     end
 
-    if not autoStealEnabled then
+    if not autoStealEnabled or stopCurrentStealForPriority() then
         return false
     end
 
@@ -4659,6 +4708,10 @@ local function runAutoStealCycle()
         )
     end
 
+    if stopCurrentStealForPriority() then
+        return false
+    end
+
     if not teleportCharacter(eggCF) then
         clearTargetLock()
         setStatus("Teleport failed", "error")
@@ -4672,6 +4725,10 @@ local function runAutoStealCycle()
 
     task.wait(POST_TELEPORT_SETTLE)
 
+    if stopCurrentStealForPriority() then
+        return false
+    end
+
     local originalEggPosition = eggCF.Position
     local prompt = nil
     local lastDetailUpdate = 0
@@ -4681,7 +4738,7 @@ local function runAutoStealCycle()
     -- IMPORTANT:
     -- Rapid-hit burst runs every Heartbeat. Only the expensive descendant/HP
     -- break scan is throttled, keeping FireServer bursts fast while reducing CPU use.
-    while autoStealEnabled do
+    while autoStealEnabled and not autoStealPriorityRequested() do
         local broken = false
         local targetPrompt = nil
 
@@ -4704,7 +4761,7 @@ local function runAutoStealCycle()
 
             -- The broken egg may be replaced by a new pickup model/prompt.
             local promptDeadline = tick() + 1.5
-            while autoStealEnabled and tick() < promptDeadline and not prompt do
+            while autoStealEnabled and not autoStealPriorityRequested() and tick() < promptDeadline and not prompt do
                 prompt = findPickupPromptNearPosition(originalEggPosition, 20)
                 if not prompt then
                     task.wait(IS_TOUCH_DEVICE and 0.10 or 0.07)
@@ -4749,7 +4806,7 @@ local function runAutoStealCycle()
         end
     end
 
-    if not autoStealEnabled then
+    if not autoStealEnabled or stopCurrentStealForPriority() then
         clearTargetLock()
         return false
     end
@@ -4760,12 +4817,12 @@ local function runAutoStealCycle()
         setStatus("Egg broken • waiting 5 seconds before claim", "success")
 
         local waitUntil = tick() + POST_BREAK_WAIT
-        while autoStealEnabled and tick() < waitUntil do
+        while autoStealEnabled and not autoStealPriorityRequested() and tick() < waitUntil do
             RunService.Heartbeat:Wait()
         end
     end
 
-    if not autoStealEnabled then
+    if not autoStealEnabled or stopCurrentStealForPriority() then
         clearTargetLock()
         return false
     end
@@ -4773,7 +4830,7 @@ local function runAutoStealCycle()
     -- STRICT PICKUP-PROMPT BARRIER:
     -- Do not give up and do not find another egg just because the pickup prompt
     -- has not spawned yet.
-    while autoStealEnabled and not prompt do
+    while autoStealEnabled and not autoStealPriorityRequested() and not prompt do
         prompt = findPickupPromptNearPosition(originalEggPosition, 20)
 
         if not prompt then
@@ -4782,7 +4839,7 @@ local function runAutoStealCycle()
         end
     end
 
-    if not autoStealEnabled then
+    if not autoStealEnabled or stopCurrentStealForPriority() then
         clearTargetLock()
         return false
     end
@@ -4799,13 +4856,13 @@ local function runAutoStealCycle()
         originalEggPosition
     )
 
-    if not autoStealEnabled then
+    if not autoStealEnabled or stopCurrentStealForPriority() then
         clearTargetLock()
         return false
     end
 
     -- A failed/unconfirmed steal is not allowed to advance to another egg.
-    while autoStealEnabled and not claimed do
+    while autoStealEnabled and not autoStealPriorityRequested() and not claimed do
         prompt = findPickupPromptNearPosition(originalEggPosition, 20)
 
         if prompt then
@@ -4821,7 +4878,7 @@ local function runAutoStealCycle()
         end
     end
 
-    if not autoStealEnabled then
+    if not autoStealEnabled or stopCurrentStealForPriority() then
         clearTargetLock()
         return false
     end
@@ -4829,16 +4886,25 @@ local function runAutoStealCycle()
     -- Release egg protection only after steal confirmation.
     clearTargetLock()
 
+    if stopCurrentStealForPriority() then
+        return false
+    end
+
     -- STRICT RETURN BARRIER:
     -- This call does not finish until TreadmillBoard arrival is confirmed.
     local returned = returnFromSteal()
 
     -- The manager cannot start another cycle until this function returns.
-    while autoStealEnabled and not returned do
+    while autoStealEnabled and not autoStealPriorityRequested() and not returned do
         returned = returnFromSteal()
         if not returned then
             RunService.Heartbeat:Wait()
         end
+    end
+
+    if autoStealPriorityRequested() then
+        stopCurrentStealForPriority()
+        return false
     end
 
     return returned == true
@@ -4864,22 +4930,36 @@ local function runAutoStealManager()
                 break
             end
 
+            local resumedFromPriorityTask = false
             if PetEggAutomation and PetEggAutomation.ShouldBlockSteal and PetEggAutomation.ShouldBlockSteal() then
                 local reason = PetEggAutomation.GetBlockReason and PetEggAutomation.GetBlockReason() or "Egg automation"
                 setStatus("Paused • " .. tostring(reason) .. " has priority", "warning")
                 while autoStealEnabled and PetEggAutomation.ShouldBlockSteal() do
                     task.wait(IS_TOUCH_DEVICE and 0.10 or 0.07)
                 end
-                if autoStealEnabled then
-                    setStatus("Higher-priority egg task finished • resuming Auto Steal", "working")
-                end
+                resumedFromPriorityTask = autoStealEnabled
             end
 
             if not autoStealEnabled then
                 break
             end
 
+            -- ATOMIC OWNERSHIP HANDOFF:
+            -- There is no yield between the final priority check above and this
+            -- assignment. In Luau's cooperative scheduler, whichever task gets
+            -- here first owns movement:
+            --   * Auto Place first -> placementRequested blocks this cycle.
+            --   * Auto Steal first -> autoStealCycleBusy makes Auto Place wait.
+            -- This removes the TP/equip conflict between the two automations.
+            autoStealCycleBusy = true
+
+            if resumedFromPriorityTask then
+                setStatus("Higher-priority egg task finished • resuming Auto Steal", "working")
+            end
+
             local ok, completedOrError = pcall(runAutoStealCycle)
+            autoStealCycleBusy = false
+
             if not ok then
                 setStatus("Error: " .. tostring(completedOrError), "error")
             end
@@ -4904,6 +4984,9 @@ local function runAutoStealManager()
             end
         end
 
+        -- Always release ownership when the manager exits so Auto Place Eggs
+        -- can immediately continue if Auto Steal was toggled off mid-cycle.
+        autoStealCycleBusy = false
         autoStealManagerRunning = false
         autoStealReturnCFrame = nil
         clearTargetLock()
