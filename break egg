@@ -8,9 +8,11 @@
       * Added a premium responsive dark UI
       * Added touch-friendly controls and scrolling for mobile
       * Added mouse + touch dragging
-      * MOBILE SMALLER WINDOW: reduced only the outer phone panel size; row sizing is unchanged
+      * MOBILE BALANCED UI: compact outer panel with normal readable control scale
+      * Row/button/dropdown definitions are NOT individually compressed again
       * ALL-EDGE DRAG: drag from top/header, left edge, right edge, or bottom edge
       * PERFORMANCE: cached ProximityPrompts + plot lookup to avoid repeated full Workspace scans
+      * PERFORMANCE: mobile UI drag updates throttled + background scanners run at lighter mobile intervals
       * MOBILE FREE DRAG: window can move horizontally and vertically while staying on-screen
       * Added minimize / restore support
       * Auto Steal now targets selected live-scanned rarities
@@ -89,6 +91,10 @@ end
 local IS_TOUCH_DEVICE = UserInputService.TouchEnabled == true
 local HAS_KEYBOARD = UserInputService.KeyboardEnabled == true
 local IS_MOBILE = IS_TOUCH_DEVICE and not HAS_KEYBOARD
+
+-- Keep controls at their normal readable size on mobile.
+-- Only the outer VNDT window is compact; rows/buttons/dropdowns are not globally shrunk.
+local MOBILE_UI_SCALE = 1
 
 --// Recovered game constants
 local GUI_NAME = "VNDT"
@@ -2445,7 +2451,7 @@ PetEggAutomation = (function()
         task.spawn(function()
             -- Cached prompt scan: 0.45s remains responsive but avoids unnecessary
             -- UI/status work every few frames on mobile.
-            while task.wait(0.45) do
+            while task.wait(IS_TOUCH_DEVICE and 0.70 or 0.45) do
                 local hatchCount = publishHatchCount()
                 if autoHatchEnabled and hatchCount > 0 then
                     hatchRequested = true
@@ -2459,7 +2465,7 @@ PetEggAutomation = (function()
         end)
 
         task.spawn(function()
-            while task.wait(SCAN_DELAY) do
+            while task.wait(IS_TOUCH_DEVICE and 0.55 or SCAN_DELAY) do
                 pcall(publishPetOptions)
                 local eggs = publishEggCount()
                 if autoPlaceEggsEnabled and eggs > 0 then
@@ -2475,7 +2481,7 @@ PetEggAutomation = (function()
         end)
 
         task.spawn(function()
-            while task.wait(MERGE_DELAY) do
+            while task.wait(IS_TOUCH_DEVICE and 0.35 or MERGE_DELAY) do
                 if autoMergeEnabled and selectedMergePet and not currentlyMerging then
                     pcall(mergeSelectedOnce)
                 end
@@ -4766,7 +4772,7 @@ local function runAutoStealManager()
                 else
                     -- No target: rescan quickly instead of
                     -- sleeping a whole second or behaving like a one-shot.
-                    task.wait(0.15)
+                    task.wait(IS_TOUCH_DEVICE and 0.22 or 0.15)
                 end
             end
         end
@@ -5045,6 +5051,7 @@ function UI.makeTouchDraggable(handle, frame, reserveRightButton)
             dragInput = nil,
             dragStart = nil,
             startPosition = nil,
+            lastDragUpdate = 0,
         }
         UI._dragStates[frame] = state
 
@@ -5078,6 +5085,14 @@ function UI.makeTouchDraggable(handle, frame, reserveRightButton)
                 end
             elseif input.UserInputType ~= Enum.UserInputType.MouseMovement then
                 return
+            end
+
+            if IS_TOUCH_DEVICE then
+                local now = os.clock()
+                if now - (state.lastDragUpdate or 0) < (1 / 45) then
+                    return
+                end
+                state.lastDragUpdate = now
             end
 
             local delta = input.Position - state.dragStart
@@ -5129,6 +5144,7 @@ function UI.makeTouchDraggable(handle, frame, reserveRightButton)
         state.dragInput = input
         state.dragStart = input.Position
         state.startPosition = frame.Position
+        state.lastDragUpdate = 0
     end)
 end
 
@@ -5166,18 +5182,18 @@ function UI.getResponsiveSize()
     local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
 
     if IS_TOUCH_DEVICE then
-        -- Smaller OUTER window only. Row/button/dropdown dimensions below are
-        -- intentionally untouched; the scrolling viewport simply shows less at once.
-        local width = math.clamp(math.floor(viewport.X * 0.36), 135, 160)
-        local height = math.clamp(math.floor(viewport.Y * 0.27), 155, 205)
+        -- TRUE SMALL MOBILE WINDOW. Internal row/button/dropdown definitions are
+        -- unchanged; this only reduces the visible viewport of the scrolling panel.
+        local width = math.clamp(math.floor(viewport.X * 0.31), 118, 145)
+        local height = math.clamp(math.floor(viewport.Y * 0.22), 138, 180)
 
         if viewport.X > viewport.Y then
-            width = math.clamp(math.floor(viewport.X * 0.18), 140, 170)
-            height = math.clamp(math.floor(viewport.Y * 0.46), 155, 205)
+            width = math.clamp(math.floor(viewport.X * 0.155), 122, 150)
+            height = math.clamp(math.floor(viewport.Y * 0.39), 138, 180)
         end
 
-        width = math.min(width, math.max(130, viewport.X - 12))
-        height = math.min(height, math.max(150, viewport.Y - 18))
+        width = math.min(width, math.max(112, viewport.X - 10))
+        height = math.min(height, math.max(132, viewport.Y - 14))
 
         return width, height
     end
@@ -5694,6 +5710,13 @@ function UI.launchMainGui()
     shadow.Parent = gui
     UI.addCorner(shadow, 16)
 
+    if IS_TOUCH_DEVICE and MOBILE_UI_SCALE ~= 1 then
+        local shadowScale = Instance.new("UIScale")
+        shadowScale.Name = "MobileScale"
+        shadowScale.Scale = MOBILE_UI_SCALE
+        shadowScale.Parent = shadow
+    end
+
     local mainFrame = Instance.new("Frame")
     mainFrame.Name = "MainFrame"
     mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -5706,6 +5729,13 @@ function UI.launchMainGui()
     mainFrame.Parent = gui
     UI.addCorner(mainFrame, 14)
     UI.addStroke(mainFrame, Color3.fromRGB(82, 87, 116), 1, 0.35)
+
+    if IS_TOUCH_DEVICE and MOBILE_UI_SCALE ~= 1 then
+        local mainScale = Instance.new("UIScale")
+        mainScale.Name = "MobileScale"
+        mainScale.Scale = MOBILE_UI_SCALE
+        mainScale.Parent = mainFrame
+    end
 
     local gradient = Instance.new("UIGradient")
     gradient.Color = ColorSequence.new({
