@@ -11,8 +11,11 @@
       * MOBILE BALANCED UI: compact outer panel with normal readable control scale
       * Row/button/dropdown definitions are NOT individually compressed again
       * ALL-EDGE DRAG: drag from top/header, left edge, right edge, or bottom edge
+      * MOBILE NORMAL SIZE: larger balanced mobile panel, still compact
+      * RESIZABLE UI: drag the bottom-right grip to resize the expanded VNDT window
       * PERFORMANCE: cached ProximityPrompts + plot lookup to avoid repeated full Workspace scans
       * PERFORMANCE: mobile UI drag updates throttled + background scanners run at lighter mobile intervals
+      * LOW-LAG PASS: reduced per-frame remote spam, deep character scans, workspace rescans, and random-candidate work
       * MOBILE FREE DRAG: window can move horizontally and vertically while staying on-screen
       * Added minimize / restore support
       * Auto Steal now targets selected live-scanned rarities
@@ -34,6 +37,7 @@
       * FIX: restored exact EggTargeting.Pick resolution before each rapid burst
       * RAPID HIT: 4 zero-delay EggHitRequest calls per Heartbeat
       * OPTIMIZED: expensive HP/break scans throttled while hit loop stays Heartbeat-fast
+      * REGISTER FIX: scoped FPS + Anti-AFK internals to stay below Luau 200-local limit
 ]]
 
 --// Services
@@ -66,9 +70,15 @@ local function ensureProximityPromptCache()
 
     proximityPromptCacheStarted = true
 
-    for _, object in ipairs(Workspace:GetDescendants()) do
+    -- Build the initial cache in small batches so large maps do not freeze mobile.
+    local descendants = Workspace:GetDescendants()
+    local batchSize = UserInputService.TouchEnabled and 320 or 700
+    for index, object in ipairs(descendants) do
         if object:IsA("ProximityPrompt") then
             PROXIMITY_PROMPT_CACHE[object] = true
+        end
+        if index % batchSize == 0 then
+            task.wait()
         end
     end
 
@@ -125,7 +135,11 @@ local ZONES = {
 --====================================================
 
 local fpsBoosterEnabled = false
+local setFpsBoosterEnabled
 
+-- REGISTER FIX: keep FPS implementation locals inside this block so they
+-- are released before the rest of the 6k-line script is compiled.
+do
 local FPS_REMOVE_TEXTURES = true
 local FPS_REMOVE_DECALS = true
 local FPS_REMOVE_PARTICLES = true
@@ -572,7 +586,7 @@ local function enableFpsBooster()
 
     task.spawn(function()
         while fpsBoosterEnabled and myToken == fpsPeriodicToken do
-            task.wait(IS_TOUCH_DEVICE and 15 or 10)
+            task.wait(IS_TOUCH_DEVICE and 25 or 18)
 
             if not fpsBoosterEnabled or myToken ~= fpsPeriodicToken then
                 break
@@ -636,7 +650,7 @@ local function disableFpsBooster()
     restoreRendering()
 end
 
-local function setFpsBoosterEnabled(enabled)
+setFpsBoosterEnabled = function(enabled)
     enabled = enabled == true
     fpsBoosterEnabled = enabled
 
@@ -646,6 +660,7 @@ local function setFpsBoosterEnabled(enabled)
         disableFpsBooster()
     end
 end
+end -- FPS register scope
 
 --// Runtime state
 local autoStealEnabled = false
@@ -873,9 +888,9 @@ PetEggAutomation = (function()
     -- concentrating candidates around the middle. A small edge margin keeps
     -- the character/egg safely inside the plot boundary.
     local PLOT_EDGE_MARGIN = 1.75
-    local RANDOM_CANDIDATE_COUNT = 220
-    local RANDOM_CANDIDATE_TRIES = 1800
-    local MAX_POSITION_ATTEMPTS_PER_EGG = 80
+    local RANDOM_CANDIDATE_COUNT = IS_TOUCH_DEVICE and 80 or 110
+    local RANDOM_CANDIDATE_TRIES = IS_TOUCH_DEVICE and 500 or 750
+    local MAX_POSITION_ATTEMPTS_PER_EGG = IS_TOUCH_DEVICE and 36 or 50
     local placementRandom = Random.new()
 
     local autoMergeEnabled = false
@@ -1809,7 +1824,7 @@ PetEggAutomation = (function()
         -- while still staying inside the full PlotSurface and avoiding eggs.
         if #candidates < 8 then
             local relaxedTries = 0
-            while #candidates < math.min(60, RANDOM_CANDIDATE_COUNT) and relaxedTries < 700 do
+            while #candidates < math.min(40, RANDOM_CANDIDATE_COUNT) and relaxedTries < (IS_TOUCH_DEVICE and 260 or 380) do
                 relaxedTries += 1
 
                 local localX = placementRandom:NextNumber(-safeHalfX, safeHalfX)
@@ -2451,7 +2466,7 @@ PetEggAutomation = (function()
         task.spawn(function()
             -- Cached prompt scan: 0.45s remains responsive but avoids unnecessary
             -- UI/status work every few frames on mobile.
-            while task.wait(IS_TOUCH_DEVICE and 0.70 or 0.45) do
+            while task.wait(IS_TOUCH_DEVICE and 1.00 or 0.70) do
                 local hatchCount = publishHatchCount()
                 if autoHatchEnabled and hatchCount > 0 then
                     hatchRequested = true
@@ -2465,7 +2480,7 @@ PetEggAutomation = (function()
         end)
 
         task.spawn(function()
-            while task.wait(IS_TOUCH_DEVICE and 0.55 or SCAN_DELAY) do
+            while task.wait(IS_TOUCH_DEVICE and 0.90 or 0.65) do
                 pcall(publishPetOptions)
                 local eggs = publishEggCount()
                 if autoPlaceEggsEnabled and eggs > 0 then
@@ -2481,7 +2496,7 @@ PetEggAutomation = (function()
         end)
 
         task.spawn(function()
-            while task.wait(IS_TOUCH_DEVICE and 0.35 or MERGE_DELAY) do
+            while task.wait(IS_TOUCH_DEVICE and 0.60 or 0.40) do
                 if autoMergeEnabled and selectedMergePet and not currentlyMerging then
                     pcall(mergeSelectedOnce)
                 end
@@ -2552,6 +2567,10 @@ pcall(loadConfig)
 highestHpPriorityEnabled = autoStealEnabled
 
 --// Anti AFK
+local startAntiAfk, stopAntiAfk
+
+-- REGISTER FIX: Anti-AFK worker details live only inside this block.
+do
 local antiAfkIdleConnection = nil
 local antiAfkWorkerToken = 0
 local disabledIdleConnections = {}
@@ -2664,7 +2683,7 @@ local function restoreRobloxIdleConnections()
     disabledIdleConnections = {}
 end
 
-local function stopAntiAfk()
+stopAntiAfk = function()
     antiAfkWorkerToken += 1
 
     if antiAfkIdleConnection then
@@ -2677,7 +2696,7 @@ local function stopAntiAfk()
     restoreRobloxIdleConnections()
 end
 
-local function startAntiAfk()
+startAntiAfk = function()
     stopAntiAfk()
 
     if not antiAfkEnabled then
@@ -2712,11 +2731,13 @@ local function startAntiAfk()
                 if not antiAfkEnabled or myToken ~= antiAfkWorkerToken then
                     break
                 end
-                task.wait(5)
+                task.wait(IS_TOUCH_DEVICE and 12 or 8)
             end
         end
     end)
 end
+
+end -- Anti-AFK register scope
 
 -- Apply the saved/default state.
 if antiAfkEnabled then
@@ -2762,6 +2783,8 @@ local protectionAntiPushMover = nil
 local protectionAntiPushRoot = nil
 local protectionForceField = nil
 local protectionConstraintStates = setmetatable({}, {__mode = "k"})
+local protectionWasActive = false
+local protectionLastDeepScan = -math.huge
 
 if PetEggAutomation and PetEggAutomation.SetStealBusyCheck then
     PetEggAutomation.SetStealBusyCheck(function()
@@ -2773,12 +2796,13 @@ local POST_TELEPORT_SETTLE = 0.03
 -- Resolve the correct server-accepted egg once per Heartbeat, then send a
 -- short zero-delay burst to that exact target. Keeping the burst small avoids
 -- the lag/broken targeting caused by huge FireServer spam.
-local ATTACK_INTERVAL = 0
-local RAPID_HIT_BURST = 4
-local RETURN_RETRY_INTERVAL = 0.02
+local ATTACK_INTERVAL = IS_TOUCH_DEVICE and 0.025 or 0.012
+local RAPID_HIT_BURST = IS_TOUCH_DEVICE and 2 or 3
+local RETURN_RETRY_INTERVAL = IS_TOUCH_DEVICE and 0.06 or 0.04
 local POST_BREAK_WAIT = 5.0
 local NEXT_EGG_DELAY = 0.5
 local autoStealReturnCFrame = nil
+local cachedTreadmillBoard = nil
 local moduleCache = {
     EggTargeting = nil,
     PickaxeController = nil,
@@ -2789,12 +2813,24 @@ local eggScanState = {
     lastContainerScan = 0,
     fallback = {},
     lastFallbackScan = 0,
-    fallbackInterval = 1.5,
+    fallbackInterval = IS_TOUCH_DEVICE and 6.0 or 4.0,
 }
+
+local lastAutoStealStatusText = nil
+local lastAutoStealStatusKind = nil
 
 local function setStatus(text, kind)
     local prefix = "Auto Steal: "
     local full = prefix .. tostring(text or "Idle")
+    kind = kind or "idle"
+
+    -- Avoid pushing the same text into the UI over and over from fast loops.
+    if full == lastAutoStealStatusText and kind == lastAutoStealStatusKind then
+        return
+    end
+    lastAutoStealStatusText = full
+    lastAutoStealStatusKind = kind
+
     if statusSink then
         pcall(statusSink, full, kind)
     end
@@ -2932,7 +2968,7 @@ end
 local function runRarityScanner()
     while true do
         pcall(scanRarities)
-        task.wait(5)
+        task.wait(IS_TOUCH_DEVICE and 12 or 8)
     end
 end
 
@@ -3062,9 +3098,13 @@ local function equipTool(toolName)
     local tool = getEquippedOrBackpackTool(toolName)
 
     if humanoid and tool then
-        pcall(function()
-            humanoid:EquipTool(tool)
-        end)
+        -- Re-equipping an already equipped Pickaxe every attack tick is expensive,
+        -- especially on mobile. Only equip when the Tool is still in Backpack.
+        if tool.Parent ~= character then
+            pcall(function()
+                humanoid:EquipTool(tool)
+            end)
+        end
         pcall(function()
             GuiService.SelectedCoreObject = nil
         end)
@@ -3201,7 +3241,7 @@ local function getEggContainers(force)
     local now = tick()
     -- Keep both positive AND negative scan results briefly. This prevents a
     -- full Workspace:GetDescendants() scan every retry when no container exists.
-    if not force and now - eggScanState.lastContainerScan < 3 then
+    if not force and now - eggScanState.lastContainerScan < (IS_TOUCH_DEVICE and 8 or 5) then
         local valid = {}
         for _, container in ipairs(eggScanState.containers) do
             if container and container.Parent then
@@ -3522,6 +3562,26 @@ local function formatHp(hp, maxHp)
     return fmt(hp) .. " HP"
 end
 
+local eggSelectionHpCache = setmetatable({}, {__mode = "k"})
+
+local function getSelectionHpCached(object)
+    local now = os.clock()
+    local entry = eggSelectionHpCache[object]
+    local maxAge = IS_TOUCH_DEVICE and 0.55 or 0.35
+
+    if entry and now - entry.time <= maxAge then
+        return entry.hp, entry.maxHp
+    end
+
+    local hp, maxHp = detectEggHp(object)
+    eggSelectionHpCache[object] = {
+        time = now,
+        hp = hp,
+        maxHp = maxHp,
+    }
+    return hp, maxHp
+end
+
 local function chooseSelectedRarityEgg()
     -- Use live children from cached containers. Container discovery itself is
     -- throttled, avoiding repeated full-workspace scans during empty periods.
@@ -3583,7 +3643,7 @@ local function chooseSelectedRarityEgg()
                     local hp, maxHp = nil, nil
 
                     if useHp then
-                        hp, maxHp = detectEggHp(candidate)
+                        hp, maxHp = getSelectionHpCached(candidate)
                     end
 
                     if isBetter(hp, distance) then
@@ -3839,6 +3899,7 @@ local function suppressRagdollConstraints(character)
 end
 
 local function cleanupCharacterProtection()
+    protectionWasActive = false
     releaseAntiPushMover()
 
     if protectionForceField then
@@ -3879,9 +3940,16 @@ end
 
 local function protectCharacterStep()
     if not characterProtectionEnabled or not autoStealEnabled then
-        cleanupCharacterProtection()
+        -- Cleanup only once when protection transitions from active -> inactive.
+        -- The old version rebuilt/cleaned protection state every 0.10s even while idle.
+        if protectionWasActive then
+            cleanupCharacterProtection()
+            protectionWasActive = false
+        end
         return
     end
+
+    protectionWasActive = true
 
     local character = LocalPlayer.Character
     local root = character and character:FindFirstChild("HumanoidRootPart")
@@ -3919,7 +3987,14 @@ local function protectCharacterStep()
         end)
     end
 
-    suppressRagdollConstraints(character)
+    -- Descendant traversal is the most expensive part of protection.
+    -- Run it periodically instead of on every protection tick.
+    local nowProtection = os.clock()
+    local runDeepProtection = nowProtection - protectionLastDeepScan >= (IS_TOUCH_DEVICE and 0.90 or 0.65)
+    if runDeepProtection then
+        protectionLastDeepScan = nowProtection
+        suppressRagdollConstraints(character)
+    end
 
     -- Stronger anti-stun: restore movement and common local stun flags.
     if protectionBaseline then
@@ -3942,9 +4017,11 @@ local function protectCharacterStep()
         end)
     end
 
-    clearCommonStunFlags(LocalPlayer)
-    clearCommonStunFlags(character)
-    clearCommonStunFlags(humanoid)
+    if runDeepProtection then
+        clearCommonStunFlags(LocalPlayer)
+        clearCommonStunFlags(character)
+        clearCommonStunFlags(humanoid)
+    end
 
     -- Best-effort godmode.
     ensureProtectionForceField(character)
@@ -3999,7 +4076,7 @@ local function startProtectionWorker()
     task.spawn(function()
         while true do
             pcall(protectCharacterStep)
-            task.wait(0.10)
+            task.wait(IS_TOUCH_DEVICE and 0.18 or 0.13)
         end
     end)
 
@@ -4126,24 +4203,44 @@ local function getPickedEggFromModule(preferredEgg)
     return preferredEgg
 end
 
+local rapidTargetCacheEgg = nil
+local rapidTargetCacheTarget = nil
+local rapidTargetCacheUntil = 0
+local lastPickaxeActivation = -math.huge
+
 local function attackEggRapid(preferredEgg)
     local didAnything = false
     local successfulHits = 0
 
-    -- Equip/activate only once for this Heartbeat.
+    -- Keep the Pickaxe equipped, but do not call Tool:Activate every attack tick.
     local tool = equipTool("Pickaxe")
     if tool then
-        pcall(function()
-            tool:Activate()
-        end)
+        local now = os.clock()
+        if now - lastPickaxeActivation >= (IS_TOUCH_DEVICE and 0.16 or 0.12) then
+            pcall(function()
+                tool:Activate()
+            end)
+            lastPickaxeActivation = now
+        end
         didAnything = true
     end
 
     local remote = findEggHitRemote()
 
-    -- IMPORTANT: resolve the exact game-accepted egg before firing.
-    -- Do not send the outer scanned model directly unless targeting falls back to it.
-    local target = getPickedEggFromModule(preferredEgg)
+    -- EggTargeting.Pick can be expensive. Reuse its resolved target briefly while
+    -- staying on the same scanned egg, then refresh several times per second.
+    local now = os.clock()
+    local target
+    if preferredEgg == rapidTargetCacheEgg
+        and rapidTargetCacheTarget ~= nil
+        and now <= rapidTargetCacheUntil then
+        target = rapidTargetCacheTarget
+    else
+        target = getPickedEggFromModule(preferredEgg)
+        rapidTargetCacheEgg = preferredEgg
+        rapidTargetCacheTarget = target
+        rapidTargetCacheUntil = now + (IS_TOUCH_DEVICE and 0.12 or 0.08)
+    end
 
     if remote and target then
         if remote:IsA("RemoteEvent") then
@@ -4216,25 +4313,32 @@ local function getTreadmillBoardCFrame(object)
 end
 
 local function findTreadmillBoard()
-    local wanted = normalizeName(RETURN_TARGET_NAME)
     local anchorPosition = autoStealReturnCFrame and autoStealReturnCFrame.Position or nil
-    local bestObject = nil
-    local bestCFrame = nil
-    local bestDistance = math.huge
 
+    -- Fast path: reuse the same board between steal cycles.
+    if cachedTreadmillBoard and cachedTreadmillBoard.Parent then
+        local cachedCF = getTreadmillBoardCFrame(cachedTreadmillBoard)
+        if cachedCF then
+            return cachedTreadmillBoard, cachedCF
+        end
+        cachedTreadmillBoard = nil
+    end
+
+    -- FindFirstChild(recursive=true) is already enough for the common case.
+    -- Only do the expensive full Workspace scan if that lookup fails.
     local direct = Workspace:FindFirstChild(RETURN_TARGET_NAME, true)
     if direct then
         local cf = getTreadmillBoardCFrame(direct)
         if cf then
-            bestObject = direct
-            bestCFrame = cf
-            if anchorPosition then
-                bestDistance = (cf.Position - anchorPosition).Magnitude
-            else
-                bestDistance = 0
-            end
+            cachedTreadmillBoard = direct
+            return direct, cf
         end
     end
+
+    local wanted = normalizeName(RETURN_TARGET_NAME)
+    local bestObject = nil
+    local bestCFrame = nil
+    local bestDistance = math.huge
 
     for _, object in ipairs(Workspace:GetDescendants()) do
         if normalizeName(object.Name) == wanted then
@@ -4250,6 +4354,9 @@ local function findTreadmillBoard()
         end
     end
 
+    if bestObject then
+        cachedTreadmillBoard = bestObject
+    end
     return bestObject, bestCFrame
 end
 
@@ -4281,7 +4388,7 @@ local function claimEggBeforeReturn(egg, prompt, rarity, pickupPosition)
                 return true
             end
 
-            if tick() - lastFire >= 0.02 then
+            if tick() - lastFire >= (IS_TOUCH_DEVICE and 0.08 or 0.05) then
                 firePromptInstant(activePrompt)
                 lastFire = tick()
             end
@@ -4553,7 +4660,7 @@ local function runAutoStealCycle()
     local prompt = nil
     local lastDetailUpdate = 0
     local lastBreakCheck = 0
-    local BREAK_CHECK_INTERVAL = 0.06
+    local BREAK_CHECK_INTERVAL = IS_TOUCH_DEVICE and 0.14 or 0.10
 
     -- IMPORTANT:
     -- Rapid-hit burst runs every Heartbeat. Only the expensive descendant/HP
@@ -4584,7 +4691,7 @@ local function runAutoStealCycle()
             while autoStealEnabled and tick() < promptDeadline and not prompt do
                 prompt = findPickupPromptNearPosition(originalEggPosition, 20)
                 if not prompt then
-                    task.wait(0.05)
+                    task.wait(IS_TOUCH_DEVICE and 0.10 or 0.07)
                 end
             end
 
@@ -4655,7 +4762,7 @@ local function runAutoStealCycle()
 
         if not prompt then
             setStatus("Egg broken • waiting for steal prompt…", "working")
-            task.wait(0.05)
+            task.wait(IS_TOUCH_DEVICE and 0.10 or 0.07)
         end
     end
 
@@ -4694,7 +4801,7 @@ local function runAutoStealCycle()
             )
         else
             setStatus("Steal not confirmed • waiting for pickup prompt…", "warning")
-            task.wait(0.05)
+            task.wait(IS_TOUCH_DEVICE and 0.10 or 0.07)
         end
     end
 
@@ -4745,7 +4852,7 @@ local function runAutoStealManager()
                 local reason = PetEggAutomation.GetBlockReason and PetEggAutomation.GetBlockReason() or "Egg automation"
                 setStatus("Paused • " .. tostring(reason) .. " has priority", "warning")
                 while autoStealEnabled and PetEggAutomation.ShouldBlockSteal() do
-                    task.wait(0.05)
+                    task.wait(IS_TOUCH_DEVICE and 0.10 or 0.07)
                 end
                 if autoStealEnabled then
                     setStatus("Higher-priority egg task finished • resuming Auto Steal", "working")
@@ -4765,6 +4872,10 @@ local function runAutoStealManager()
                 if ok and completedOrError == true then
                     -- A completed egg can invalidate cached rarity/target objects.
                     rarityDetectionCache = setmetatable({}, {__mode = "k"})
+                    eggSelectionHpCache = setmetatable({}, {__mode = "k"})
+                    rapidTargetCacheEgg = nil
+                    rapidTargetCacheTarget = nil
+                    rapidTargetCacheUntil = 0
                     -- Only wait after a FULL successful:
                     -- break -> claim -> return.
                     setStatus("Returned • scanning next selected-rarity egg", "success")
@@ -4772,7 +4883,7 @@ local function runAutoStealManager()
                 else
                     -- No target: rescan quickly instead of
                     -- sleeping a whole second or behaving like a one-shot.
-                    task.wait(IS_TOUCH_DEVICE and 0.22 or 0.15)
+                    task.wait(IS_TOUCH_DEVICE and 0.35 or 0.22)
                 end
             end
         end
@@ -4860,7 +4971,7 @@ end
 local function runAutoBuyPickaxe()
     while autoBuyEnabled do
         pcall(autoBuyPickaxePass)
-        task.wait(0.5)
+        task.wait(IS_TOUCH_DEVICE and 0.8 or 0.6)
     end
 end
 
@@ -4957,7 +5068,7 @@ end
 local function runSellAll()
     while sellAllEnabled do
         pcall(sellSelectedRarityTools)
-        task.wait(0.5)
+        task.wait(IS_TOUCH_DEVICE and 0.8 or 0.6)
     end
 end
 
@@ -5089,7 +5200,7 @@ function UI.makeTouchDraggable(handle, frame, reserveRightButton)
 
             if IS_TOUCH_DEVICE then
                 local now = os.clock()
-                if now - (state.lastDragUpdate or 0) < (1 / 45) then
+                if now - (state.lastDragUpdate or 0) < (1 / 30) then
                     return
                 end
                 state.lastDragUpdate = now
@@ -5177,23 +5288,183 @@ function UI.addAllEdgeDragHandles(frame)
     return handles
 end
 
+function UI.makeResizable(frame, onResize, canResize)
+    -- One compact bottom-right grip. Keeping resize logic inside this function
+    -- avoids adding more long-lived locals to the main chunk.
+    local grip = Instance.new("TextButton")
+    grip.Name = "ResizeGrip"
+    grip.AnchorPoint = Vector2.new(1, 1)
+    grip.Position = UDim2.new(1, -4, 1, -4)
+    grip.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(24, 24) or UDim2.fromOffset(18, 18)
+    grip.BackgroundColor3 = THEME.surface2
+    grip.BackgroundTransparency = IS_TOUCH_DEVICE and 0.08 or 0.18
+    grip.BorderSizePixel = 0
+    grip.AutoButtonColor = false
+    grip.Text = "◢"
+    grip.TextColor3 = THEME.muted
+    grip.TextSize = IS_TOUCH_DEVICE and 11 or 10
+    grip.Font = Enum.Font.GothamBold
+    grip.ZIndex = 250
+    grip.Active = true
+    grip.Parent = frame
+    UI.addCorner(grip, 5)
+    UI.addStroke(grip, THEME.line, 1, 0.50)
+
+    local resizing = false
+    local activeInput = nil
+    local startPointer = nil
+    local startSize = nil
+    local startPosition = nil
+    local lastUpdate = 0
+
+    local function viewportSize()
+        local camera = Workspace.CurrentCamera
+        return camera and camera.ViewportSize or Vector2.new(1280, 720)
+    end
+
+    local function limits(viewport)
+        local minW
+        local minH
+
+        if IS_TOUCH_DEVICE then
+            minW = math.min(220, math.max(170, viewport.X - 16))
+            minH = math.min(260, math.max(190, viewport.Y - 20))
+        else
+            minW = 260
+            minH = 260
+        end
+
+        local maxW = math.max(minW, viewport.X - 12)
+        local maxH = math.max(minH, viewport.Y - 16)
+        return minW, minH, maxW, maxH
+    end
+
+    local function clampCenter(position, width, height, viewport)
+        local x = viewport.X * position.X.Scale + position.X.Offset
+        local y = viewport.Y * position.Y.Scale + position.Y.Offset
+        local margin = 4
+        local halfW = width * 0.5
+        local halfH = height * 0.5
+        local minX = halfW + margin
+        local maxX = viewport.X - halfW - margin
+        local minY = halfH + margin
+        local maxY = viewport.Y - halfH - margin
+
+        if maxX < minX then
+            x = viewport.X * 0.5
+        else
+            x = math.clamp(x, minX, maxX)
+        end
+
+        if maxY < minY then
+            y = viewport.Y * 0.5
+        else
+            y = math.clamp(y, minY, maxY)
+        end
+
+        return UDim2.fromOffset(x, y)
+    end
+
+    grip.InputBegan:Connect(function(input)
+        local t = input.UserInputType
+        if t ~= Enum.UserInputType.MouseButton1 and t ~= Enum.UserInputType.Touch then
+            return
+        end
+        if canResize and not canResize() then
+            return
+        end
+
+        resizing = true
+        activeInput = input
+        startPointer = input.Position
+        startSize = frame.AbsoluteSize
+        startPosition = frame.Position
+        lastUpdate = 0
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if not resizing or not startPointer or not startSize or not startPosition then
+            return
+        end
+
+        local isTouch = activeInput and activeInput.UserInputType == Enum.UserInputType.Touch
+        if isTouch then
+            if input ~= activeInput then
+                return
+            end
+        elseif input.UserInputType ~= Enum.UserInputType.MouseMovement then
+            return
+        end
+
+        if IS_TOUCH_DEVICE then
+            local now = os.clock()
+            if now - lastUpdate < (1 / 24) then
+                return
+            end
+            lastUpdate = now
+        end
+
+        local viewport = viewportSize()
+        local minW, minH, maxW, maxH = limits(viewport)
+        local delta = input.Position - startPointer
+        local newW = math.clamp(math.floor(startSize.X + delta.X + 0.5), minW, maxW)
+        local newH = math.clamp(math.floor(startSize.Y + delta.Y + 0.5), minH, maxH)
+
+        local dx = (newW - startSize.X) * 0.5
+        local dy = (newH - startSize.Y) * 0.5
+        local proposedPosition = UDim2.new(
+            startPosition.X.Scale,
+            startPosition.X.Offset + dx,
+            startPosition.Y.Scale,
+            startPosition.Y.Offset + dy
+        )
+
+        frame.Size = UDim2.fromOffset(newW, newH)
+        frame.Position = clampCenter(proposedPosition, newW, newH, viewport)
+
+        if onResize then
+            pcall(onResize, newW, newH)
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if not resizing then
+            return
+        end
+        if input == activeInput or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            resizing = false
+            activeInput = nil
+            startPointer = nil
+            startSize = nil
+            startPosition = nil
+        end
+    end)
+
+    return grip
+end
+
 function UI.getResponsiveSize()
     local camera = Workspace.CurrentCamera
     local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
 
     if IS_TOUCH_DEVICE then
-        -- TRUE SMALL MOBILE WINDOW. Internal row/button/dropdown definitions are
-        -- unchanged; this only reduces the visible viewport of the scrolling panel.
-        local width = math.clamp(math.floor(viewport.X * 0.31), 118, 145)
-        local height = math.clamp(math.floor(viewport.Y * 0.22), 138, 180)
+        -- Balanced mobile size: clearly larger than the previous tiny panel,
+        -- but still leaves plenty of the game visible.
+        local width
+        local height
 
         if viewport.X > viewport.Y then
-            width = math.clamp(math.floor(viewport.X * 0.155), 122, 150)
-            height = math.clamp(math.floor(viewport.Y * 0.39), 138, 180)
+            -- Landscape mobile/tablet.
+            width = math.clamp(math.floor(viewport.X * 0.18), 250, 320)
+            height = math.clamp(math.floor(viewport.Y * 0.44), 300, 390)
+        else
+            -- Portrait mobile.
+            width = math.clamp(math.floor(viewport.X * 0.78), 260, 330)
+            height = math.clamp(math.floor(viewport.Y * 0.50), 330, 470)
         end
 
-        width = math.min(width, math.max(112, viewport.X - 10))
-        height = math.min(height, math.max(132, viewport.Y - 14))
+        width = math.min(width, math.max(220, viewport.X - 16))
+        height = math.min(height, math.max(260, viewport.Y - 20))
 
         return width, height
     end
@@ -6218,6 +6489,22 @@ function UI.launchMainGui()
     UI.addAllEdgeDragHandles(mainFrame)
 
     local minimized = false
+    local userResized = false
+
+    local resizeHandle = UI.makeResizable(
+        mainFrame,
+        function(newW, newH)
+            if not minimized then
+                mainWidth = newW
+                mainHeight = newH
+                expandedSize = UDim2.fromOffset(newW, newH)
+                userResized = true
+            end
+        end,
+        function()
+            return not minimized
+        end
+    )
 
     local function syncShadow()
         shadow.Position = mainFrame.Position
@@ -6237,6 +6524,9 @@ function UI.launchMainGui()
         minimized = not minimized
 
         if minimized then
+            if resizeHandle then
+                resizeHandle.Visible = false
+            end
             content.Visible = false
             divider.Visible = false
             brandDot.Visible = false
@@ -6256,6 +6546,9 @@ function UI.launchMainGui()
                 Size = UDim2.fromOffset(MINIMIZED_WIDTH, MINIMIZED_HEIGHT)
             })
         else
+            if resizeHandle then
+                resizeHandle.Visible = true
+            end
             content.Visible = true
             divider.Visible = true
             brandDot.Visible = true
@@ -6278,8 +6571,20 @@ function UI.launchMainGui()
     if camera then
         camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
             local newWidth, newHeight = UI.getResponsiveSize()
-            mainWidth = newWidth
-            mainHeight = newHeight
+            local viewport = camera.ViewportSize
+
+            if userResized then
+                local minW = IS_TOUCH_DEVICE and math.min(220, math.max(170, viewport.X - 16)) or 260
+                local minH = IS_TOUCH_DEVICE and math.min(260, math.max(190, viewport.Y - 20)) or 260
+                local maxW = math.max(minW, viewport.X - 12)
+                local maxH = math.max(minH, viewport.Y - 16)
+                mainWidth = math.clamp(expandedSize.X.Offset, minW, maxW)
+                mainHeight = math.clamp(expandedSize.Y.Offset, minH, maxH)
+            else
+                mainWidth = newWidth
+                mainHeight = newHeight
+            end
+
             expandedSize = UDim2.fromOffset(mainWidth, mainHeight)
 
             if minimized then
