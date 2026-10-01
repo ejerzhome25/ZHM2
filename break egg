@@ -22,6 +22,7 @@
       * FALLBACK BUTTONS: large ▲ and ▼ buttons page the UI even if drag input is interrupted
       * TOUCH-SAFE: custom rail uses its own narrow lane and no full-screen touch interception
       * SCROLL HANDLE: drag the floating ↕ handle up/down with your finger
+      * SMALLER MOBILE SCROLLBAR: reduced rail, thumb, arrows, and native bar size
       * TOUCH FIX: taps stay taps; vertical movement becomes scrolling after a small threshold
       * TOUCH FIX: thinner edge drag zones reduce accidental swipe capture
       * PERFORMANCE: cached ProximityPrompts + plot lookup to avoid repeated full Workspace scans
@@ -5321,7 +5322,7 @@ function UI.bindSmoothScrolling(scroller, layout)
     scroller.Active = true
     scroller.ScrollingEnabled = true
     scroller.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
-    scroller.ScrollBarThickness = IS_TOUCH_DEVICE and 14 or 4
+    scroller.ScrollBarThickness = IS_TOUCH_DEVICE and 6 or 4
     scroller.ScrollBarImageColor3 = IS_TOUCH_DEVICE and LIGHT_PURPLE or THEME.accent
     scroller.ScrollBarImageTransparency = IS_TOUCH_DEVICE and 0.08 or 0.12
 
@@ -5378,16 +5379,16 @@ function UI.bindSmoothScrolling(scroller, layout)
         local scrollAbs = scroller.AbsolutePosition
         local scrollSize = scroller.AbsoluteSize
 
-        local laneWidth = 64
-        local topGap = 54
-        local bottomGap = 54
+        local laneWidth = 38
+        local topGap = 38
+        local bottomGap = 38
 
-        local left = scrollAbs.X - parentAbs.X + scrollSize.X - laneWidth - 8
+        local left = scrollAbs.X - parentAbs.X + scrollSize.X - laneWidth - 6
         local top = scrollAbs.Y - parentAbs.Y + 5
-        local totalHeight = math.max(140, scrollSize.Y - 10)
+        local totalHeight = math.max(110, scrollSize.Y - 10)
 
         local railTop = top + topGap
-        local railHeight = math.max(60, totalHeight - topGap - bottomGap)
+        local railHeight = math.max(44, totalHeight - topGap - bottomGap)
 
         return left, top, laneWidth, totalHeight, railTop, railHeight
     end
@@ -5414,7 +5415,7 @@ function UI.bindSmoothScrolling(scroller, layout)
         railGlow.ZIndex = 314
         railGlow.Visible = false
         railGlow.Parent = thumbParent
-        UI.addCorner(railGlow, 18)
+        UI.addCorner(railGlow, 11)
 
         -- The rail itself is the touch target. It is intentionally a real GuiButton,
         -- so Roblox owns the touch capture while the finger is on this control.
@@ -5429,8 +5430,8 @@ function UI.bindSmoothScrolling(scroller, layout)
         railButton.Active = true
         railButton.Visible = false
         railButton.Parent = thumbParent
-        UI.addCorner(railButton, 16)
-        UI.addStroke(railButton, LIGHT_PURPLE, 2, 0.08)
+        UI.addCorner(railButton, 10)
+        UI.addStroke(railButton, LIGHT_PURPLE, 1, 0.08)
 
         local railGradient = Instance.new("UIGradient")
         railGradient.Color = ColorSequence.new({
@@ -5444,14 +5445,14 @@ function UI.bindSmoothScrolling(scroller, layout)
         local railAccent = Instance.new("Frame")
         railAccent.Name = "AccentTrack"
         railAccent.AnchorPoint = Vector2.new(0.5, 0)
-        railAccent.Position = UDim2.new(0.5, 0, 0, 8)
-        railAccent.Size = UDim2.new(0, 12, 1, -16)
+        railAccent.Position = UDim2.new(0.5, 0, 0, 6)
+        railAccent.Size = UDim2.new(0, 6, 1, -12)
         railAccent.BackgroundColor3 = BRIGHT_PURPLE
         railAccent.BackgroundTransparency = 0.12
         railAccent.BorderSizePixel = 0
         railAccent.ZIndex = 316
         railAccent.Parent = railButton
-        UI.addCorner(railAccent, 6)
+        UI.addCorner(railAccent, 3)
 
         local accentGradient = Instance.new("UIGradient")
         accentGradient.Color = ColorSequence.new({
@@ -5465,25 +5466,25 @@ function UI.bindSmoothScrolling(scroller, layout)
         thumbShadow = Instance.new("Frame")
         thumbShadow.Name = "MobileScrollThumbShadow"
         thumbShadow.AnchorPoint = Vector2.new(0.5, 0.5)
-        thumbShadow.Size = UDim2.fromOffset(54, 56)
+        thumbShadow.Size = UDim2.fromOffset(32, 34)
         thumbShadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
         thumbShadow.BackgroundTransparency = 0.45
         thumbShadow.BorderSizePixel = 0
         thumbShadow.ZIndex = 317
         thumbShadow.Parent = railButton
-        UI.addCorner(thumbShadow, 16)
+        UI.addCorner(thumbShadow, 10)
 
         thumb = Instance.new("Frame")
         thumb.Name = "MobileScrollThumb"
         thumb.AnchorPoint = Vector2.new(0.5, 0.5)
-        thumb.Size = UDim2.fromOffset(50, 52)
+        thumb.Size = UDim2.fromOffset(28, 30)
         thumb.BackgroundColor3 = BRIGHT_PURPLE
         thumb.BackgroundTransparency = 0
         thumb.BorderSizePixel = 0
         thumb.ZIndex = 318
         thumb.Parent = railButton
-        UI.addCorner(thumb, 15)
-        UI.addStroke(thumb, Color3.fromRGB(255, 255, 255), 2, 0.05)
+        UI.addCorner(thumb, 9)
+        UI.addStroke(thumb, Color3.fromRGB(255, 255, 255), 1, 0.05)
 
         local thumbGradient = Instance.new("UIGradient")
         thumbGradient.Color = ColorSequence.new({
@@ -5497,7 +5498,7 @@ function UI.bindSmoothScrolling(scroller, layout)
         local gripLabel = UI.makeText(
             thumb,
             "≡",
-            28,
+            17,
             Color3.fromRGB(255, 255, 255),
             Enum.Font.GothamBold,
             Enum.TextXAlignment.Center
@@ -5514,14 +5515,14 @@ function UI.bindSmoothScrolling(scroller, layout)
             button.AutoButtonColor = true
             button.Text = symbol
             button.TextColor3 = Color3.fromRGB(255, 255, 255)
-            button.TextSize = 25
+            button.TextSize = 17
             button.Font = Enum.Font.GothamBold
             button.ZIndex = 320
             button.Active = true
             button.Visible = false
             button.Parent = thumbParent
-            UI.addCorner(button, 15)
-            UI.addStroke(button, Color3.fromRGB(255, 255, 255), 2, 0.08)
+            UI.addCorner(button, 9)
+            UI.addStroke(button, Color3.fromRGB(255, 255, 255), 1, 0.08)
 
             local gradient = Instance.new("UIGradient")
             gradient.Color = ColorSequence.new({
@@ -5631,20 +5632,20 @@ function UI.bindSmoothScrolling(scroller, layout)
             return
         end
 
-        railGlow.Position = UDim2.fromOffset(left - 4, railTop - 4)
-        railGlow.Size = UDim2.fromOffset(laneWidth + 8, railHeight + 8)
+        railGlow.Position = UDim2.fromOffset(left - 3, railTop - 3)
+        railGlow.Size = UDim2.fromOffset(laneWidth + 6, railHeight + 6)
 
         railButton.Position = UDim2.fromOffset(left, railTop)
         railButton.Size = UDim2.fromOffset(laneWidth, railHeight)
 
-        upButton.Position = UDim2.fromOffset(left + 4, top)
-        upButton.Size = UDim2.fromOffset(laneWidth - 8, 46)
+        upButton.Position = UDim2.fromOffset(left + 3, top)
+        upButton.Size = UDim2.fromOffset(laneWidth - 6, 30)
 
         downButton.Position = UDim2.fromOffset(
-            left + 4,
-            top + totalHeight - 46
+            left + 3,
+            top + totalHeight - 30
         )
-        downButton.Size = UDim2.fromOffset(laneWidth - 8, 46)
+        downButton.Size = UDim2.fromOffset(laneWidth - 6, 30)
 
         railButton.BackgroundTransparency = hasScroll and 0.08 or 0.45
         upButton.BackgroundTransparency = hasScroll and 0 or 0.45
@@ -5656,7 +5657,7 @@ function UI.bindSmoothScrolling(scroller, layout)
                 progress = math.clamp(scroller.CanvasPosition.Y / maxY, 0, 1)
             end
 
-            local thumbHalf = 28
+            local thumbHalf = 16
             local usable = math.max(1, railHeight - thumbHalf * 2)
             local y = thumbHalf + progress * usable
 
@@ -6541,7 +6542,7 @@ function UI.launchMainGui()
     content.Size = IS_TOUCH_DEVICE and UDim2.new(1, -8, 1, -36) or UDim2.new(1, -16, 1, -63)
     content.BackgroundTransparency = 1
     content.BorderSizePixel = 0
-    content.ScrollBarThickness = IS_TOUCH_DEVICE and 14 or 4
+    content.ScrollBarThickness = IS_TOUCH_DEVICE and 6 or 4
     content.ScrollBarImageColor3 = IS_TOUCH_DEVICE and Color3.fromRGB(216, 205, 255) or THEME.accent
     content.ScrollBarImageTransparency = IS_TOUCH_DEVICE and 0 or 0.12
     content.ScrollingDirection = Enum.ScrollingDirection.Y
