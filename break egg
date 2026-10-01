@@ -23,6 +23,8 @@
       * TOUCH-SAFE: custom rail uses its own narrow lane and no full-screen touch interception
       * SCROLL HANDLE: drag the floating ↕ handle up/down with your finger
       * SMALLER MOBILE SCROLLBAR: reduced rail, thumb, arrows, and native bar size
+      * PC SCROLLBAR FIX: custom scrollbar now renders and supports mouse input on PC executors
+      * RIGHT-EDGE SCROLLBAR: custom rail is pinned to the outer right side of the VNDT window
       * TOUCH FIX: taps stay taps; vertical movement becomes scrolling after a small threshold
       * TOUCH FIX: thinner edge drag zones reduce accidental swipe capture
       * PERFORMANCE: cached ProximityPrompts + plot lookup to avoid repeated full Workspace scans
@@ -5322,9 +5324,10 @@ function UI.bindSmoothScrolling(scroller, layout)
     scroller.Active = true
     scroller.ScrollingEnabled = true
     scroller.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
-    scroller.ScrollBarThickness = IS_TOUCH_DEVICE and 6 or 4
-    scroller.ScrollBarImageColor3 = IS_TOUCH_DEVICE and LIGHT_PURPLE or THEME.accent
-    scroller.ScrollBarImageTransparency = IS_TOUCH_DEVICE and 0.08 or 0.12
+    -- Keep Roblox's native bar visible as a fallback on both mobile and PC.
+    scroller.ScrollBarThickness = IS_TOUCH_DEVICE and 5 or 5
+    scroller.ScrollBarImageColor3 = IS_TOUCH_DEVICE and LIGHT_PURPLE or BRIGHT_PURPLE
+    scroller.ScrollBarImageTransparency = IS_TOUCH_DEVICE and 0.10 or 0.05
 
     pcall(function()
         scroller.VerticalScrollBarInset = Enum.ScrollBarInset.ScrollBar
@@ -5379,11 +5382,15 @@ function UI.bindSmoothScrolling(scroller, layout)
         local scrollAbs = scroller.AbsolutePosition
         local scrollSize = scroller.AbsoluteSize
 
-        local laneWidth = 38
-        local topGap = 38
-        local bottomGap = 38
+        -- Compact visual size. PC gets a slim rail; mobile stays finger-friendly.
+        local laneWidth = IS_TOUCH_DEVICE and 28 or 18
+        local topGap = IS_TOUCH_DEVICE and 30 or 24
+        local bottomGap = IS_TOUCH_DEVICE and 30 or 24
 
-        local left = scrollAbs.X - parentAbs.X + scrollSize.X - laneWidth - 6
+        -- Pin the custom scrollbar to the OUTER right edge of the VNDT window
+        -- instead of keeping it inset inside the ScrollingFrame.
+        local rightEdgePadding = 2
+        local left = math.max(0, thumbParent.AbsoluteSize.X - laneWidth - rightEdgePadding)
         local top = scrollAbs.Y - parentAbs.Y + 5
         local totalHeight = math.max(110, scrollSize.Y - 10)
 
@@ -5406,7 +5413,7 @@ function UI.bindSmoothScrolling(scroller, layout)
         setScrollY(progress * getMaxScrollY())
     end
 
-    if IS_TOUCH_DEVICE and thumbParent then
+    if thumbParent then
         railGlow = Instance.new("Frame")
         railGlow.Name = "MobileScrollRailGlow"
         railGlow.BackgroundColor3 = BRIGHT_PURPLE
@@ -5446,7 +5453,7 @@ function UI.bindSmoothScrolling(scroller, layout)
         railAccent.Name = "AccentTrack"
         railAccent.AnchorPoint = Vector2.new(0.5, 0)
         railAccent.Position = UDim2.new(0.5, 0, 0, 6)
-        railAccent.Size = UDim2.new(0, 6, 1, -12)
+        railAccent.Size = UDim2.new(0, IS_TOUCH_DEVICE and 4 or 3, 1, -12)
         railAccent.BackgroundColor3 = BRIGHT_PURPLE
         railAccent.BackgroundTransparency = 0.12
         railAccent.BorderSizePixel = 0
@@ -5466,7 +5473,7 @@ function UI.bindSmoothScrolling(scroller, layout)
         thumbShadow = Instance.new("Frame")
         thumbShadow.Name = "MobileScrollThumbShadow"
         thumbShadow.AnchorPoint = Vector2.new(0.5, 0.5)
-        thumbShadow.Size = UDim2.fromOffset(32, 34)
+        thumbShadow.Size = UDim2.fromOffset(IS_TOUCH_DEVICE and 24 or 14, IS_TOUCH_DEVICE and 28 or 26)
         thumbShadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
         thumbShadow.BackgroundTransparency = 0.45
         thumbShadow.BorderSizePixel = 0
@@ -5477,7 +5484,7 @@ function UI.bindSmoothScrolling(scroller, layout)
         thumb = Instance.new("Frame")
         thumb.Name = "MobileScrollThumb"
         thumb.AnchorPoint = Vector2.new(0.5, 0.5)
-        thumb.Size = UDim2.fromOffset(28, 30)
+        thumb.Size = UDim2.fromOffset(IS_TOUCH_DEVICE and 20 or 12, IS_TOUCH_DEVICE and 24 or 22)
         thumb.BackgroundColor3 = BRIGHT_PURPLE
         thumb.BackgroundTransparency = 0
         thumb.BorderSizePixel = 0
@@ -5498,7 +5505,7 @@ function UI.bindSmoothScrolling(scroller, layout)
         local gripLabel = UI.makeText(
             thumb,
             "≡",
-            17,
+            IS_TOUCH_DEVICE and 14 or 11,
             Color3.fromRGB(255, 255, 255),
             Enum.Font.GothamBold,
             Enum.TextXAlignment.Center
@@ -5515,7 +5522,7 @@ function UI.bindSmoothScrolling(scroller, layout)
             button.AutoButtonColor = true
             button.Text = symbol
             button.TextColor3 = Color3.fromRGB(255, 255, 255)
-            button.TextSize = 17
+            button.TextSize = IS_TOUCH_DEVICE and 14 or 11
             button.Font = Enum.Font.GothamBold
             button.ZIndex = 320
             button.Active = true
@@ -5586,16 +5593,39 @@ function UI.bindSmoothScrolling(scroller, layout)
         -- Executor/mobile fallback: some clients report movement globally instead
         -- of through GuiObject.InputChanged. Keep this tiny listener rail-only.
         UserInputService.InputChanged:Connect(function(input)
-            if not railDragging or input ~= railTouch then
+            if not railDragging then
                 return
             end
+
+            -- Touch usually keeps the same InputObject. Mouse dragging reports
+            -- MouseMovement separately from the original MouseButton1 press.
+            if railTouch and railTouch.UserInputType == Enum.UserInputType.Touch then
+                if input ~= railTouch then
+                    return
+                end
+            elseif input.UserInputType ~= Enum.UserInputType.MouseMovement then
+                return
+            end
+
             scrollFromScreenY(input.Position.Y)
         end)
 
         UserInputService.InputEnded:Connect(function(input)
-            if input ~= railTouch then
+            if not railDragging then
                 return
             end
+
+            local endedTouch = railTouch
+                and railTouch.UserInputType == Enum.UserInputType.Touch
+                and input == railTouch
+            local endedMouse = railTouch
+                and railTouch.UserInputType == Enum.UserInputType.MouseButton1
+                and input.UserInputType == Enum.UserInputType.MouseButton1
+
+            if not endedTouch and not endedMouse then
+                return
+            end
+
             railDragging = false
             railTouch = nil
         end)
@@ -5615,7 +5645,8 @@ function UI.bindSmoothScrolling(scroller, layout)
 
         local left, top, laneWidth, totalHeight, railTop, railHeight = table.unpack(geometry)
         local hasScroll = maxY > 1
-        local shouldShow = scroller.Visible and IS_TOUCH_DEVICE
+        -- Show the custom rail on both touch devices and PC executors.
+        local shouldShow = scroller.Visible
 
         for _, object in ipairs({
             railGlow,
@@ -5639,13 +5670,14 @@ function UI.bindSmoothScrolling(scroller, layout)
         railButton.Size = UDim2.fromOffset(laneWidth, railHeight)
 
         upButton.Position = UDim2.fromOffset(left + 3, top)
-        upButton.Size = UDim2.fromOffset(laneWidth - 6, 30)
+        local arrowHeight = IS_TOUCH_DEVICE and 24 or 18
+        upButton.Size = UDim2.fromOffset(math.max(12, laneWidth - 4), arrowHeight)
 
         downButton.Position = UDim2.fromOffset(
             left + 3,
-            top + totalHeight - 30
+            top + totalHeight - arrowHeight
         )
-        downButton.Size = UDim2.fromOffset(laneWidth - 6, 30)
+        downButton.Size = UDim2.fromOffset(math.max(12, laneWidth - 4), arrowHeight)
 
         railButton.BackgroundTransparency = hasScroll and 0.08 or 0.45
         upButton.BackgroundTransparency = hasScroll and 0 or 0.45
@@ -5657,7 +5689,7 @@ function UI.bindSmoothScrolling(scroller, layout)
                 progress = math.clamp(scroller.CanvasPosition.Y / maxY, 0, 1)
             end
 
-            local thumbHalf = 16
+            local thumbHalf = IS_TOUCH_DEVICE and 13 or 11
             local usable = math.max(1, railHeight - thumbHalf * 2)
             local y = thumbHalf + progress * usable
 
