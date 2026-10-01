@@ -15,6 +15,13 @@
       * RESIZABLE UI: drag the bottom-right grip to resize the expanded VNDT window
       * SMOOTH MOBILE SCROLL: manual canvas sync prevents AutomaticCanvasSize stalls
       * DIRECT FINGER SCROLL: swipe anywhere inside the content area to scroll up/down
+      * BIG MOBILE SCROLLBAR: thicker right-side scroll indicator
+      * HIGHLIGHTED SCROLL RAIL: visible accent rail shows the full scroll path
+      * SCROLL FREEZE FIX: native mobile swipe restored + manual canvas synchronization
+      * RELIABLE SCROLL RAIL: drag/tap anywhere on the purple rail to jump/scroll
+      * FALLBACK BUTTONS: large ▲ and ▼ buttons page the UI even if drag input is interrupted
+      * TOUCH-SAFE: custom rail uses its own narrow lane and no full-screen touch interception
+      * SCROLL HANDLE: drag the floating ↕ handle up/down with your finger
       * TOUCH FIX: taps stay taps; vertical movement becomes scrolling after a small threshold
       * TOUCH FIX: thinner edge drag zones reduce accidental swipe capture
       * PERFORMANCE: cached ProximityPrompts + plot lookup to avoid repeated full Workspace scans
@@ -5293,42 +5300,53 @@ function UI.addAllEdgeDragHandles(frame)
 end
 
 function UI.bindSmoothScrolling(scroller, layout)
-    -- Mobile uses a direct finger-pan fallback instead of relying on Roblox's
-    -- native ScrollingFrame gesture state. This makes swiping work even when the
-    -- touch starts over a button/toggle/dropdown row inside the VNDT content.
+    -- Reliable mobile scrolling:
+    -- 1) Roblox native finger scrolling remains ENABLED.
+    -- 2) CanvasSize is synchronized manually so dropdown/resize changes cannot
+    --    leave the ScrollingFrame with a stale or invalid scroll range.
+    -- 3) A dedicated right-side rail offers drag/tap scrolling plus ▲/▼ fallbacks.
+    --
+    -- This deliberately avoids global content-touch interception, which could
+    -- fight buttons, resizing, window dragging, or Roblox's own touch scroller.
     if not scroller or not layout then
         return
     end
 
+    local BRIGHT_PURPLE = Color3.fromRGB(139, 92, 246)
+    local LIGHT_PURPLE = Color3.fromRGB(216, 205, 255)
+    local DEEP_PURPLE = Color3.fromRGB(91, 33, 182)
+
     scroller.AutomaticCanvasSize = Enum.AutomaticSize.None
     scroller.ScrollingDirection = Enum.ScrollingDirection.Y
     scroller.Active = true
+    scroller.ScrollingEnabled = true
     scroller.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
-    scroller.ScrollBarThickness = IS_TOUCH_DEVICE and 4 or 3
-    scroller.ScrollBarImageTransparency = IS_TOUCH_DEVICE and 0.08 or 0.15
-
-    -- Desktop keeps Roblox's normal wheel/drag scrolling.
-    -- Mobile CanvasPosition is controlled directly by the finger-pan code below
-    -- so a frozen native touch gesture cannot block the menu.
-    scroller.ScrollingEnabled = not IS_TOUCH_DEVICE
+    scroller.ScrollBarThickness = IS_TOUCH_DEVICE and 14 or 4
+    scroller.ScrollBarImageColor3 = IS_TOUCH_DEVICE and LIGHT_PURPLE or THEME.accent
+    scroller.ScrollBarImageTransparency = IS_TOUCH_DEVICE and 0.08 or 0.12
 
     pcall(function()
         scroller.VerticalScrollBarInset = Enum.ScrollBarInset.ScrollBar
     end)
 
-    local updateQueued = false
     local destroyed = false
-    local activeTouch = nil
-    local touchStart = nil
-    local canvasStartY = 0
-    local manualScroll = false
-    local cancelledTouch = false
-    local TOUCH_THRESHOLD = 6
+    local updateQueued = false
+    local thumbParent = scroller.Parent
+
+    local railGlow = nil
+    local railButton = nil
+    local upButton = nil
+    local downButton = nil
+    local thumbShadow = nil
+    local thumb = nil
+
+    local railTouch = nil
+    local railDragging = false
 
     local function getCanvasHeight()
         return math.max(
             0,
-            math.ceil(layout.AbsoluteContentSize.Y + (IS_TOUCH_DEVICE and 8 or 12))
+            math.ceil(layout.AbsoluteContentSize.Y + (IS_TOUCH_DEVICE and 12 or 12))
         )
     end
 
@@ -5344,10 +5362,308 @@ function UI.bindSmoothScrolling(scroller, layout)
             return
         end
 
+        local maxY = getMaxScrollY()
         scroller.CanvasPosition = Vector2.new(
             0,
-            math.clamp(y, 0, getMaxScrollY())
+            math.clamp(tonumber(y) or 0, 0, maxY)
         )
+    end
+
+    local function getRailGeometry()
+        if not railButton or not railButton.Parent then
+            return nil
+        end
+
+        local parentAbs = thumbParent.AbsolutePosition
+        local scrollAbs = scroller.AbsolutePosition
+        local scrollSize = scroller.AbsoluteSize
+
+        local laneWidth = 64
+        local topGap = 54
+        local bottomGap = 54
+
+        local left = scrollAbs.X - parentAbs.X + scrollSize.X - laneWidth - 8
+        local top = scrollAbs.Y - parentAbs.Y + 5
+        local totalHeight = math.max(140, scrollSize.Y - 10)
+
+        local railTop = top + topGap
+        local railHeight = math.max(60, totalHeight - topGap - bottomGap)
+
+        return left, top, laneWidth, totalHeight, railTop, railHeight
+    end
+
+    local function scrollFromScreenY(screenY)
+        local geometry = {getRailGeometry()}
+        if #geometry < 6 then
+            return
+        end
+
+        local _, _, _, _, railTop, railHeight = table.unpack(geometry)
+        local parentY = thumbParent.AbsolutePosition.Y
+        local localY = screenY - parentY
+        local progress = math.clamp((localY - railTop) / math.max(1, railHeight), 0, 1)
+        setScrollY(progress * getMaxScrollY())
+    end
+
+    if IS_TOUCH_DEVICE and thumbParent then
+        railGlow = Instance.new("Frame")
+        railGlow.Name = "MobileScrollRailGlow"
+        railGlow.BackgroundColor3 = BRIGHT_PURPLE
+        railGlow.BackgroundTransparency = 0.82
+        railGlow.BorderSizePixel = 0
+        railGlow.ZIndex = 314
+        railGlow.Visible = false
+        railGlow.Parent = thumbParent
+        UI.addCorner(railGlow, 18)
+
+        -- The rail itself is the touch target. It is intentionally a real GuiButton,
+        -- so Roblox owns the touch capture while the finger is on this control.
+        railButton = Instance.new("TextButton")
+        railButton.Name = "MobileScrollRail"
+        railButton.BackgroundColor3 = Color3.fromRGB(34, 23, 58)
+        railButton.BackgroundTransparency = 0.08
+        railButton.BorderSizePixel = 0
+        railButton.AutoButtonColor = false
+        railButton.Text = ""
+        railButton.ZIndex = 315
+        railButton.Active = true
+        railButton.Visible = false
+        railButton.Parent = thumbParent
+        UI.addCorner(railButton, 16)
+        UI.addStroke(railButton, LIGHT_PURPLE, 2, 0.08)
+
+        local railGradient = Instance.new("UIGradient")
+        railGradient.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(52, 35, 83)),
+            ColorSequenceKeypoint.new(0.5, Color3.fromRGB(38, 26, 65)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(29, 20, 48))
+        })
+        railGradient.Rotation = 90
+        railGradient.Parent = railButton
+
+        local railAccent = Instance.new("Frame")
+        railAccent.Name = "AccentTrack"
+        railAccent.AnchorPoint = Vector2.new(0.5, 0)
+        railAccent.Position = UDim2.new(0.5, 0, 0, 8)
+        railAccent.Size = UDim2.new(0, 12, 1, -16)
+        railAccent.BackgroundColor3 = BRIGHT_PURPLE
+        railAccent.BackgroundTransparency = 0.12
+        railAccent.BorderSizePixel = 0
+        railAccent.ZIndex = 316
+        railAccent.Parent = railButton
+        UI.addCorner(railAccent, 6)
+
+        local accentGradient = Instance.new("UIGradient")
+        accentGradient.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, LIGHT_PURPLE),
+            ColorSequenceKeypoint.new(0.5, BRIGHT_PURPLE),
+            ColorSequenceKeypoint.new(1, DEEP_PURPLE)
+        })
+        accentGradient.Rotation = 90
+        accentGradient.Parent = railAccent
+
+        thumbShadow = Instance.new("Frame")
+        thumbShadow.Name = "MobileScrollThumbShadow"
+        thumbShadow.AnchorPoint = Vector2.new(0.5, 0.5)
+        thumbShadow.Size = UDim2.fromOffset(54, 56)
+        thumbShadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        thumbShadow.BackgroundTransparency = 0.45
+        thumbShadow.BorderSizePixel = 0
+        thumbShadow.ZIndex = 317
+        thumbShadow.Parent = railButton
+        UI.addCorner(thumbShadow, 16)
+
+        thumb = Instance.new("Frame")
+        thumb.Name = "MobileScrollThumb"
+        thumb.AnchorPoint = Vector2.new(0.5, 0.5)
+        thumb.Size = UDim2.fromOffset(50, 52)
+        thumb.BackgroundColor3 = BRIGHT_PURPLE
+        thumb.BackgroundTransparency = 0
+        thumb.BorderSizePixel = 0
+        thumb.ZIndex = 318
+        thumb.Parent = railButton
+        UI.addCorner(thumb, 15)
+        UI.addStroke(thumb, Color3.fromRGB(255, 255, 255), 2, 0.05)
+
+        local thumbGradient = Instance.new("UIGradient")
+        thumbGradient.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, LIGHT_PURPLE),
+            ColorSequenceKeypoint.new(0.48, BRIGHT_PURPLE),
+            ColorSequenceKeypoint.new(1, DEEP_PURPLE)
+        })
+        thumbGradient.Rotation = 90
+        thumbGradient.Parent = thumb
+
+        local gripLabel = UI.makeText(
+            thumb,
+            "≡",
+            28,
+            Color3.fromRGB(255, 255, 255),
+            Enum.Font.GothamBold,
+            Enum.TextXAlignment.Center
+        )
+        gripLabel.Size = UDim2.fromScale(1, 1)
+        gripLabel.ZIndex = 319
+
+        local function makeArrowButton(name, symbol)
+            local button = Instance.new("TextButton")
+            button.Name = name
+            button.BackgroundColor3 = BRIGHT_PURPLE
+            button.BackgroundTransparency = 0
+            button.BorderSizePixel = 0
+            button.AutoButtonColor = true
+            button.Text = symbol
+            button.TextColor3 = Color3.fromRGB(255, 255, 255)
+            button.TextSize = 25
+            button.Font = Enum.Font.GothamBold
+            button.ZIndex = 320
+            button.Active = true
+            button.Visible = false
+            button.Parent = thumbParent
+            UI.addCorner(button, 15)
+            UI.addStroke(button, Color3.fromRGB(255, 255, 255), 2, 0.08)
+
+            local gradient = Instance.new("UIGradient")
+            gradient.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, LIGHT_PURPLE),
+                ColorSequenceKeypoint.new(0.5, BRIGHT_PURPLE),
+                ColorSequenceKeypoint.new(1, DEEP_PURPLE)
+            })
+            gradient.Rotation = 90
+            gradient.Parent = button
+
+            return button
+        end
+
+        upButton = makeArrowButton("MobileScrollUp", "▲")
+        downButton = makeArrowButton("MobileScrollDown", "▼")
+
+        local function pageAmount()
+            return math.max(90, scroller.AbsoluteWindowSize.Y * 0.65)
+        end
+
+        upButton.Activated:Connect(function()
+            setScrollY(scroller.CanvasPosition.Y - pageAmount())
+        end)
+
+        downButton.Activated:Connect(function()
+            setScrollY(scroller.CanvasPosition.Y + pageAmount())
+        end)
+
+        -- Dragging/tapping anywhere on the rail directly maps the finger position
+        -- to scroll progress. This avoids delta-state desync and "stuck" thumbs.
+        railButton.InputBegan:Connect(function(input)
+            local t = input.UserInputType
+            if t ~= Enum.UserInputType.Touch
+                and t ~= Enum.UserInputType.MouseButton1 then
+                return
+            end
+
+            railTouch = input
+            railDragging = true
+            scrollFromScreenY(input.Position.Y)
+        end)
+
+        railButton.InputChanged:Connect(function(input)
+            if not railDragging or input ~= railTouch then
+                return
+            end
+
+            scrollFromScreenY(input.Position.Y)
+        end)
+
+        railButton.InputEnded:Connect(function(input)
+            if input ~= railTouch then
+                return
+            end
+
+            scrollFromScreenY(input.Position.Y)
+            railDragging = false
+            railTouch = nil
+        end)
+
+        -- Executor/mobile fallback: some clients report movement globally instead
+        -- of through GuiObject.InputChanged. Keep this tiny listener rail-only.
+        UserInputService.InputChanged:Connect(function(input)
+            if not railDragging or input ~= railTouch then
+                return
+            end
+            scrollFromScreenY(input.Position.Y)
+        end)
+
+        UserInputService.InputEnded:Connect(function(input)
+            if input ~= railTouch then
+                return
+            end
+            railDragging = false
+            railTouch = nil
+        end)
+    end
+
+    local function updateVisuals()
+        if destroyed or not thumbParent then
+            return
+        end
+
+        local maxY = getMaxScrollY()
+        local geometry = {getRailGeometry()}
+
+        if #geometry < 6 then
+            return
+        end
+
+        local left, top, laneWidth, totalHeight, railTop, railHeight = table.unpack(geometry)
+        local hasScroll = maxY > 1
+        local shouldShow = scroller.Visible and IS_TOUCH_DEVICE
+
+        for _, object in ipairs({
+            railGlow,
+            railButton,
+            upButton,
+            downButton,
+        }) do
+            if object then
+                object.Visible = shouldShow
+            end
+        end
+
+        if not shouldShow then
+            return
+        end
+
+        railGlow.Position = UDim2.fromOffset(left - 4, railTop - 4)
+        railGlow.Size = UDim2.fromOffset(laneWidth + 8, railHeight + 8)
+
+        railButton.Position = UDim2.fromOffset(left, railTop)
+        railButton.Size = UDim2.fromOffset(laneWidth, railHeight)
+
+        upButton.Position = UDim2.fromOffset(left + 4, top)
+        upButton.Size = UDim2.fromOffset(laneWidth - 8, 46)
+
+        downButton.Position = UDim2.fromOffset(
+            left + 4,
+            top + totalHeight - 46
+        )
+        downButton.Size = UDim2.fromOffset(laneWidth - 8, 46)
+
+        railButton.BackgroundTransparency = hasScroll and 0.08 or 0.45
+        upButton.BackgroundTransparency = hasScroll and 0 or 0.45
+        downButton.BackgroundTransparency = hasScroll and 0 or 0.45
+
+        if thumb and thumbShadow then
+            local progress = 0
+            if maxY > 0 then
+                progress = math.clamp(scroller.CanvasPosition.Y / maxY, 0, 1)
+            end
+
+            local thumbHalf = 28
+            local usable = math.max(1, railHeight - thumbHalf * 2)
+            local y = thumbHalf + progress * usable
+
+            thumb.Position = UDim2.new(0.5, 0, 0, math.floor(y + 0.5))
+            thumbShadow.Position = UDim2.new(0.5, 3, 0, math.floor(y + 3.5))
+            thumb.BackgroundTransparency = hasScroll and 0 or 0.35
+        end
     end
 
     local function updateCanvasNow()
@@ -5360,126 +5676,74 @@ function UI.bindSmoothScrolling(scroller, layout)
         local canvasHeight = getCanvasHeight()
         scroller.CanvasSize = UDim2.fromOffset(0, canvasHeight)
 
-        local current = scroller.CanvasPosition
-        setScrollY(current.Y)
+        -- Always keep CanvasPosition legal after a dropdown closes, the window
+        -- resizes, or the viewport changes.
+        setScrollY(scroller.CanvasPosition.Y)
+
+        -- Defensive reset: if another UI path ever disables native scrolling,
+        -- immediately re-enable it.
+        if not scroller.ScrollingEnabled then
+            scroller.ScrollingEnabled = true
+        end
+
+        updateVisuals()
     end
 
     local function queueUpdate()
-        if updateQueued or destroyed then
+        if destroyed or updateQueued then
             return
         end
 
         updateQueued = true
         task.defer(function()
-            -- Let AutomaticSize descendants finish before reading layout height.
+            -- Two scheduler steps are cheap and make nested AutomaticSize dropdowns
+            -- much more reliable before reading UIListLayout.AbsoluteContentSize.
+            task.wait()
             task.wait()
             updateCanvasNow()
         end)
     end
 
-    local function pointInsideScroller(position)
-        if not position or not scroller.Visible then
-            return false
-        end
-
-        local p = scroller.AbsolutePosition
-        local s = scroller.AbsoluteSize
-        local x = position.X
-        local y = position.Y
-
-        -- Keep a few pixels away from the outer frame's drag/resize grips so
-        -- finger scrolling and window movement never fight over the same touch.
-        local sideGuard = IS_TOUCH_DEVICE and 7 or 0
-        local bottomGuard = IS_TOUCH_DEVICE and 22 or 0
-
-        return x >= p.X + sideGuard
-            and x <= p.X + s.X - sideGuard
-            and y >= p.Y
-            and y <= p.Y + s.Y - bottomGuard
-    end
-
     layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(queueUpdate)
     scroller:GetPropertyChangedSignal("AbsoluteWindowSize"):Connect(queueUpdate)
+    scroller:GetPropertyChangedSignal("AbsolutePosition"):Connect(queueUpdate)
+    scroller:GetPropertyChangedSignal("AbsoluteSize"):Connect(queueUpdate)
+    scroller:GetPropertyChangedSignal("CanvasPosition"):Connect(updateVisuals)
+    scroller:GetPropertyChangedSignal("Visible"):Connect(updateVisuals)
 
-    -- Dropdowns and dynamic sections can change height while the menu is open.
     scroller.DescendantAdded:Connect(queueUpdate)
     scroller.DescendantRemoving:Connect(queueUpdate)
 
     scroller.AncestryChanged:Connect(function(_, parent)
-        if parent == nil then
-            destroyed = true
-            activeTouch = nil
+        if parent ~= nil then
+            return
+        end
+
+        destroyed = true
+        railDragging = false
+        railTouch = nil
+
+        for _, object in ipairs({
+            railGlow,
+            railButton,
+            upButton,
+            downButton,
+        }) do
+            if object and object.Parent then
+                pcall(function()
+                    object:Destroy()
+                end)
+            end
         end
     end)
 
-    if IS_TOUCH_DEVICE then
-        UserInputService.InputBegan:Connect(function(input)
-            if destroyed
-                or activeTouch
-                or input.UserInputType ~= Enum.UserInputType.Touch
-                or not pointInsideScroller(input.Position) then
-                return
-            end
-
-            activeTouch = input
-            touchStart = input.Position
-            canvasStartY = scroller.CanvasPosition.Y
-            manualScroll = false
-            cancelledTouch = false
-            queueUpdate()
-        end)
-
-        UserInputService.InputChanged:Connect(function(input)
-            if destroyed or input ~= activeTouch or not touchStart then
-                return
-            end
-
-            local delta = input.Position - touchStart
-            local absX = math.abs(delta.X)
-            local absY = math.abs(delta.Y)
-
-            if not manualScroll then
-                if absY < TOUCH_THRESHOLD and absX < TOUCH_THRESHOLD then
-                    return
-                end
-
-                -- A clear horizontal gesture is not treated as menu scrolling.
-                -- This keeps normal taps/side gestures responsive.
-                if absX > absY * 1.25 then
-                    cancelledTouch = true
-                    return
-                end
-
-                manualScroll = true
-            end
-
-            if manualScroll and not cancelledTouch then
-                -- Finger up = content down; finger down = content up.
-                setScrollY(canvasStartY - delta.Y)
-            end
-        end)
-
-        UserInputService.InputEnded:Connect(function(input)
-            if input ~= activeTouch then
-                return
-            end
-
-            activeTouch = nil
-            touchStart = nil
-            manualScroll = false
-            cancelledTouch = false
-            queueUpdate()
-        end)
-    else
-        -- Safety net for desktop/external mouse use.
-        scroller.InputBegan:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.MouseWheel
-                and not scroller.ScrollingEnabled then
-                scroller.ScrollingEnabled = true
-            end
-            queueUpdate()
-        end)
-    end
+    -- Extra recovery whenever the user touches the native scroller.
+    scroller.InputBegan:Connect(function()
+        if not scroller.ScrollingEnabled then
+            scroller.ScrollingEnabled = true
+        end
+        queueUpdate()
+    end)
 
     updateCanvasNow()
 end
@@ -6277,9 +6541,9 @@ function UI.launchMainGui()
     content.Size = IS_TOUCH_DEVICE and UDim2.new(1, -8, 1, -36) or UDim2.new(1, -16, 1, -63)
     content.BackgroundTransparency = 1
     content.BorderSizePixel = 0
-    content.ScrollBarThickness = IS_TOUCH_DEVICE and 4 or 3
-    content.ScrollBarImageColor3 = THEME.accent
-    content.ScrollBarImageTransparency = IS_TOUCH_DEVICE and 0.08 or 0.15
+    content.ScrollBarThickness = IS_TOUCH_DEVICE and 14 or 4
+    content.ScrollBarImageColor3 = IS_TOUCH_DEVICE and Color3.fromRGB(216, 205, 255) or THEME.accent
+    content.ScrollBarImageTransparency = IS_TOUCH_DEVICE and 0 or 0.12
     content.ScrollingDirection = Enum.ScrollingDirection.Y
     content.Active = true
     content.ScrollingEnabled = true
