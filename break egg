@@ -8,6 +8,10 @@
       * Added a premium responsive dark UI
       * Added touch-friendly controls and scrolling for mobile
       * Added mouse + touch dragging
+      * MOBILE SMALLER WINDOW: reduced only the outer phone panel size; row sizing is unchanged
+      * ALL-EDGE DRAG: drag from top/header, left edge, right edge, or bottom edge
+      * PERFORMANCE: cached ProximityPrompts + plot lookup to avoid repeated full Workspace scans
+      * MOBILE FREE DRAG: window can move horizontally and vertically while staying on-screen
       * Added minimize / restore support
       * Auto Steal now targets selected live-scanned rarities
       * No fixed egg-search delay: rescans immediately / every frame when empty
@@ -46,6 +50,40 @@ local VirtualUser = game:GetService("VirtualUser")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local LocalPlayer = Players.LocalPlayer
+
+--// Shared live ProximityPrompt cache
+-- One initial Workspace scan, then event-driven updates. This replaces repeated
+-- Workspace:GetDescendants() prompt scans used by Auto Hatch / pickup checks.
+local PROXIMITY_PROMPT_CACHE = setmetatable({}, {__mode = "k"})
+local proximityPromptCacheStarted = false
+
+local function ensureProximityPromptCache()
+    if proximityPromptCacheStarted then
+        return PROXIMITY_PROMPT_CACHE
+    end
+
+    proximityPromptCacheStarted = true
+
+    for _, object in ipairs(Workspace:GetDescendants()) do
+        if object:IsA("ProximityPrompt") then
+            PROXIMITY_PROMPT_CACHE[object] = true
+        end
+    end
+
+    Workspace.DescendantAdded:Connect(function(object)
+        if object:IsA("ProximityPrompt") then
+            PROXIMITY_PROMPT_CACHE[object] = true
+        end
+    end)
+
+    Workspace.DescendantRemoving:Connect(function(object)
+        if PROXIMITY_PROMPT_CACHE[object] then
+            PROXIMITY_PROMPT_CACHE[object] = nil
+        end
+    end)
+
+    return PROXIMITY_PROMPT_CACHE
+end
 
 --// Device detection
 local IS_TOUCH_DEVICE = UserInputService.TouchEnabled == true
@@ -858,6 +896,14 @@ PetEggAutomation = (function()
     local successfulPositions = {}
     local lastPetSignature = ""
     local lastEggTotal = -1
+    local lastHatchTotal = -1
+
+    -- Own-plot lookup is expensive because the fallback scans plot descendants.
+    -- Cache the resolved model/surface and only retry a failed lookup occasionally.
+    local cachedMyPlot = nil
+    local cachedMyPlotSurface = nil
+    local lastPlotLookup = -math.huge
+    local PLOT_LOOKUP_RETRY = 2.0
 
     local function report(text, kind)
         if statusSink then
@@ -1155,7 +1201,7 @@ PetEggAutomation = (function()
         return nil
     end
 
-    local function findMyPlotModel()
+    local function findMyPlotModelUncached()
         local plots = Workspace:FindFirstChild("Plots")
         if not plots then
             return nil
@@ -1214,7 +1260,30 @@ PetEggAutomation = (function()
         return nil
     end
 
+    local function findMyPlotModel()
+        if cachedMyPlot and cachedMyPlot.Parent then
+            return cachedMyPlot
+        end
+
+        local now = os.clock()
+        if now - lastPlotLookup < PLOT_LOOKUP_RETRY then
+            return nil
+        end
+        lastPlotLookup = now
+
+        cachedMyPlot = findMyPlotModelUncached()
+        if not cachedMyPlot then
+            cachedMyPlotSurface = nil
+        end
+        return cachedMyPlot
+    end
+
     local function getMyPlotSurface()
+        if cachedMyPlotSurface and cachedMyPlotSurface.Parent
+            and cachedMyPlot and cachedMyPlot.Parent then
+            return cachedMyPlotSurface, cachedMyPlot
+        end
+
         local plot = findMyPlotModel()
         if not plot then
             return nil, nil
@@ -1222,6 +1291,7 @@ PetEggAutomation = (function()
 
         local surface = plot:FindFirstChild("PlotSurface", true)
         if surface and surface:IsA("BasePart") then
+            cachedMyPlotSurface = surface
             return surface, plot
         end
 
@@ -1240,6 +1310,7 @@ PetEggAutomation = (function()
             end
         end
 
+        cachedMyPlotSurface = bestPart
         return bestPart, plot
     end
 
@@ -1338,13 +1409,12 @@ PetEggAutomation = (function()
         local playerRoot = Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
         local origin = playerRoot and playerRoot.Position or (surface and surface.Position) or Vector3.zero
 
-        -- IMPORTANT FIX:
-        -- Ready eggs are not guaranteed to be parented under Workspace.Plots/<my plot>.
-        -- Some game builds keep spawned eggs in a separate Workspace container while
-        -- only positioning them on the player's plot. Therefore scan Workspace and
-        -- use the real PlotSurface bounds as the ownership/location filter.
-        for _, object in ipairs(Workspace:GetDescendants()) do
-            if isHatchPrompt(object) then
+        -- PERFORMANCE: iterate the shared live prompt cache instead of scanning
+        -- every Workspace descendant every 0.18s. A real Hatch prompt is already
+        -- the authoritative signal that the egg is ready, so no nested GUI scan
+        -- is needed to search separately for a "Ready!" TextLabel.
+        for object in pairs(ensureProximityPromptCache()) do
+            if object and object.Parent and isHatchPrompt(object) then
                 local position = getPromptWorldPosition(object)
                 if position then
                     local inMyPlot = false
@@ -1368,35 +1438,9 @@ PetEggAutomation = (function()
                     end
 
                     if inMyPlot then
-                        local readySignal = false
-                        local current = object.Parent
-                        for _ = 1, 5 do
-                            if not current or current == Workspace then
-                                break
-                            end
-
-                            -- "Ready!" is normally rendered by a BillboardGui on the egg.
-                            -- It is only a priority hint; the Hatch prompt itself remains
-                            -- the authoritative readiness signal.
-                            for _, child in ipairs(current:GetDescendants()) do
-                                if child:IsA("TextLabel") or child:IsA("TextButton") then
-                                    local txt = string.lower(tostring(child.Text or ""))
-                                    if string.find(txt, "ready", 1, true) then
-                                        readySignal = true
-                                        break
-                                    end
-                                end
-                            end
-                            if readySignal then
-                                break
-                            end
-                            current = current.Parent
-                        end
-
                         table.insert(results, {
                             prompt = object,
                             position = position,
-                            ready = readySignal,
                             plotDistance = plotDistance,
                             playerDistance = (position - origin).Magnitude,
                         })
@@ -1406,11 +1450,6 @@ PetEggAutomation = (function()
         end
 
         table.sort(results, function(a, b)
-            -- Explicit Ready! eggs first, then the prompt closest to the center of
-            -- our plot, then whichever is closest to the player.
-            if a.ready ~= b.ready then
-                return a.ready == true
-            end
             if math.abs(a.plotDistance - b.plotDistance) > 0.05 then
                 return a.plotDistance < b.plotDistance
             end
@@ -1420,10 +1459,13 @@ PetEggAutomation = (function()
         return results
     end
 
-    local function publishHatchCount()
+    local function publishHatchCount(force)
         local count = #collectHatchPrompts()
-        if hatchCountSink then
-            pcall(hatchCountSink, count)
+        if force or count ~= lastHatchTotal then
+            lastHatchTotal = count
+            if hatchCountSink then
+                pcall(hatchCountSink, count)
+            end
         end
         return count
     end
@@ -2307,7 +2349,7 @@ PetEggAutomation = (function()
     function A.SetStatusSink(fn) statusSink = fn end
     function A.SetPetOptionsSink(fn) petOptionsSink = fn; publishPetOptions(true) end
     function A.SetEggCountSink(fn) eggCountSink = fn; publishEggCount(true) end
-    function A.SetHatchCountSink(fn) hatchCountSink = fn; publishHatchCount() end
+    function A.SetHatchCountSink(fn) hatchCountSink = fn; publishHatchCount(true) end
     function A.SetStealBusyCheck(fn)
         stealBusyCheck = type(fn) == "function" and fn or function() return false end
     end
@@ -2390,6 +2432,9 @@ PetEggAutomation = (function()
         candidateIndex = 1
         usedPositionKeys = {}
         successfulPositions = {}
+        cachedMyPlot = nil
+        cachedMyPlotSurface = nil
+        lastPlotLookup = -math.huge
         return buildCandidatePositions()
     end
 
@@ -2398,7 +2443,9 @@ PetEggAutomation = (function()
         started = true
 
         task.spawn(function()
-            while task.wait(0.18) do
+            -- Cached prompt scan: 0.45s remains responsive but avoids unnecessary
+            -- UI/status work every few frames on mobile.
+            while task.wait(0.45) do
                 local hatchCount = publishHatchCount()
                 if autoHatchEnabled and hatchCount > 0 then
                     hatchRequested = true
@@ -2471,6 +2518,9 @@ PetEggAutomation = (function()
             candidateIndex = 1
             usedPositionKeys = {}
             successfulPositions = {}
+            cachedMyPlot = nil
+            cachedMyPlotSurface = nil
+            lastPlotLookup = -math.huge
             task.delay(1.5, function() pcall(buildCandidatePositions) end)
         end)
 
@@ -4367,8 +4417,8 @@ local function findPickupPromptNearPosition(position, maxDistance)
     local nearestAny = nil
     local nearestAnyDistance = maxDistance or 18
 
-    for _, object in ipairs(Workspace:GetDescendants()) do
-        if object:IsA("ProximityPrompt") and object.Enabled then
+    for object in pairs(ensureProximityPromptCache()) do
+        if object and object.Parent and object:IsA("ProximityPrompt") and object.Enabled then
             local promptPosition = getPromptWorldPosition(object)
             if promptPosition then
                 local distance = (position - promptPosition).Magnitude
@@ -4982,32 +5032,81 @@ function UI.makeText(parent, text, size, color, font, alignment)
     return label
 end
 
-function UI.makeTouchDraggable(handle, frame)
-    local dragging = false
-    local dragInput = nil
-    local dragStart = nil
-    local startPosition = nil
+function UI.makeTouchDraggable(handle, frame, reserveRightButton)
+    -- PERFORMANCE: all drag handles on the same VNDT frame share ONE global
+    -- InputChanged/InputEnded pair instead of creating another global listener
+    -- for every edge grip. This matters on mobile where touch events are frequent.
+    UI._dragStates = UI._dragStates or setmetatable({}, {__mode = "k"})
+
+    local state = UI._dragStates[frame]
+    if not state then
+        state = {
+            dragging = false,
+            dragInput = nil,
+            dragStart = nil,
+            startPosition = nil,
+        }
+        UI._dragStates[frame] = state
+
+        local function clampFrameToViewport(position)
+            local camera = Workspace.CurrentCamera
+            local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
+            local size = frame.AbsoluteSize
+            local halfW = size.X * 0.5
+            local halfH = size.Y * 0.5
+            local targetX = viewport.X * position.X.Scale + position.X.Offset
+            local targetY = viewport.Y * position.Y.Scale + position.Y.Offset
+            local margin = 4
+
+            targetX = math.clamp(targetX, halfW + margin, viewport.X - halfW - margin)
+            targetY = math.clamp(targetY, halfH + margin, viewport.Y - halfH - margin)
+
+            return UDim2.fromOffset(targetX, targetY)
+        end
+
+        UserInputService.InputChanged:Connect(function(input)
+            if not state.dragging or not state.dragStart or not state.startPosition then
+                return
+            end
+
+            local isTouch = state.dragInput
+                and state.dragInput.UserInputType == Enum.UserInputType.Touch
+
+            if isTouch then
+                if input ~= state.dragInput then
+                    return
+                end
+            elseif input.UserInputType ~= Enum.UserInputType.MouseMovement then
+                return
+            end
+
+            local delta = input.Position - state.dragStart
+            local proposed = UDim2.new(
+                state.startPosition.X.Scale,
+                state.startPosition.X.Offset + delta.X,
+                state.startPosition.Y.Scale,
+                state.startPosition.Y.Offset + delta.Y
+            )
+
+            frame.Position = clampFrameToViewport(proposed)
+        end)
+
+        UserInputService.InputEnded:Connect(function(input)
+            if not state.dragging then
+                return
+            end
+
+            if input == state.dragInput
+                or input.UserInputType == Enum.UserInputType.MouseButton1 then
+                state.dragging = false
+                state.dragInput = nil
+                state.dragStart = nil
+                state.startPosition = nil
+            end
+        end)
+    end
 
     handle.Active = true
-
-    local function clampFrameToViewport(position)
-        local camera = Workspace.CurrentCamera
-        local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
-        local size = frame.AbsoluteSize
-
-        -- Frame uses center anchor.
-        local halfW = size.X * 0.5
-        local halfH = size.Y * 0.5
-
-        local targetX = viewport.X * position.X.Scale + position.X.Offset
-        local targetY = viewport.Y * position.Y.Scale + position.Y.Offset
-
-        local margin = IS_TOUCH_DEVICE and 8 or 4
-        targetX = math.clamp(targetX, halfW + margin, viewport.X - halfW - margin)
-        targetY = math.clamp(targetY, halfH + margin, viewport.Y - halfH - margin)
-
-        return UDim2.fromOffset(targetX, targetY)
-    end
 
     handle.InputBegan:Connect(function(input)
         local inputType = input.UserInputType
@@ -5016,57 +5115,50 @@ function UI.makeTouchDraggable(handle, frame)
             return
         end
 
-        -- Don't start a drag when tapping the minimize/restore button area.
-        local screenX = input.Position.X
-        local rightEdge = handle.AbsolutePosition.X + handle.AbsoluteSize.X
-        local reserved = IS_TOUCH_DEVICE and 54 or 44
-        if screenX >= rightEdge - reserved then
-            return
-        end
-
-        dragging = true
-        dragInput = input
-        dragStart = input.Position
-        startPosition = frame.Position
-
-        input.Changed:Connect(function()
-            if input.UserInputState == Enum.UserInputState.End
-                or input.UserInputState == Enum.UserInputState.Cancel then
-                dragging = false
-                dragInput = nil
-            end
-        end)
-    end)
-
-    handle.InputChanged:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseMovement
-            or input.UserInputType == Enum.UserInputType.Touch then
-            if dragging then
-                dragInput = input
+        -- Header drag leaves the minimize/restore button clickable.
+        if reserveRightButton then
+            local screenX = input.Position.X
+            local rightEdge = handle.AbsolutePosition.X + handle.AbsoluteSize.X
+            local reserved = IS_TOUCH_DEVICE and 42 or 44
+            if screenX >= rightEdge - reserved then
+                return
             end
         end
+
+        state.dragging = true
+        state.dragInput = input
+        state.dragStart = input.Position
+        state.startPosition = frame.Position
     end)
+end
 
-    UserInputService.InputChanged:Connect(function(input)
-        if not dragging or not dragStart or not startPosition then
-            return
-        end
+function UI.addAllEdgeDragHandles(frame)
+    -- Thin transparent grip zones let mobile users drag from any outer side
+    -- without covering the actual buttons in the center of the UI.
+    local thickness = IS_TOUCH_DEVICE and 10 or 6
+    local handles = {}
 
-        if input ~= dragInput
-            and input.UserInputType ~= Enum.UserInputType.Touch then
-            return
-        end
+    local function makeHandle(name, position, size, anchorPoint)
+        local grip = Instance.new("Frame")
+        grip.Name = name
+        grip.BackgroundTransparency = 1
+        grip.BorderSizePixel = 0
+        grip.Active = true
+        grip.ZIndex = 80
+        grip.AnchorPoint = anchorPoint or Vector2.new(0, 0)
+        grip.Position = position
+        grip.Size = size
+        grip.Parent = frame
+        table.insert(handles, grip)
+        UI.makeTouchDraggable(grip, frame, false)
+        return grip
+    end
 
-        local delta = input.Position - dragStart
-        local proposed = UDim2.new(
-            startPosition.X.Scale,
-            startPosition.X.Offset + delta.X,
-            startPosition.Y.Scale,
-            startPosition.Y.Offset + delta.Y
-        )
+    makeHandle("DragLeft", UDim2.fromOffset(0, 0), UDim2.new(0, thickness, 1, 0))
+    makeHandle("DragRight", UDim2.new(1, 0, 0, 0), UDim2.new(0, thickness, 1, 0), Vector2.new(1, 0))
+    makeHandle("DragBottom", UDim2.new(0, 0, 1, 0), UDim2.new(1, 0, 0, thickness), Vector2.new(0, 1))
 
-        frame.Position = clampFrameToViewport(proposed)
-    end)
+    return handles
 end
 
 function UI.getResponsiveSize()
@@ -5074,17 +5166,20 @@ function UI.getResponsiveSize()
     local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
 
     if IS_TOUCH_DEVICE then
-        -- Never exceed the actual mobile viewport.
-        local width = math.clamp(viewport.X - 24, 260, 320)
-        local height = math.clamp(viewport.Y - 110, 300, 430)
+        -- Smaller OUTER window only. Row/button/dropdown dimensions below are
+        -- intentionally untouched; the scrolling viewport simply shows less at once.
+        local width = math.clamp(math.floor(viewport.X * 0.36), 135, 160)
+        local height = math.clamp(math.floor(viewport.Y * 0.27), 155, 205)
 
-        -- Landscape phones need a shorter panel.
         if viewport.X > viewport.Y then
-            width = math.clamp(viewport.X * 0.52, 280, 340)
-            height = math.clamp(viewport.Y - 44, 280, 360)
+            width = math.clamp(math.floor(viewport.X * 0.18), 140, 170)
+            height = math.clamp(math.floor(viewport.Y * 0.46), 155, 205)
         end
 
-        return math.floor(width), math.floor(height)
+        width = math.min(width, math.max(130, viewport.X - 12))
+        height = math.min(height, math.max(150, viewport.Y - 18))
+
+        return width, height
     end
 
     local width = math.clamp(math.floor(viewport.X * 0.82), 280, 340)
@@ -5100,12 +5195,12 @@ end
 function UI.createSectionLabel(parent, text, order)
     local row = Instance.new("Frame")
     row.Name = text:gsub("%s+", "") .. "Section"
-    row.Size = UDim2.new(1, 0, 0, 22)
+    row.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 12 or 22)
     row.BackgroundTransparency = 1
     row.LayoutOrder = order
     row.Parent = parent
 
-    local label = UI.makeText(row, string.upper(text), 10, THEME.muted, Enum.Font.GothamBold)
+    local label = UI.makeText(row, string.upper(text), IS_TOUCH_DEVICE and 6 or 10, THEME.muted, Enum.Font.GothamBold)
     label.Size = UDim2.new(1, 0, 1, 0)
     label.TextTransparency = 0.05
 
@@ -5116,7 +5211,7 @@ end
 function UI.createActionRow(parent, labelText, description, buttonText, order, onActivated)
     local row = Instance.new("Frame")
     row.Name = labelText:gsub("%W+", "") .. "Action"
-    row.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 58 or 54)
+    row.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 33 or 54)
     row.BackgroundColor3 = THEME.card
     row.BorderSizePixel = 0
     row.LayoutOrder = order
@@ -5124,26 +5219,26 @@ function UI.createActionRow(parent, labelText, description, buttonText, order, o
     UI.addCorner(row, 10)
     UI.addStroke(row, THEME.line, 1, 0.45)
 
-    local label = UI.makeText(row, labelText, 13, THEME.text, Enum.Font.GothamBold)
-    label.Position = UDim2.new(0, 11, 0, 6)
-    label.Size = UDim2.new(1, -92, 0, 20)
+    local label = UI.makeText(row, labelText, IS_TOUCH_DEVICE and 9 or 13, THEME.text, Enum.Font.GothamBold)
+    label.Position = IS_TOUCH_DEVICE and UDim2.new(0, 6, 0, 2) or UDim2.new(0, 11, 0, 6)
+    label.Size = UDim2.new(1, IS_TOUCH_DEVICE and -61 or -92, 0, IS_TOUCH_DEVICE and 13 or 20)
 
-    local sub = UI.makeText(row, description or "", 9, THEME.muted, Enum.Font.GothamBold)
-    sub.Position = UDim2.new(0, 11, 0, 27)
-    sub.Size = UDim2.new(1, -92, 0, 17)
+    local sub = UI.makeText(row, description or "", IS_TOUCH_DEVICE and 5 or 9, THEME.muted, Enum.Font.GothamBold)
+    sub.Position = IS_TOUCH_DEVICE and UDim2.new(0, 6, 0, 16) or UDim2.new(0, 11, 0, 27)
+    sub.Size = UDim2.new(1, IS_TOUCH_DEVICE and -61 or -92, 0, IS_TOUCH_DEVICE and 10 or 17)
     sub.TextTruncate = Enum.TextTruncate.AtEnd
 
     local button = Instance.new("TextButton")
     button.Name = "ActionButton"
     button.AutoButtonColor = false
     button.AnchorPoint = Vector2.new(1, 0.5)
-    button.Position = UDim2.new(1, -9, 0.5, 0)
-    button.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(72, 32) or UDim2.fromOffset(70, 28)
+    button.Position = UDim2.new(1, IS_TOUCH_DEVICE and -5 or -9, 0.5, 0)
+    button.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(42, 19) or UDim2.fromOffset(70, 28)
     button.BackgroundColor3 = THEME.accent
     button.BorderSizePixel = 0
     button.Text = buttonText or "RUN"
     button.TextColor3 = THEME.text
-    button.TextSize = 10
+    button.TextSize = IS_TOUCH_DEVICE and 7 or 10
     button.Font = Enum.Font.GothamBold
     button.Parent = row
     UI.addCorner(button, 8)
@@ -5167,7 +5262,7 @@ end
 function UI.createToggleRow(parent, labelText, description, order, initialValue, onChanged)
     local row = Instance.new("Frame")
     row.Name = labelText:gsub("%W+", "") .. "Toggle"
-    row.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 58 or 54)
+    row.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 33 or 54)
     row.BackgroundColor3 = THEME.card
     row.BorderSizePixel = 0
     row.LayoutOrder = order
@@ -5175,22 +5270,22 @@ function UI.createToggleRow(parent, labelText, description, order, initialValue,
     UI.addCorner(row, 10)
     UI.addStroke(row, THEME.line, 1, 0.45)
 
-    local label = UI.makeText(row, labelText, 13, THEME.text, Enum.Font.GothamBold)
-    label.Position = UDim2.new(0, 11, 0, 6)
-    label.Size = UDim2.new(1, -76, 0, 20)
+    local label = UI.makeText(row, labelText, IS_TOUCH_DEVICE and 9 or 13, THEME.text, Enum.Font.GothamBold)
+    label.Position = IS_TOUCH_DEVICE and UDim2.new(0, 6, 0, 2) or UDim2.new(0, 11, 0, 6)
+    label.Size = UDim2.new(1, IS_TOUCH_DEVICE and -51 or -76, 0, IS_TOUCH_DEVICE and 13 or 20)
 
-    local sub = UI.makeText(row, description or "", 10, THEME.muted, Enum.Font.GothamBold)
-    sub.Position = UDim2.new(0, 11, 0, 27)
-    sub.Size = UDim2.new(1, -76, 0, 17)
+    local sub = UI.makeText(row, description or "", IS_TOUCH_DEVICE and 5 or 10, THEME.muted, Enum.Font.GothamBold)
+    sub.Position = IS_TOUCH_DEVICE and UDim2.new(0, 6, 0, 16) or UDim2.new(0, 11, 0, 27)
+    sub.Size = UDim2.new(1, IS_TOUCH_DEVICE and -51 or -76, 0, IS_TOUCH_DEVICE and 10 or 17)
     sub.TextTruncate = Enum.TextTruncate.AtEnd
 
     local button = Instance.new("TextButton")
     button.Name = "Switch"
     button.AutoButtonColor = false
     button.Text = ""
-    button.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(50, 30) or UDim2.fromOffset(44, 26)
+    button.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(31, 18) or UDim2.fromOffset(44, 26)
     button.AnchorPoint = Vector2.new(1, 0.5)
-    button.Position = UDim2.new(1, -10, 0.5, 0)
+    button.Position = UDim2.new(1, IS_TOUCH_DEVICE and -5 or -10, 0.5, 0)
     button.BackgroundColor3 = initialValue and THEME.accent or Color3.fromRGB(55, 59, 77)
     button.BorderSizePixel = 0
     button.Parent = row
@@ -5198,9 +5293,9 @@ function UI.createToggleRow(parent, labelText, description, order, initialValue,
 
     local knob = Instance.new("Frame")
     knob.Name = "Knob"
-    knob.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(22, 22) or UDim2.fromOffset(20, 20)
+    knob.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(13, 13) or UDim2.fromOffset(20, 20)
     knob.AnchorPoint = Vector2.new(0.5, 0.5)
-    local knobOffset = IS_TOUCH_DEVICE and 15 or 13
+    local knobOffset = IS_TOUCH_DEVICE and 8 or 13
     knob.Position = initialValue and UDim2.new(1, -knobOffset, 0.5, 0) or UDim2.new(0, knobOffset, 0.5, 0)
     knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
     knob.BorderSizePixel = 0
@@ -5211,7 +5306,7 @@ function UI.createToggleRow(parent, labelText, description, order, initialValue,
 
     local function render(instant)
         local targetColor = enabled and THEME.accent or Color3.fromRGB(55, 59, 77)
-        local knobOffset = IS_TOUCH_DEVICE and 15 or 13
+        local knobOffset = IS_TOUCH_DEVICE and 8 or 13
         local targetPosition = enabled and UDim2.new(1, -knobOffset, 0.5, 0) or UDim2.new(0, knobOffset, 0.5, 0)
 
         if instant then
@@ -5258,7 +5353,7 @@ end
 function UI.createSingleSelectDropdown(parent, labelText, description, order, initialValue, onChanged)
     local wrapper = Instance.new("Frame")
     wrapper.Name = labelText:gsub("%W+", "") .. "SingleDropdown"
-    wrapper.Size = UDim2.new(1, 0, 0, 54)
+    wrapper.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 34 or 54)
     wrapper.AutomaticSize = Enum.AutomaticSize.Y
     wrapper.BackgroundColor3 = THEME.surface
     wrapper.BorderSizePixel = 0
@@ -5266,15 +5361,15 @@ function UI.createSingleSelectDropdown(parent, labelText, description, order, in
     wrapper.Parent = parent
     UI.addCorner(wrapper, 10)
     UI.addStroke(wrapper, THEME.line, 1, 0.45)
-    UI.addPadding(wrapper, 6, 6, 6, 6)
+    UI.addPadding(wrapper, IS_TOUCH_DEVICE and 2 or 6, IS_TOUCH_DEVICE and 2 or 6, IS_TOUCH_DEVICE and 2 or 6, IS_TOUCH_DEVICE and 2 or 6)
 
     local layout = Instance.new("UIListLayout")
     layout.SortOrder = Enum.SortOrder.LayoutOrder
-    layout.Padding = UDim.new(0, 5)
+    layout.Padding = UDim.new(0, IS_TOUCH_DEVICE and 3 or 5)
     layout.Parent = wrapper
 
     local header = Instance.new("TextButton")
-    header.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 48 or 44)
+    header.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 28 or 44)
     header.BackgroundColor3 = THEME.card
     header.BorderSizePixel = 0
     header.AutoButtonColor = false
@@ -5283,19 +5378,19 @@ function UI.createSingleSelectDropdown(parent, labelText, description, order, in
     header.Parent = wrapper
     UI.addCorner(header, 8)
 
-    local title = UI.makeText(header, labelText, 13, THEME.text, Enum.Font.GothamBold)
-    title.Position = UDim2.fromOffset(10, 3)
-    title.Size = UDim2.new(1, -46, 0, 19)
+    local title = UI.makeText(header, labelText, IS_TOUCH_DEVICE and 9 or 13, THEME.text, Enum.Font.GothamBold)
+    title.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(6, 0) or UDim2.fromOffset(10, 3)
+    title.Size = UDim2.new(1, -35, 0, IS_TOUCH_DEVICE and 12 or 19)
 
-    local summary = UI.makeText(header, initialValue or description or "None selected", 9, THEME.muted, Enum.Font.GothamBold)
-    summary.Position = UDim2.fromOffset(10, 22)
-    summary.Size = UDim2.new(1, -46, 0, 16)
+    local summary = UI.makeText(header, initialValue or description or "None selected", IS_TOUCH_DEVICE and 5 or 9, THEME.muted, Enum.Font.GothamBold)
+    summary.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(6, 12) or UDim2.fromOffset(10, 22)
+    summary.Size = UDim2.new(1, -35, 0, IS_TOUCH_DEVICE and 11 or 16)
     summary.TextTruncate = Enum.TextTruncate.AtEnd
 
-    local arrow = UI.makeText(header, "⌄", 18, THEME.muted, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+    local arrow = UI.makeText(header, "⌄", IS_TOUCH_DEVICE and 14 or 18, THEME.muted, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
     arrow.AnchorPoint = Vector2.new(1, 0.5)
-    arrow.Position = UDim2.new(1, -6, 0.5, 0)
-    arrow.Size = UDim2.fromOffset(28, 28)
+    arrow.Position = UDim2.new(1, IS_TOUCH_DEVICE and -4 or -6, 0.5, 0)
+    arrow.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(18, 18) or UDim2.fromOffset(28, 28)
 
     local options = Instance.new("Frame")
     options.Size = UDim2.new(1, 0, 0, 0)
@@ -5307,7 +5402,7 @@ function UI.createSingleSelectDropdown(parent, labelText, description, order, in
 
     local optionsLayout = Instance.new("UIListLayout")
     optionsLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    optionsLayout.Padding = UDim.new(0, 4)
+    optionsLayout.Padding = UDim.new(0, IS_TOUCH_DEVICE and 3 or 4)
     optionsLayout.Parent = options
 
     local currentValue = initialValue
@@ -5335,7 +5430,7 @@ function UI.createSingleSelectDropdown(parent, labelText, description, order, in
 
         for index, value in ipairs(currentOptions) do
             local option = Instance.new("TextButton")
-            option.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 40 or 34)
+            option.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 22 or 34)
             option.BackgroundColor3 = currentValue == value and Color3.fromRGB(43, 39, 75) or THEME.card
             option.BorderSizePixel = 0
             option.AutoButtonColor = false
@@ -5348,7 +5443,7 @@ function UI.createSingleSelectDropdown(parent, labelText, description, order, in
             if counts and counts[value] ~= nil then
                 labelText = value .. "  ×" .. tostring(counts[value])
             end
-            local label = UI.makeText(option, labelText, 11, THEME.text, Enum.Font.GothamBold)
+            local label = UI.makeText(option, labelText, IS_TOUCH_DEVICE and 7 or 11, THEME.text, Enum.Font.GothamBold)
             label.Position = UDim2.fromOffset(10, 0)
             label.Size = UDim2.new(1, -20, 1, 0)
 
@@ -5388,7 +5483,7 @@ end
 function UI.createMultiSelectDropdown(parent, labelText, description, order, selectionTable, onChanged)
     local wrapper = Instance.new("Frame")
     wrapper.Name = labelText:gsub("%W+", "") .. "Dropdown"
-    wrapper.Size = UDim2.new(1, 0, 0, 54)
+    wrapper.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 34 or 54)
     wrapper.AutomaticSize = Enum.AutomaticSize.Y
     wrapper.BackgroundColor3 = THEME.surface
     wrapper.BorderSizePixel = 0
@@ -5396,16 +5491,16 @@ function UI.createMultiSelectDropdown(parent, labelText, description, order, sel
     wrapper.Parent = parent
     UI.addCorner(wrapper, 10)
     UI.addStroke(wrapper, THEME.line, 1, 0.45)
-    UI.addPadding(wrapper, 6, 6, 6, 6)
+    UI.addPadding(wrapper, IS_TOUCH_DEVICE and 2 or 6, IS_TOUCH_DEVICE and 2 or 6, IS_TOUCH_DEVICE and 2 or 6, IS_TOUCH_DEVICE and 2 or 6)
 
     local layout = Instance.new("UIListLayout")
     layout.SortOrder = Enum.SortOrder.LayoutOrder
-    layout.Padding = UDim.new(0, 5)
+    layout.Padding = UDim.new(0, IS_TOUCH_DEVICE and 3 or 5)
     layout.Parent = wrapper
 
     local header = Instance.new("TextButton")
     header.Name = "Header"
-    header.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 48 or 44)
+    header.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 28 or 44)
     header.BackgroundColor3 = THEME.card
     header.BorderSizePixel = 0
     header.AutoButtonColor = false
@@ -5414,19 +5509,19 @@ function UI.createMultiSelectDropdown(parent, labelText, description, order, sel
     header.Parent = wrapper
     UI.addCorner(header, 8)
 
-    local title = UI.makeText(header, labelText, 13, THEME.text, Enum.Font.GothamBold)
-    title.Position = UDim2.fromOffset(10, 3)
-    title.Size = UDim2.new(1, -46, 0, 19)
+    local title = UI.makeText(header, labelText, IS_TOUCH_DEVICE and 9 or 13, THEME.text, Enum.Font.GothamBold)
+    title.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(6, 0) or UDim2.fromOffset(10, 3)
+    title.Size = UDim2.new(1, -35, 0, IS_TOUCH_DEVICE and 12 or 19)
 
-    local summary = UI.makeText(header, description or "None selected", 9, THEME.muted, Enum.Font.GothamBold)
-    summary.Position = UDim2.fromOffset(10, 22)
-    summary.Size = UDim2.new(1, -46, 0, 16)
+    local summary = UI.makeText(header, description or "None selected", IS_TOUCH_DEVICE and 5 or 9, THEME.muted, Enum.Font.GothamBold)
+    summary.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(6, 12) or UDim2.fromOffset(10, 22)
+    summary.Size = UDim2.new(1, -35, 0, IS_TOUCH_DEVICE and 11 or 16)
     summary.TextTruncate = Enum.TextTruncate.AtEnd
 
-    local arrow = UI.makeText(header, "⌄", 18, THEME.muted, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+    local arrow = UI.makeText(header, "⌄", IS_TOUCH_DEVICE and 14 or 18, THEME.muted, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
     arrow.AnchorPoint = Vector2.new(1, 0.5)
-    arrow.Position = UDim2.new(1, -6, 0.5, 0)
-    arrow.Size = UDim2.fromOffset(28, 28)
+    arrow.Position = UDim2.new(1, IS_TOUCH_DEVICE and -4 or -6, 0.5, 0)
+    arrow.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(18, 18) or UDim2.fromOffset(28, 28)
 
     local options = Instance.new("Frame")
     options.Name = "Options"
@@ -5439,7 +5534,7 @@ function UI.createMultiSelectDropdown(parent, labelText, description, order, sel
 
     local optionsLayout = Instance.new("UIListLayout")
     optionsLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    optionsLayout.Padding = UDim.new(0, 4)
+    optionsLayout.Padding = UDim.new(0, IS_TOUCH_DEVICE and 3 or 4)
     optionsLayout.Parent = options
 
     local currentOptions = {}
@@ -5488,7 +5583,7 @@ function UI.createMultiSelectDropdown(parent, labelText, description, order, sel
         for index, rarityName in ipairs(currentOptions) do
             local option = Instance.new("TextButton")
             option.Name = "Option_" .. tostring(index)
-            option.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 40 or 34)
+            option.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 22 or 34)
             option.BackgroundColor3 = THEME.card
             option.BorderSizePixel = 0
             option.AutoButtonColor = false
@@ -5498,20 +5593,20 @@ function UI.createMultiSelectDropdown(parent, labelText, description, order, sel
             UI.addCorner(option, 9)
 
             local check = Instance.new("TextLabel")
-            check.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(24, 24) or UDim2.fromOffset(22, 22)
-            check.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(8, 8) or UDim2.fromOffset(6, 6)
+            check.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(13, 13) or UDim2.fromOffset(22, 22)
+            check.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(5, 5) or UDim2.fromOffset(6, 6)
             check.BackgroundColor3 = Color3.fromRGB(54, 58, 76)
             check.BorderSizePixel = 0
             check.Text = ""
             check.TextColor3 = THEME.text
-            check.TextSize = 13
+            check.TextSize = IS_TOUCH_DEVICE and 7 or 13
             check.Font = Enum.Font.GothamBold
             check.Parent = option
             UI.addCorner(check, 6)
 
-            local label = UI.makeText(option, rarityName, 11, THEME.text, Enum.Font.GothamBold)
-            label.Position = UDim2.fromOffset(IS_TOUCH_DEVICE and 42 or 36, 0)
-            label.Size = UDim2.new(1, -42, 1, 0)
+            local label = UI.makeText(option, rarityName, IS_TOUCH_DEVICE and 7 or 11, THEME.text, Enum.Font.GothamBold)
+            label.Position = UDim2.fromOffset(IS_TOUCH_DEVICE and 22 or 36, 0)
+            label.Size = UDim2.new(1, IS_TOUCH_DEVICE and -22 or -42, 1, 0)
 
             renderOption(option, check, rarityName)
 
@@ -5585,8 +5680,8 @@ function UI.launchMainGui()
     local expandedSize = UDim2.fromOffset(mainWidth, mainHeight)
 
     -- Compact minimized bar dimensions.
-    local MINIMIZED_WIDTH = IS_TOUCH_DEVICE and 138 or 150
-    local MINIMIZED_HEIGHT = IS_TOUCH_DEVICE and 40 or 42
+    local MINIMIZED_WIDTH = IS_TOUCH_DEVICE and 78 or 150
+    local MINIMIZED_HEIGHT = IS_TOUCH_DEVICE and 25 or 42
 
     local shadow = Instance.new("Frame")
     shadow.Name = "Shadow"
@@ -5622,18 +5717,18 @@ function UI.launchMainGui()
 
     local header = Instance.new("Frame")
     header.Name = "Header"
-    header.Size = UDim2.new(1, 0, 0, 48)
+    header.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 28 or 48)
     header.BackgroundTransparency = 1
     header.Active = true
     header.Parent = mainFrame
 
     local brandDot = Instance.new("Frame")
-    brandDot.Size = UDim2.fromOffset(28, 28)
-    brandDot.Position = UDim2.fromOffset(10, 10)
+    brandDot.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(14, 14) or UDim2.fromOffset(28, 28)
+    brandDot.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(6, 7) or UDim2.fromOffset(10, 10)
     brandDot.BackgroundColor3 = THEME.accent
     brandDot.BorderSizePixel = 0
     brandDot.Parent = header
-    UI.addCorner(brandDot, 11)
+    UI.addCorner(brandDot, IS_TOUCH_DEVICE and 7 or 11)
 
     local brandGradient = Instance.new("UIGradient")
     brandGradient.Color = ColorSequence.new({
@@ -5643,36 +5738,37 @@ function UI.launchMainGui()
     brandGradient.Rotation = 35
     brandGradient.Parent = brandDot
 
-    local brandLetter = UI.makeText(brandDot, "V", 15, THEME.text, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+    local brandLetter = UI.makeText(brandDot, "V", IS_TOUCH_DEVICE and 8 or 15, THEME.text, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
     brandLetter.Size = UDim2.fromScale(1, 1)
 
-    local title = UI.makeText(header, GUI_TITLE, 15, THEME.text, Enum.Font.GothamBold)
-    title.Position = UDim2.fromOffset(58, 10)
-    title.Size = UDim2.new(1, -94, 0, 21)
+    local title = UI.makeText(header, GUI_TITLE, IS_TOUCH_DEVICE and 9 or 15, THEME.text, Enum.Font.GothamBold)
+    title.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(25, 2) or UDim2.fromOffset(58, 10)
+    title.Size = UDim2.new(1, IS_TOUCH_DEVICE and -51 or -94, 0, IS_TOUCH_DEVICE and 13 or 21)
 
-    local subtitle = UI.makeText(header, "Automation Hub", 9, THEME.muted, Enum.Font.GothamBold)
-    subtitle.Position = UDim2.fromOffset(58, 32)
-    subtitle.Size = UDim2.new(1, -94, 0, 15)
+    local subtitle = UI.makeText(header, "Automation Hub", IS_TOUCH_DEVICE and 5 or 9, THEME.muted, Enum.Font.GothamBold)
+    subtitle.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(25, 14) or UDim2.fromOffset(58, 32)
+    subtitle.Size = UDim2.new(1, IS_TOUCH_DEVICE and -51 or -94, 0, IS_TOUCH_DEVICE and 9 or 15)
 
     local minimize = Instance.new("TextButton")
     minimize.Name = "Minimize"
     minimize.AutoButtonColor = false
     minimize.AnchorPoint = Vector2.new(1, 0)
-    minimize.Position = UDim2.new(1, -9, 0, 9)
-    minimize.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(38, 34) or UDim2.fromOffset(32, 28)
+    minimize.Position = IS_TOUCH_DEVICE and UDim2.new(1, -4, 0, 4) or UDim2.new(1, -9, 0, 9)
+    minimize.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(20, 20) or UDim2.fromOffset(32, 28)
     minimize.BackgroundColor3 = THEME.surface2
     minimize.Text = "—"
     minimize.TextColor3 = THEME.text
-    minimize.TextSize = 17
+    minimize.TextSize = IS_TOUCH_DEVICE and 12 or 17
     minimize.Font = Enum.Font.GothamBold
     minimize.BorderSizePixel = 0
+    minimize.ZIndex = 100 -- keep clickable above the right-edge drag grip
     minimize.Parent = header
     UI.addCorner(minimize, 8)
     UI.addStroke(minimize, THEME.line, 1, 0.4)
 
     local divider = Instance.new("Frame")
-    divider.Position = UDim2.new(0, 10, 0, 47)
-    divider.Size = UDim2.new(1, -20, 0, 1)
+    divider.Position = UDim2.new(0, 6, 0, IS_TOUCH_DEVICE and 27 or 47)
+    divider.Size = UDim2.new(1, IS_TOUCH_DEVICE and -12 or -20, 0, 1)
     divider.BackgroundColor3 = THEME.line
     divider.BackgroundTransparency = 0.55
     divider.BorderSizePixel = 0
@@ -5680,11 +5776,11 @@ function UI.launchMainGui()
 
     local content = Instance.new("ScrollingFrame")
     content.Name = "Content"
-    content.Position = UDim2.fromOffset(8, 55)
-    content.Size = UDim2.new(1, -16, 1, -63)
+    content.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(4, 32) or UDim2.fromOffset(8, 55)
+    content.Size = IS_TOUCH_DEVICE and UDim2.new(1, -8, 1, -36) or UDim2.new(1, -16, 1, -63)
     content.BackgroundTransparency = 1
     content.BorderSizePixel = 0
-    content.ScrollBarThickness = IS_TOUCH_DEVICE and 4 or 2
+    content.ScrollBarThickness = IS_TOUCH_DEVICE and 2 or 2
     content.ScrollBarImageColor3 = THEME.accent
     content.ScrollingDirection = Enum.ScrollingDirection.Y
     content.Active = true
@@ -5693,16 +5789,16 @@ function UI.launchMainGui()
     content.AutomaticCanvasSize = Enum.AutomaticSize.Y
     content.CanvasSize = UDim2.new(0, 0, 0, 0)
     content.Parent = mainFrame
-    UI.addPadding(content, 1, 3, 1, 5)
+    UI.addPadding(content, 1, 2, 1, 3)
 
     local contentLayout = Instance.new("UIListLayout")
     contentLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    contentLayout.Padding = UDim.new(0, 6)
+    contentLayout.Padding = UDim.new(0, IS_TOUCH_DEVICE and 2 or 6)
     contentLayout.Parent = content
 
     local hero = Instance.new("Frame")
     hero.Name = "StatusCard"
-    hero.Size = UDim2.new(1, 0, 0, 78)
+    hero.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 43 or 78)
     hero.BackgroundColor3 = THEME.surface
     hero.BorderSizePixel = 0
     hero.LayoutOrder = 1
@@ -5718,18 +5814,18 @@ function UI.launchMainGui()
     heroGradient.Rotation = 20
     heroGradient.Parent = hero
 
-    local statusTitle = UI.makeText(hero, "VNDT READY", 13, THEME.text, Enum.Font.GothamBold)
-    statusTitle.Position = UDim2.fromOffset(10, 8)
-    statusTitle.Size = UDim2.new(1, -92, 0, 19)
+    local statusTitle = UI.makeText(hero, "VNDT READY", IS_TOUCH_DEVICE and 8 or 13, THEME.text, Enum.Font.GothamBold)
+    statusTitle.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(6, 3) or UDim2.fromOffset(10, 8)
+    statusTitle.Size = UDim2.new(1, IS_TOUCH_DEVICE and -59 or -92, 0, IS_TOUCH_DEVICE and 12 or 19)
 
-    local statusSub = UI.makeText(hero, "Auto Steal: Idle", 10, THEME.muted, Enum.Font.GothamBold)
-    statusSub.Position = UDim2.fromOffset(10, 29)
-    statusSub.Size = UDim2.new(1, -20, 0, 17)
+    local statusSub = UI.makeText(hero, "Auto Steal: Idle", IS_TOUCH_DEVICE and 6 or 10, THEME.muted, Enum.Font.GothamBold)
+    statusSub.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(6, 15) or UDim2.fromOffset(10, 29)
+    statusSub.Size = UDim2.new(1, -12, 0, IS_TOUCH_DEVICE and 10 or 17)
     statusSub.TextTruncate = Enum.TextTruncate.AtEnd
 
-    local rarityStatus = UI.makeText(hero, "Rarities: Scanning…", 9, THEME.muted, Enum.Font.GothamBold)
-    rarityStatus.Position = UDim2.fromOffset(10, 49)
-    rarityStatus.Size = UDim2.new(1, -20, 0, 16)
+    local rarityStatus = UI.makeText(hero, "Rarities: Scanning…", IS_TOUCH_DEVICE and 5 or 9, THEME.muted, Enum.Font.GothamBold)
+    rarityStatus.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(6, 27) or UDim2.fromOffset(10, 49)
+    rarityStatus.Size = UDim2.new(1, -12, 0, IS_TOUCH_DEVICE and 10 or 16)
     rarityStatus.TextTruncate = Enum.TextTruncate.AtEnd
 
     statusSink = function(message, kind)
@@ -5768,12 +5864,12 @@ function UI.launchMainGui()
 
     local badge = Instance.new("TextLabel")
     badge.AnchorPoint = Vector2.new(1, 0)
-    badge.Position = UDim2.new(1, -8, 0, 8)
-    badge.Size = UDim2.fromOffset(68, 22)
+    badge.Position = UDim2.new(1, IS_TOUCH_DEVICE and -4 or -8, 0, IS_TOUCH_DEVICE and 3 or 8)
+    badge.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(38, 14) or UDim2.fromOffset(68, 22)
     badge.BackgroundColor3 = Color3.fromRGB(29, 70, 58)
     badge.Text = "KEYLESS"
     badge.TextColor3 = THEME.success
-    badge.TextSize = 9
+    badge.TextSize = IS_TOUCH_DEVICE and 5 or 9
     badge.Font = Enum.Font.GothamBold
     badge.BorderSizePixel = 0
     badge.Parent = hero
@@ -6071,7 +6167,7 @@ function UI.launchMainGui()
     PetEggAutomation.Start()
 
     local footer = Instance.new("Frame")
-    footer.Size = UDim2.new(1, 0, 0, 28)
+    footer.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 12 or 28)
     footer.BackgroundTransparency = 1
     footer.LayoutOrder = 22
     footer.Parent = content
@@ -6081,14 +6177,15 @@ function UI.launchMainGui()
         IS_TOUCH_DEVICE
             and "VNDT  •  Mobile mode  •  Config auto-saves"
             or "VNDT  •  Config auto-saves  •  FPS toggle",
-        9,
+        IS_TOUCH_DEVICE and 5 or 9,
         THEME.muted,
         Enum.Font.GothamBold,
         Enum.TextXAlignment.Center
     )
     footerText.Size = UDim2.fromScale(1, 1)
 
-    UI.makeTouchDraggable(header, mainFrame)
+    UI.makeTouchDraggable(header, mainFrame, true)
+    UI.addAllEdgeDragHandles(mainFrame)
 
     local minimized = false
 
@@ -6116,14 +6213,14 @@ function UI.launchMainGui()
             subtitle.Visible = false
 
             -- Reposition title/buttons for the tiny minimized bar.
-            title.Position = UDim2.fromOffset(12, 0)
-            title.Size = UDim2.new(1, -52, 1, 0)
-            title.TextSize = 13
+            title.Position = UDim2.fromOffset(IS_TOUCH_DEVICE and 5 or 12, 0)
+            title.Size = UDim2.new(1, IS_TOUCH_DEVICE and -31 or -52, 1, 0)
+            title.TextSize = IS_TOUCH_DEVICE and 8 or 13
 
             minimize.Text = "+"
-            minimize.Position = UDim2.new(1, -7, 0.5, 0)
+            minimize.Position = UDim2.new(1, IS_TOUCH_DEVICE and -4 or -7, 0.5, 0)
             minimize.AnchorPoint = Vector2.new(1, 0.5)
-            minimize.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(34, 30) or UDim2.fromOffset(28, 26)
+            minimize.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(19, 18) or UDim2.fromOffset(28, 26)
 
             UI.tween(mainFrame, 0.16, {
                 Size = UDim2.fromOffset(MINIMIZED_WIDTH, MINIMIZED_HEIGHT)
@@ -6134,14 +6231,14 @@ function UI.launchMainGui()
             brandDot.Visible = true
             subtitle.Visible = true
 
-            title.Position = UDim2.fromOffset(46, 4)
-            title.Size = UDim2.new(1, -94, 0, 21)
-            title.TextSize = 15
+            title.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(25, 2) or UDim2.fromOffset(46, 4)
+            title.Size = UDim2.new(1, IS_TOUCH_DEVICE and -51 or -94, 0, IS_TOUCH_DEVICE and 13 or 21)
+            title.TextSize = IS_TOUCH_DEVICE and 9 or 15
 
             minimize.Text = "—"
             minimize.AnchorPoint = Vector2.new(1, 0)
-            minimize.Position = UDim2.new(1, -9, 0, 9)
-            minimize.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(38, 34) or UDim2.fromOffset(32, 28)
+            minimize.Position = IS_TOUCH_DEVICE and UDim2.new(1, -4, 0, 4) or UDim2.new(1, -9, 0, 9)
+            minimize.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(20, 20) or UDim2.fromOffset(32, 28)
 
             UI.tween(mainFrame, 0.16, {Size = expandedSize})
         end
