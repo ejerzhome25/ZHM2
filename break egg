@@ -26,6 +26,7 @@
       * PC SCROLLBAR FIX: custom scrollbar now renders and supports mouse input on PC executors
       * RIGHT-EDGE SCROLLBAR: custom rail is pinned to the outer right side of the VNDT window
       * EXTRA-SMALL MOBILE SCROLLBAR: thinner rail, compact thumb, and smaller arrow buttons
+      * FLOATING DETACH: mobile/PC scrollbar can be dragged outside the VNDT window across the screen
       * TOUCH FIX: taps stay taps; vertical movement becomes scrolling after a small threshold
       * TOUCH FIX: thinner edge drag zones reduce accidental swipe capture
       * PERFORMANCE: cached ProximityPrompts + plot lookup to avoid repeated full Workspace scans
@@ -5316,7 +5317,11 @@ function UI.bindSmoothScrolling(scroller, layout)
         return
     end
 
-    -- MOBILE TINY EDGE SCROLLBAR: 9px lane, tiny arrows/thumb, flush to the right edge.
+    -- MOBILE TINY EDGE SCROLLBAR: slim lane, tiny arrows/thumb, flush to the right edge.
+    -- FLOATING DETACHABLE: drag the small side grip to move the entire scrollbar
+    -- anywhere on the screen, including completely outside the VNDT window.
+    -- The floating layer is parented to the ScreenGui so MainFrame.ClipsDescendants
+    -- cannot cut the detached bar off on mobile executors.
     local BRIGHT_PURPLE = Color3.fromRGB(139, 92, 246)
     local LIGHT_PURPLE = Color3.fromRGB(216, 205, 255)
     local DEEP_PURPLE = Color3.fromRGB(91, 33, 182)
@@ -5339,15 +5344,48 @@ function UI.bindSmoothScrolling(scroller, layout)
     local updateQueued = false
     local thumbParent = scroller.Parent
 
+    -- Put custom scrollbar visuals in a screen-level layer instead of inside
+    -- MainFrame. This is what lets the bar move beyond the VNDT edges even though
+    -- MainFrame uses ClipsDescendants = true.
+    local hostGui = scroller:FindFirstAncestorOfClass("ScreenGui")
+    local floatingLayer = nil
+    if hostGui then
+        floatingLayer = Instance.new("Frame")
+        floatingLayer.Name = "VNDT_FloatingScrollbarLayer"
+        floatingLayer.BackgroundTransparency = 1
+        floatingLayer.BorderSizePixel = 0
+        floatingLayer.Position = UDim2.fromOffset(0, 0)
+        floatingLayer.Size = UDim2.fromScale(1, 1)
+        floatingLayer.ClipsDescendants = false
+        floatingLayer.Active = false
+        floatingLayer.ZIndex = 300
+        floatingLayer.Parent = hostGui
+    end
+    local visualParent = floatingLayer or thumbParent
+
     local railGlow = nil
     local railButton = nil
     local upButton = nil
     local downButton = nil
     local thumbShadow = nil
     local thumb = nil
+    local detachGrip = nil
 
     local railTouch = nil
     local railDragging = false
+
+    -- Offset from the normal right-edge position. Zero means attached to the edge.
+    local detachedOffset = Vector2.zero
+    local detachDragging = false
+    local detachInput = nil
+    local detachStartScreen = nil
+    local detachStartLeft = 0
+    local detachStartTop = 0
+    local detachMoved = false
+    local lastDetachTap = 0
+
+    -- Forward declaration because the detachable grip updates visuals while dragging.
+    local updateVisuals
 
     local function getCanvasHeight()
         return math.max(
@@ -5375,26 +5413,52 @@ function UI.bindSmoothScrolling(scroller, layout)
         )
     end
 
-    local function getRailGeometry()
+    local function getBaseRailGeometry()
         if not railButton or not railButton.Parent then
             return nil
         end
 
+        local layerAbs = visualParent.AbsolutePosition
         local parentAbs = thumbParent.AbsolutePosition
         local scrollAbs = scroller.AbsolutePosition
         local scrollSize = scroller.AbsoluteSize
 
-        -- Compact visual size. PC gets a slim rail; mobile stays finger-friendly.
-        local laneWidth = IS_TOUCH_DEVICE and 9 or 18
-        local topGap = IS_TOUCH_DEVICE and 12 or 24
-        local bottomGap = IS_TOUCH_DEVICE and 12 or 24
+        -- Compact visual size. Mobile is intentionally tiny; the separate grip
+        -- remains the touch target for detaching/moving it.
+        local laneWidth = IS_TOUCH_DEVICE and 7 or 18
+        local topGap = IS_TOUCH_DEVICE and 10 or 24
+        local bottomGap = IS_TOUCH_DEVICE and 10 or 24
 
-        -- Pin the custom scrollbar to the OUTER right edge of the VNDT window
-        -- instead of keeping it inset inside the ScrollingFrame.
+        -- Default attached position: flush to the OUTER right edge of VNDT, but
+        -- expressed in floating-layer coordinates.
         local rightEdgePadding = IS_TOUCH_DEVICE and 0 or 2
-        local left = math.max(0, thumbParent.AbsoluteSize.X - laneWidth - rightEdgePadding)
-        local top = scrollAbs.Y - parentAbs.Y + 5
-        local totalHeight = math.max(110, scrollSize.Y - 10)
+        local left = (parentAbs.X - layerAbs.X)
+            + thumbParent.AbsoluteSize.X
+            - laneWidth
+            - rightEdgePadding
+        local top = (scrollAbs.Y - layerAbs.Y) + 5
+        local totalHeight = math.max(IS_TOUCH_DEVICE and 90 or 110, scrollSize.Y - 10)
+
+        return left, top, laneWidth, totalHeight, topGap, bottomGap
+    end
+
+    local function getRailGeometry()
+        local base = {getBaseRailGeometry()}
+        if #base < 6 then
+            return nil
+        end
+
+        local baseLeft, baseTop, laneWidth, totalHeight, topGap, bottomGap = table.unpack(base)
+
+        -- Apply detachable offset and clamp only to the SCREEN layer, not VNDT.
+        -- This allows the entire scrollbar to live outside the VNDT window.
+        local maxLeft = math.max(0, visualParent.AbsoluteSize.X - laneWidth)
+        local maxTop = math.max(0, visualParent.AbsoluteSize.Y - totalHeight)
+        local left = math.clamp(baseLeft + detachedOffset.X, 0, maxLeft)
+        local top = math.clamp(baseTop + detachedOffset.Y, 0, maxTop)
+
+        -- Keep the saved offset synchronized after window resize/orientation changes.
+        detachedOffset = Vector2.new(left - baseLeft, top - baseTop)
 
         local railTop = top + topGap
         local railHeight = math.max(44, totalHeight - topGap - bottomGap)
@@ -5409,7 +5473,7 @@ function UI.bindSmoothScrolling(scroller, layout)
         end
 
         local _, _, _, _, railTop, railHeight = table.unpack(geometry)
-        local parentY = thumbParent.AbsolutePosition.Y
+        local parentY = visualParent.AbsolutePosition.Y
         local localY = screenY - parentY
         local progress = math.clamp((localY - railTop) / math.max(1, railHeight), 0, 1)
         setScrollY(progress * getMaxScrollY())
@@ -5423,7 +5487,7 @@ function UI.bindSmoothScrolling(scroller, layout)
         railGlow.BorderSizePixel = 0
         railGlow.ZIndex = 314
         railGlow.Visible = false
-        railGlow.Parent = thumbParent
+        railGlow.Parent = visualParent
         UI.addCorner(railGlow, IS_TOUCH_DEVICE and 4 or 11)
 
         -- The rail itself is the touch target. It is intentionally a real GuiButton,
@@ -5438,7 +5502,7 @@ function UI.bindSmoothScrolling(scroller, layout)
         railButton.ZIndex = 315
         railButton.Active = true
         railButton.Visible = false
-        railButton.Parent = thumbParent
+        railButton.Parent = visualParent
         UI.addCorner(railButton, IS_TOUCH_DEVICE and 4 or 10)
         UI.addStroke(railButton, LIGHT_PURPLE, 1, 0.08)
 
@@ -5475,7 +5539,7 @@ function UI.bindSmoothScrolling(scroller, layout)
         thumbShadow = Instance.new("Frame")
         thumbShadow.Name = "MobileScrollThumbShadow"
         thumbShadow.AnchorPoint = Vector2.new(0.5, 0.5)
-        thumbShadow.Size = UDim2.fromOffset(IS_TOUCH_DEVICE and 8 or 14, IS_TOUCH_DEVICE and 14 or 26)
+        thumbShadow.Size = UDim2.fromOffset(IS_TOUCH_DEVICE and 7 or 14, IS_TOUCH_DEVICE and 12 or 26)
         thumbShadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
         thumbShadow.BackgroundTransparency = 0.45
         thumbShadow.BorderSizePixel = 0
@@ -5486,7 +5550,7 @@ function UI.bindSmoothScrolling(scroller, layout)
         thumb = Instance.new("Frame")
         thumb.Name = "MobileScrollThumb"
         thumb.AnchorPoint = Vector2.new(0.5, 0.5)
-        thumb.Size = UDim2.fromOffset(IS_TOUCH_DEVICE and 6 or 12, IS_TOUCH_DEVICE and 10 or 22)
+        thumb.Size = UDim2.fromOffset(IS_TOUCH_DEVICE and 5 or 12, IS_TOUCH_DEVICE and 8 or 22)
         thumb.BackgroundColor3 = BRIGHT_PURPLE
         thumb.BackgroundTransparency = 0
         thumb.BorderSizePixel = 0
@@ -5529,7 +5593,7 @@ function UI.bindSmoothScrolling(scroller, layout)
             button.ZIndex = 320
             button.Active = true
             button.Visible = false
-            button.Parent = thumbParent
+            button.Parent = visualParent
             UI.addCorner(button, IS_TOUCH_DEVICE and 4 or 9)
             UI.addStroke(button, Color3.fromRGB(255, 255, 255), 1, 0.08)
 
@@ -5547,6 +5611,131 @@ function UI.bindSmoothScrolling(scroller, layout)
 
         upButton = makeArrowButton("MobileScrollUp", "▲")
         downButton = makeArrowButton("MobileScrollDown", "▼")
+
+        -- Small independent drag grip. Drag this grip to detach/move the entire
+        -- scrollbar. It does NOT change the current scroll position while moving.
+        detachGrip = Instance.new("TextButton")
+        detachGrip.Name = "ScrollbarDetachGrip"
+        detachGrip.BackgroundColor3 = Color3.fromRGB(25, 20, 38)
+        detachGrip.BackgroundTransparency = IS_TOUCH_DEVICE and 0.10 or 0.05
+        detachGrip.BorderSizePixel = 0
+        detachGrip.AutoButtonColor = false
+        detachGrip.Text = "⋮"
+        detachGrip.TextColor3 = LIGHT_PURPLE
+        detachGrip.TextSize = IS_TOUCH_DEVICE and 9 or 12
+        detachGrip.Font = Enum.Font.GothamBold
+        detachGrip.ZIndex = 322
+        detachGrip.Active = true
+        detachGrip.Visible = false
+        detachGrip.Parent = visualParent
+        UI.addCorner(detachGrip, IS_TOUCH_DEVICE and 3 or 6)
+        UI.addStroke(detachGrip, LIGHT_PURPLE, 1, 0.25)
+
+        detachGrip.InputBegan:Connect(function(input)
+            local t = input.UserInputType
+            if t ~= Enum.UserInputType.Touch
+                and t ~= Enum.UserInputType.MouseButton1 then
+                return
+            end
+
+            local geometry = {getRailGeometry()}
+            if #geometry < 6 then
+                return
+            end
+
+            detachDragging = true
+            detachInput = input
+            detachStartScreen = Vector2.new(input.Position.X, input.Position.Y)
+            detachStartLeft = geometry[1]
+            detachStartTop = geometry[2]
+            detachMoved = false
+        end)
+
+        local function updateDetachDrag(input)
+            if not detachDragging or not detachStartScreen then
+                return
+            end
+
+            if detachInput and detachInput.UserInputType == Enum.UserInputType.Touch then
+                if input ~= detachInput then
+                    return
+                end
+            elseif input.UserInputType ~= Enum.UserInputType.MouseMovement then
+                return
+            end
+
+            local base = {getBaseRailGeometry()}
+            if #base < 6 then
+                return
+            end
+
+            local baseLeft, baseTop, laneWidth, totalHeight = base[1], base[2], base[3], base[4]
+            local dx = input.Position.X - detachStartScreen.X
+            local dy = input.Position.Y - detachStartScreen.Y
+            if math.abs(dx) >= 3 or math.abs(dy) >= 3 then
+                detachMoved = true
+            end
+
+            -- Detachment uses full screen bounds, so touch users can move the
+            -- rail completely away from the VNDT panel.
+            local maxLeft = math.max(0, visualParent.AbsoluteSize.X - laneWidth)
+            local maxTop = math.max(0, visualParent.AbsoluteSize.Y - totalHeight)
+            local desiredLeft = math.clamp(detachStartLeft + dx, 0, maxLeft)
+            local desiredTop = math.clamp(detachStartTop + dy, 0, maxTop)
+
+            detachedOffset = Vector2.new(desiredLeft - baseLeft, desiredTop - baseTop)
+            updateVisuals()
+        end
+
+        detachGrip.InputChanged:Connect(updateDetachDrag)
+
+        detachGrip.InputEnded:Connect(function(input)
+            if input ~= detachInput then
+                return
+            end
+
+            -- Double-tap/click the grip to snap the scrollbar back to the right edge.
+            if not detachMoved then
+                local now = os.clock()
+                if now - lastDetachTap <= 0.35 then
+                    detachedOffset = Vector2.zero
+                    lastDetachTap = 0
+                    updateVisuals()
+                else
+                    lastDetachTap = now
+                end
+            end
+
+            detachDragging = false
+            detachInput = nil
+            detachStartScreen = nil
+            detachMoved = false
+        end)
+
+        UserInputService.InputChanged:Connect(function(input)
+            if detachDragging then
+                updateDetachDrag(input)
+            end
+        end)
+
+        UserInputService.InputEnded:Connect(function(input)
+            if not detachDragging then
+                return
+            end
+
+            local endedTouch = detachInput
+                and detachInput.UserInputType == Enum.UserInputType.Touch
+                and input == detachInput
+            local endedMouse = detachInput
+                and detachInput.UserInputType == Enum.UserInputType.MouseButton1
+                and input.UserInputType == Enum.UserInputType.MouseButton1
+
+            if endedTouch or endedMouse then
+                detachDragging = false
+                detachInput = nil
+                detachStartScreen = nil
+            end
+        end)
 
         local function pageAmount()
             return math.max(90, scroller.AbsoluteWindowSize.Y * 0.65)
@@ -5633,7 +5822,7 @@ function UI.bindSmoothScrolling(scroller, layout)
         end)
     end
 
-    local function updateVisuals()
+    updateVisuals = function()
         if destroyed or not thumbParent then
             return
         end
@@ -5655,6 +5844,7 @@ function UI.bindSmoothScrolling(scroller, layout)
             railButton,
             upButton,
             downButton,
+            detachGrip,
         }) do
             if object then
                 object.Visible = shouldShow
@@ -5672,7 +5862,7 @@ function UI.bindSmoothScrolling(scroller, layout)
         railButton.Size = UDim2.fromOffset(laneWidth, railHeight)
 
         upButton.Position = UDim2.fromOffset(left, top)
-        local arrowHeight = IS_TOUCH_DEVICE and 10 or 18
+        local arrowHeight = IS_TOUCH_DEVICE and 8 or 18
         upButton.Size = UDim2.fromOffset(IS_TOUCH_DEVICE and laneWidth or math.max(12, laneWidth - 4), arrowHeight)
 
         downButton.Position = UDim2.fromOffset(
@@ -5680,6 +5870,28 @@ function UI.bindSmoothScrolling(scroller, layout)
             top + totalHeight - arrowHeight
         )
         downButton.Size = UDim2.fromOffset(IS_TOUCH_DEVICE and laneWidth or math.max(12, laneWidth - 4), arrowHeight)
+
+        -- Keep the detach grip tiny and just beside the rail. It flips to the
+        -- right side automatically if the scrollbar is dragged to the left edge.
+        if detachGrip then
+            local gripWidth = IS_TOUCH_DEVICE and 9 or 12
+            local gripHeight = IS_TOUCH_DEVICE and 22 or 28
+            local gripGap = IS_TOUCH_DEVICE and 2 or 3
+            local gripX
+            if left >= gripWidth + gripGap then
+                gripX = left - gripWidth - gripGap
+            else
+                gripX = math.min(visualParent.AbsoluteSize.X - gripWidth, left + laneWidth + gripGap)
+            end
+            local gripY = math.clamp(
+                railTop + math.floor((railHeight - gripHeight) * 0.5),
+                0,
+                math.max(0, visualParent.AbsoluteSize.Y - gripHeight)
+            )
+            detachGrip.Position = UDim2.fromOffset(gripX, gripY)
+            detachGrip.Size = UDim2.fromOffset(gripWidth, gripHeight)
+            detachGrip.BackgroundTransparency = hasScroll and (IS_TOUCH_DEVICE and 0.10 or 0.05) or 0.40
+        end
 
         railButton.BackgroundTransparency = hasScroll and (IS_TOUCH_DEVICE and 0.55 or 0.08) or 0.70
         upButton.BackgroundTransparency = hasScroll and 0 or 0.45
@@ -5745,6 +5957,10 @@ function UI.bindSmoothScrolling(scroller, layout)
     scroller:GetPropertyChangedSignal("AbsoluteSize"):Connect(queueUpdate)
     scroller:GetPropertyChangedSignal("CanvasPosition"):Connect(updateVisuals)
     scroller:GetPropertyChangedSignal("Visible"):Connect(updateVisuals)
+    if visualParent then
+        visualParent:GetPropertyChangedSignal("AbsoluteSize"):Connect(queueUpdate)
+        visualParent:GetPropertyChangedSignal("AbsolutePosition"):Connect(queueUpdate)
+    end
 
     scroller.DescendantAdded:Connect(queueUpdate)
     scroller.DescendantRemoving:Connect(queueUpdate)
@@ -5757,18 +5973,28 @@ function UI.bindSmoothScrolling(scroller, layout)
         destroyed = true
         railDragging = false
         railTouch = nil
+        detachDragging = false
+        detachInput = nil
+        detachStartScreen = nil
 
         for _, object in ipairs({
             railGlow,
             railButton,
             upButton,
             downButton,
+            detachGrip,
         }) do
             if object and object.Parent then
                 pcall(function()
                     object:Destroy()
                 end)
             end
+        end
+
+        if floatingLayer and floatingLayer.Parent then
+            pcall(function()
+                floatingLayer:Destroy()
+            end)
         end
     end)
 
