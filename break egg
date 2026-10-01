@@ -618,7 +618,7 @@ local selectedSellRarities = {}
 --// Persistent config
 -- Uses executor file APIs when available.
 local CONFIG_FILE = "VNDT_Config.json"
-local CONFIG_VERSION = 2
+local CONFIG_VERSION = 4
 local configLoaded = false
 local configSaveSerial = 0
 
@@ -642,6 +642,7 @@ for _, rarityName in ipairs(FALLBACK_RARITIES) do
 end
 
 local mainGuiStarted = false
+local PetEggAutomation = nil
 
 
 --// Save config / auto-load config
@@ -692,6 +693,8 @@ local function configFileExists()
 end
 
 local function buildConfig()
+    local petEggConfig = PetEggAutomation and PetEggAutomation.GetConfig and PetEggAutomation.GetConfig() or {}
+
     return {
         version = CONFIG_VERSION,
 
@@ -702,6 +705,11 @@ local function buildConfig()
         characterProtectionEnabled = characterProtectionEnabled,
         antiAfkEnabled = antiAfkEnabled,
         fpsBoosterEnabled = fpsBoosterEnabled,
+
+        autoMergeEnabled = petEggConfig.autoMergeEnabled == true,
+        autoHatchEnabled = petEggConfig.autoHatchEnabled == true,
+        autoPlaceEggsEnabled = petEggConfig.autoPlaceEggsEnabled == true,
+        selectedMergePet = petEggConfig.selectedMergePet,
 
         selectedStealRarities = copyBooleanMap(selectedStealRarities),
         selectedSellRarities = copyBooleanMap(selectedSellRarities),
@@ -783,6 +791,10 @@ local function loadConfig()
         fpsBoosterEnabled = data.fpsBoosterEnabled
     end
 
+    if PetEggAutomation and PetEggAutomation.ApplyConfig then
+        PetEggAutomation.ApplyConfig(data)
+    end
+
     replaceBooleanMap(selectedStealRarities, data.selectedStealRarities)
     replaceBooleanMap(selectedSellRarities, data.selectedSellRarities)
 
@@ -793,6 +805,1691 @@ local function loadConfig()
     configLoaded = true
     return true
 end
+
+--// Pet Auto Merge + Auto Hatch + Smart Auto Place Eggs
+-- Auto Place Egg core copied from the supplied working VNDT reference script.
+-- Placement points are randomized across nearly the entire detected PlotSurface.
+-- Priority: Auto Hatch > Auto Place Eggs > Auto Steal.
+-- Encapsulated in one table to avoid adding many top-level locals to this large script.
+PetEggAutomation = (function()
+    local A = {}
+    local Player = LocalPlayer
+    local Backpack = Player:WaitForChild("Backpack")
+
+    local MERGE_REQUIRED = 3
+    local MERGE_DELAY = 0.20
+    local SCAN_DELAY = 0.35
+    local EGG_SPACING = 3
+    local EQUIP_DELAY = 0.08
+    local PLACE_DELAY = 0.10
+    local PLACE_CONFIRM_TIMEOUT = 1.25
+    local TP_HEIGHT_ABOVE_FLOOR = 3.25
+    local TP_SETTLE_DELAY = 0.07
+    -- Random placement now uses almost the ENTIRE PlotSurface instead of
+    -- concentrating candidates around the middle. A small edge margin keeps
+    -- the character/egg safely inside the plot boundary.
+    local PLOT_EDGE_MARGIN = 1.75
+    local RANDOM_CANDIDATE_COUNT = 220
+    local RANDOM_CANDIDATE_TRIES = 1800
+    local MAX_POSITION_ATTEMPTS_PER_EGG = 80
+    local placementRandom = Random.new()
+
+    local autoMergeEnabled = false
+    local autoHatchEnabled = false
+    local autoPlaceEggsEnabled = false
+    local selectedMergePet = nil
+    local currentlyMerging = false
+    local currentlyHatching = false
+    local hatchWorkerRunning = false
+    local hatchRequested = false
+    local currentlyPlacing = false
+    local placementRequested = false
+    local started = false
+    local mergeRemote = nil
+    local stealBusyCheck = function() return false end
+    local statusSink = nil
+    local petOptionsSink = nil
+    local eggCountSink = nil
+    local hatchCountSink = nil
+
+    local candidates = {}
+    local candidateIndex = 1
+    local usedPositionKeys = {}
+    local successfulPositions = {}
+    local lastPetSignature = ""
+    local lastEggTotal = -1
+
+    local function report(text, kind)
+        if statusSink then
+            pcall(statusSink, tostring(text), kind or "idle")
+        end
+    end
+
+    local function getMergeRemote()
+        if mergeRemote and mergeRemote.Parent then
+            return mergeRemote
+        end
+        local ok, remote = pcall(function()
+            return ReplicatedStorage:WaitForChild("MergeMachineRemote", 10)
+        end)
+        if ok then
+            mergeRemote = remote
+        end
+        return mergeRemote
+    end
+
+    local function getCharacter()
+        return Player.Character or Player.CharacterAdded:Wait()
+    end
+
+    local function getHumanoid()
+        local character = getCharacter()
+        return character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid")
+    end
+
+    local function getRoot()
+        local character = getCharacter()
+        return character:FindFirstChild("HumanoidRootPart") or character:WaitForChild("HumanoidRootPart")
+    end
+
+    local function isEgg(object)
+        return object
+            and object:IsA("Tool")
+            and string.find(string.lower(object.Name), "egg", 1, true) ~= nil
+    end
+
+    local petIdNames = {
+        "UID", "Uid", "uid", "UUID", "Uuid", "PetUID",
+        "PetId", "PetID", "UniqueId", "UniqueID", "ID", "Id", "id"
+    }
+
+    local function getPetId(pet)
+        for _, name in ipairs(petIdNames) do
+            local value = pet:GetAttribute(name)
+            if value ~= nil then
+                return value
+            end
+        end
+        for _, object in ipairs(pet:GetDescendants()) do
+            if object:IsA("ValueBase") then
+                for _, name in ipairs(petIdNames) do
+                    if object.Name == name then
+                        return object.Value
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    local function isPet(object)
+        if not object or not object:IsA("Tool") or isEgg(object) then
+            return false
+        end
+        -- Prefer actual pet-like tools. Unknown tools are still allowed if they
+        -- expose one of the ID fields used by the merge system.
+        if getPetId(object) ~= nil then
+            return true
+        end
+        local lower = string.lower(object.Name)
+        if lower:find("pickaxe", 1, true) or lower:find("weapon", 1, true) then
+            return false
+        end
+        return true
+    end
+
+    local function scanPets()
+        local counts = {}
+        for _, object in ipairs(Backpack:GetChildren()) do
+            if isPet(object) then
+                counts[object.Name] = (counts[object.Name] or 0) + 1
+            end
+        end
+        return counts
+    end
+
+    local function getPetOptions()
+        local counts = scanPets()
+        local names = {}
+        for name, quantity in pairs(counts) do
+            if quantity >= MERGE_REQUIRED then
+                table.insert(names, name)
+            end
+        end
+        -- Keep the selected pet visible even while waiting for another set of 3.
+        if selectedMergePet and selectedMergePet ~= "" then
+            local found = false
+            for _, name in ipairs(names) do
+                if name == selectedMergePet then
+                    found = true
+                    break
+                end
+            end
+            if not found then
+                table.insert(names, selectedMergePet)
+            end
+        end
+        table.sort(names, function(a, b)
+            return string.lower(a) < string.lower(b)
+        end)
+        return names, counts
+    end
+
+    local function publishPetOptions(force)
+        local names, counts = getPetOptions()
+        local parts = {}
+        for _, name in ipairs(names) do
+            table.insert(parts, name .. ":" .. tostring(counts[name] or 0))
+        end
+        local signature = table.concat(parts, "|") .. "#" .. tostring(selectedMergePet or "")
+        if force or signature ~= lastPetSignature then
+            lastPetSignature = signature
+            if petOptionsSink then
+                pcall(petOptionsSink, names, counts, selectedMergePet)
+            end
+        end
+    end
+
+    local function getThreePets(name)
+        local pets = {}
+        for _, object in ipairs(Backpack:GetChildren()) do
+            if isPet(object) and object.Name == name then
+                table.insert(pets, object)
+                if #pets >= MERGE_REQUIRED then
+                    break
+                end
+            end
+        end
+        if #pets < MERGE_REQUIRED then
+            return nil
+        end
+        return pets
+    end
+
+    local function buildMergePayload(pets)
+        local ids = {}
+        for _, pet in ipairs(pets) do
+            local id = getPetId(pet)
+            if id == nil then
+                return pets
+            end
+            table.insert(ids, id)
+        end
+        return ids
+    end
+
+    local function mergeSelectedOnce()
+        if currentlyMerging or not selectedMergePet then
+            return false
+        end
+        local remote = getMergeRemote()
+        if not remote then
+            report("MergeMachineRemote not found", "error")
+            return false
+        end
+        local pets = getThreePets(selectedMergePet)
+        if not pets then
+            return false
+        end
+
+        currentlyMerging = true
+        local payload = buildMergePayload(pets)
+        local ok, err = pcall(function()
+            remote:FireServer("Merge", payload)
+        end)
+        task.wait(MERGE_DELAY)
+        currentlyMerging = false
+
+        if ok then
+            report("Merged 3 × " .. selectedMergePet, "success")
+        else
+            report("Auto Merge error: " .. tostring(err), "error")
+        end
+        publishPetOptions(true)
+        return ok
+    end
+
+    local function countEggName(name)
+        local count = 0
+        for _, object in ipairs(Backpack:GetChildren()) do
+            if isEgg(object) and object.Name == name then
+                count += 1
+            end
+        end
+        local character = Player.Character
+        if character then
+            for _, object in ipairs(character:GetChildren()) do
+                if isEgg(object) and object.Name == name then
+                    count += 1
+                end
+            end
+        end
+        return count
+    end
+
+    local function getEggTotal()
+        local total = 0
+        for _, object in ipairs(Backpack:GetChildren()) do
+            if isEgg(object) then
+                total += 1
+            end
+        end
+        local character = Player.Character
+        if character then
+            for _, object in ipairs(character:GetChildren()) do
+                if isEgg(object) then
+                    total += 1
+                end
+            end
+        end
+        return total
+    end
+
+    local function publishEggCount(force)
+        local total = getEggTotal()
+        if force or total ~= lastEggTotal then
+            lastEggTotal = total
+            if eggCountSink then
+                pcall(eggCountSink, total)
+            end
+        end
+        return total
+    end
+
+    local function getNextEgg()
+        for _, object in ipairs(Backpack:GetChildren()) do
+            if isEgg(object) then
+                return object
+            end
+        end
+        return nil
+    end
+
+    local function unequipEverything()
+        local humanoid = getHumanoid()
+        if humanoid then
+            pcall(function()
+                humanoid:UnequipTools()
+            end)
+        end
+    end
+
+    local function equipEgg(egg)
+        if not egg or not egg.Parent then
+            return false
+        end
+        local character = getCharacter()
+        local humanoid = getHumanoid()
+        unequipEverything()
+        task.wait(0.04)
+        if egg.Parent == Backpack then
+            local ok = pcall(function()
+                humanoid:EquipTool(egg)
+            end)
+            if not ok then
+                return false
+            end
+        end
+        local startedAt = os.clock()
+        while os.clock() - startedAt < 1 do
+            if egg.Parent == character then
+                return true
+            end
+            task.wait()
+        end
+        return false
+    end
+
+    local function getTopLevelPlot(object)
+        local plots = Workspace:FindFirstChild("Plots")
+        if not plots or not object then
+            return nil
+        end
+        local current = object
+        while current and current ~= Workspace do
+            if current.Parent == plots then
+                return current
+            end
+            current = current.Parent
+        end
+        return nil
+    end
+
+    local function findMyPlotModel()
+        local plots = Workspace:FindFirstChild("Plots")
+        if not plots then
+            return nil
+        end
+        local playerName = string.lower(Player.Name)
+        for _, plot in ipairs(plots:GetChildren()) do
+            local ownerUserId = plot:GetAttribute("OwnerUserId")
+                or plot:GetAttribute("UserId")
+                or plot:GetAttribute("PlayerUserId")
+            if tonumber(ownerUserId) == Player.UserId then
+                return plot
+            end
+            local ownerName = plot:GetAttribute("Owner")
+                or plot:GetAttribute("OwnerName")
+                or plot:GetAttribute("PlayerName")
+            if ownerName and string.lower(tostring(ownerName)) == playerName then
+                return plot
+            end
+            for _, object in ipairs(plot:GetDescendants()) do
+                if object:IsA("ObjectValue") and object.Value == Player then
+                    return plot
+                end
+                if object:IsA("StringValue") then
+                    local n = string.lower(object.Name)
+                    if (n == "owner" or n == "player" or n == "ownername")
+                        and string.lower(tostring(object.Value)) == playerName then
+                        return plot
+                    end
+                elseif object:IsA("IntValue") or object:IsA("NumberValue") then
+                    local n = string.lower(object.Name)
+                    if (n == "userid" or n == "owneruserid" or n == "playeruserid")
+                        and tonumber(object.Value) == Player.UserId then
+                        return plot
+                    end
+                end
+            end
+        end
+        for _, object in ipairs(plots:GetDescendants()) do
+            local objectName = string.lower(object.Name)
+            if objectName:find(playerName, 1, true) and objectName:find("floatingplotsign", 1, true) then
+                local plot = getTopLevelPlot(object)
+                if plot then
+                    return plot
+                end
+            end
+            if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
+                local text = string.lower(tostring(object.Text or ""))
+                if text:find(playerName, 1, true) then
+                    local plot = getTopLevelPlot(object)
+                    if plot then
+                        return plot
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    local function getMyPlotSurface()
+        local plot = findMyPlotModel()
+        if not plot then
+            return nil, nil
+        end
+
+        local surface = plot:FindFirstChild("PlotSurface", true)
+        if surface and surface:IsA("BasePart") then
+            return surface, plot
+        end
+
+        -- Working-reference fallback: if PlotSurface is renamed/missing, use
+        -- the largest part in the detected OWN plot instead of stopping.
+        local bestPart = nil
+        local bestArea = -1
+
+        for _, object in ipairs(plot:GetDescendants()) do
+            if object:IsA("BasePart") then
+                local area = object.Size.X * object.Size.Z
+                if area > bestArea then
+                    bestArea = area
+                    bestPart = object
+                end
+            end
+        end
+
+        return bestPart, plot
+    end
+
+    local function getObjectWorldPosition(object)
+        if not object then return nil end
+        if object:IsA("BasePart") then return object.Position end
+        if object:IsA("Attachment") then return object.WorldPosition end
+        if object:IsA("Model") then
+            local ok, pivot = pcall(function() return object:GetPivot() end)
+            if ok and pivot then return pivot.Position end
+        end
+        local part = object:FindFirstChildWhichIsA("BasePart", true)
+        return part and part.Position or nil
+    end
+
+    --============================================================
+    -- AUTO HATCH
+    -- Highest movement priority: Hatch > Place Eggs > Auto Steal
+    --============================================================
+
+    local function isHatchPrompt(prompt)
+        if not prompt or not prompt:IsA("ProximityPrompt") then
+            return false
+        end
+
+        local enabled = true
+        pcall(function() enabled = prompt.Enabled end)
+        if not enabled then
+            return false
+        end
+
+        -- The ready egg shown by the game exposes a normal ProximityPrompt
+        -- whose visible text is typically: "<Egg Name> / Hatch". Check every
+        -- useful prompt field plus nearby ancestor names so this still works if
+        -- the developer moves/renames the prompt instance itself.
+        local text = string.lower(
+            tostring(prompt.Name or "") .. " "
+            .. tostring(prompt.ActionText or "") .. " "
+            .. tostring(prompt.ObjectText or "")
+        )
+
+        if string.find(text, "hatch", 1, true) then
+            return true
+        end
+
+        local current = prompt.Parent
+        for _ = 1, 5 do
+            if not current or current == Workspace then
+                break
+            end
+            local name = string.lower(tostring(current.Name or ""))
+            if string.find(name, "hatch", 1, true) then
+                return true
+            end
+            current = current.Parent
+        end
+
+        return false
+    end
+
+    local function getPromptWorldPosition(prompt)
+        if not prompt then
+            return nil
+        end
+
+        local parent = prompt.Parent
+        if parent and parent:IsA("Attachment") then
+            return parent.WorldPosition
+        end
+        if parent and parent:IsA("BasePart") then
+            return parent.Position
+        end
+
+        local current = parent
+        while current and current ~= Workspace do
+            if current:IsA("BasePart") then
+                return current.Position
+            end
+            if current:IsA("Model") then
+                local ok, pivot = pcall(function()
+                    return current:GetPivot()
+                end)
+                if ok and pivot then
+                    return pivot.Position
+                end
+            end
+            current = current.Parent
+        end
+
+        return parent and getObjectWorldPosition(parent) or nil
+    end
+
+    local function collectHatchPrompts()
+        local results = {}
+        local surface, plot = getMyPlotSurface()
+        local playerRoot = Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+        local origin = playerRoot and playerRoot.Position or (surface and surface.Position) or Vector3.zero
+
+        -- IMPORTANT FIX:
+        -- Ready eggs are not guaranteed to be parented under Workspace.Plots/<my plot>.
+        -- Some game builds keep spawned eggs in a separate Workspace container while
+        -- only positioning them on the player's plot. Therefore scan Workspace and
+        -- use the real PlotSurface bounds as the ownership/location filter.
+        for _, object in ipairs(Workspace:GetDescendants()) do
+            if isHatchPrompt(object) then
+                local position = getPromptWorldPosition(object)
+                if position then
+                    local inMyPlot = false
+                    local plotDistance = math.huge
+
+                    if surface then
+                        local localPoint = surface.CFrame:PointToObjectSpace(position)
+                        local margin = 10
+                        inMyPlot = math.abs(localPoint.X) <= (surface.Size.X * 0.5 + margin)
+                            and math.abs(localPoint.Z) <= (surface.Size.Z * 0.5 + margin)
+                            and math.abs(localPoint.Y) <= 35
+                        plotDistance = Vector3.new(localPoint.X, 0, localPoint.Z).Magnitude
+                    elseif plot and object:IsDescendantOf(plot) then
+                        inMyPlot = true
+                        plotDistance = 0
+                    else
+                        -- Last-resort fallback when ownership metadata/PlotSurface is
+                        -- temporarily unavailable: only accept a nearby Hatch prompt.
+                        plotDistance = (position - origin).Magnitude
+                        inMyPlot = plotDistance <= 90
+                    end
+
+                    if inMyPlot then
+                        local readySignal = false
+                        local current = object.Parent
+                        for _ = 1, 5 do
+                            if not current or current == Workspace then
+                                break
+                            end
+
+                            -- "Ready!" is normally rendered by a BillboardGui on the egg.
+                            -- It is only a priority hint; the Hatch prompt itself remains
+                            -- the authoritative readiness signal.
+                            for _, child in ipairs(current:GetDescendants()) do
+                                if child:IsA("TextLabel") or child:IsA("TextButton") then
+                                    local txt = string.lower(tostring(child.Text or ""))
+                                    if string.find(txt, "ready", 1, true) then
+                                        readySignal = true
+                                        break
+                                    end
+                                end
+                            end
+                            if readySignal then
+                                break
+                            end
+                            current = current.Parent
+                        end
+
+                        table.insert(results, {
+                            prompt = object,
+                            position = position,
+                            ready = readySignal,
+                            plotDistance = plotDistance,
+                            playerDistance = (position - origin).Magnitude,
+                        })
+                    end
+                end
+            end
+        end
+
+        table.sort(results, function(a, b)
+            -- Explicit Ready! eggs first, then the prompt closest to the center of
+            -- our plot, then whichever is closest to the player.
+            if a.ready ~= b.ready then
+                return a.ready == true
+            end
+            if math.abs(a.plotDistance - b.plotDistance) > 0.05 then
+                return a.plotDistance < b.plotDistance
+            end
+            return a.playerDistance < b.playerDistance
+        end)
+
+        return results
+    end
+
+    local function publishHatchCount()
+        local count = #collectHatchPrompts()
+        if hatchCountSink then
+            pcall(hatchCountSink, count)
+        end
+        return count
+    end
+
+    local function getNextHatchPrompt()
+        local prompts = collectHatchPrompts()
+        if #prompts > 0 then
+            return prompts[1].prompt, prompts[1].position
+        end
+        return nil, nil
+    end
+
+    local function teleportToHatchPrompt(prompt, position)
+        if not prompt or not prompt.Parent or not position then
+            return false
+        end
+
+        local root = getRoot()
+        if not root then
+            return false
+        end
+
+        -- Move extremely close to the actual prompt attachment/part, not merely
+        -- the egg model pivot. This keeps us inside activation distance even for
+        -- very large egg models like the one shown in the screenshot.
+        local standDirection = Vector3.new(root.Position.X - position.X, 0, root.Position.Z - position.Z)
+        if standDirection.Magnitude < 0.1 then
+            standDirection = Vector3.new(0, 0, 1)
+        else
+            standDirection = standDirection.Unit
+        end
+
+        local standDistance = 1.25
+        local stand = position + standDirection * standDistance + Vector3.new(0, 0.35, 0)
+
+        local ok = pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            root.CFrame = CFrame.lookAt(stand, position)
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+
+        if not ok then
+            return false
+        end
+
+        -- Give replication/prompt visibility a couple frames after TP.
+        pcall(function() RunService.Heartbeat:Wait() end)
+        pcall(function() RunService.Heartbeat:Wait() end)
+        task.wait(0.06)
+        return true
+    end
+
+    local function triggerHatchPrompt(prompt)
+        if not prompt or not prompt.Parent then
+            return false
+        end
+
+        -- Keep originals so the local prompt can be restored after the attempt.
+        local oldHold, oldDistance, oldLOS
+        pcall(function() oldHold = prompt.HoldDuration end)
+        pcall(function() oldDistance = prompt.MaxActivationDistance end)
+        pcall(function() oldLOS = prompt.RequiresLineOfSight end)
+
+        -- Make the visible E/Hatch prompt maximally permissive locally. This does
+        -- not replace the server interaction; it only prevents client-side hold/
+        -- line-of-sight checks from blocking the actual prompt activation.
+        pcall(function() prompt.HoldDuration = 0 end)
+        pcall(function() prompt.MaxActivationDistance = math.max(20, tonumber(oldDistance) or 10) end)
+        pcall(function() prompt.RequiresLineOfSight = false end)
+
+        local fired = false
+
+        if type(fireproximityprompt) == "function" then
+            -- Executors disagree on the optional arguments, so try the common
+            -- forms in order. A successful pcall means the activation was sent;
+            -- hatchOnePrompt still verifies that the prompt/ready state changes.
+            for _, args in ipairs({
+                {prompt},
+                {prompt, 0},
+                {prompt, 0, true},
+                {prompt, 1, true},
+            }) do
+                local ok = pcall(function()
+                    fireproximityprompt(table.unpack(args))
+                end)
+                if ok then
+                    fired = true
+                    task.wait(0.06)
+                end
+            end
+        end
+
+        -- Native ProximityPrompt input path. Do this even after fireproximityprompt
+        -- because some mobile executors expose the function but silently ignore it.
+        local okHold = pcall(function()
+            prompt:InputHoldBegin()
+            task.wait(0.06)
+            prompt:InputHoldEnd()
+        end)
+        fired = fired or okHold
+
+        -- Keyboard fallback for the exact on-screen E prompt.
+        local keyCode = Enum.KeyCode.E
+        pcall(function() keyCode = prompt.KeyboardKeyCode end)
+        local okKey = pcall(function()
+            VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+            task.wait(0.06)
+            VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+        end)
+        fired = fired or okKey
+
+        -- Restore prompt properties after the input attempt.
+        if oldHold ~= nil then pcall(function() prompt.HoldDuration = oldHold end) end
+        if oldDistance ~= nil then pcall(function() prompt.MaxActivationDistance = oldDistance end) end
+        if oldLOS ~= nil then pcall(function() prompt.RequiresLineOfSight = oldLOS end) end
+
+        return fired
+    end
+
+    local function hatchOnePrompt(prompt, position)
+        if not prompt or not prompt.Parent or not isHatchPrompt(prompt) then
+            return false
+        end
+
+        local originalParent = prompt.Parent
+        local originalPosition = position or getPromptWorldPosition(prompt)
+        if not originalPosition then
+            return false
+        end
+
+        -- Retry TP + trigger. Re-teleporting each attempt fixes cases where the
+        -- egg collision or server correction nudges the character out of range.
+        for attempt = 1, 6 do
+            if not prompt or not prompt.Parent or not isHatchPrompt(prompt) then
+                return true
+            end
+
+            local livePosition = getPromptWorldPosition(prompt) or originalPosition
+            if not teleportToHatchPrompt(prompt, livePosition) then
+                return false
+            end
+
+            triggerHatchPrompt(prompt)
+
+            local deadline = os.clock() + 1.15
+            while os.clock() < deadline do
+                if not prompt or not prompt.Parent then
+                    return true
+                end
+                if prompt.Parent ~= originalParent then
+                    return true
+                end
+                if not isHatchPrompt(prompt) then
+                    return true
+                end
+
+                -- If the egg was replaced after hatch, the old prompt may linger
+                -- for a frame. A newly selected prompt will be handled next.
+                task.wait(0.04)
+            end
+        end
+
+        return false
+    end
+
+    local function runHatchWorker()
+        if hatchWorkerRunning or not autoHatchEnabled then
+            return
+        end
+
+        hatchWorkerRunning = true
+        local prompt = getNextHatchPrompt()
+        if not prompt then
+            hatchRequested = false
+            hatchWorkerRunning = false
+            publishHatchCount()
+            return
+        end
+
+        hatchRequested = true
+        report("READY EGG detected • Auto Hatch taking HIGHEST priority", "warning")
+
+        -- Let an already-started steal/return action finish, but block the next
+        -- steal immediately through hatchRequested/ShouldBlockSteal.
+        while autoHatchEnabled and stealBusyCheck() do
+            task.wait(0.03)
+        end
+
+        -- Placement yields after its current individual placement attempt.
+        while autoHatchEnabled and currentlyPlacing do
+            task.wait(0.03)
+        end
+
+        if not autoHatchEnabled then
+            hatchRequested = false
+            hatchWorkerRunning = false
+            return
+        end
+
+        unequipEverything()
+        currentlyHatching = true
+        report("AUTO HATCH • TP to ready egg", "working")
+
+        local safety = 0
+        while autoHatchEnabled do
+            local nextPrompt, position = getNextHatchPrompt()
+            if not nextPrompt then
+                break
+            end
+
+            safety += 1
+            if safety > 80 then
+                report("Auto Hatch safety stop • live rescan will continue", "warning")
+                break
+            end
+
+            local ok = hatchOnePrompt(nextPrompt, position)
+            if ok then
+                report("READY EGG HATCHED • checking next egg", "success")
+                task.wait(0.18)
+            else
+                -- Do not hand movement back to Auto Place/Steal while a Hatch
+                -- prompt still exists. Keep Hatch highest priority and retry it.
+                report("Hatch prompt still active • re-TP + retry", "warning")
+                task.wait(0.15)
+            end
+        end
+
+        currentlyHatching = false
+        hatchWorkerRunning = false
+        local remainingHatches = publishHatchCount()
+        hatchRequested = autoHatchEnabled and remainingHatches > 0
+
+        if hatchRequested then
+            task.defer(runHatchWorker)
+        elseif autoPlaceEggsEnabled and getEggTotal() > 0 then
+            placementRequested = true
+        end
+    end
+
+    local function positionKey(position)
+        return tostring(math.floor(position.X * 5)) .. ":" .. tostring(math.floor(position.Z * 5))
+    end
+
+    local function buildCandidatePositions()
+        candidates = {}
+        candidateIndex = 1
+
+        local surface, plot = getMyPlotSurface()
+        if not surface or not plot then
+            report("My PlotSurface was not found • egg placement stopped", "error")
+            return false
+        end
+
+        -- Snapshot eggs that already exist in this plot so random positions
+        -- do not land on top of them.
+        local eggPositions = {}
+        for _, object in ipairs(plot:GetDescendants()) do
+            if (object:IsA("Model") or object:IsA("Tool"))
+                and string.find(string.lower(object.Name), "egg", 1, true) then
+                local pos = getObjectWorldPosition(object)
+                if pos then
+                    table.insert(eggPositions, pos)
+                end
+            end
+        end
+
+        -- Use nearly the FULL PlotSurface. We only keep a small safety margin
+        -- from each edge so teleporting never intentionally chooses outside.
+        local safeHalfX = math.max(0, surface.Size.X * 0.5 - PLOT_EDGE_MARGIN)
+        local safeHalfZ = math.max(0, surface.Size.Z * 0.5 - PLOT_EDGE_MARGIN)
+        local localY = surface.Size.Y * 0.5 + 0.08
+
+        if safeHalfX <= 0.05 or safeHalfZ <= 0.05 then
+            local center = (surface.CFrame * CFrame.new(0, localY, 0)).Position
+            candidates = {center}
+            report("Small plot • using the only safe placement point", "warning")
+            return true
+        end
+
+        local minSpacing = math.max(1.8, EGG_SPACING * 0.78)
+        local minSpacingSq = minSpacing * minSpacing
+        local added = {}
+        local localCandidates = {}
+        local tries = 0
+
+        local function isTooCloseToExistingEgg(world)
+            local flatWorld = Vector3.new(world.X, 0, world.Z)
+            for _, eggPos in ipairs(eggPositions) do
+                local dx = eggPos.X - flatWorld.X
+                local dz = eggPos.Z - flatWorld.Z
+                if (dx * dx + dz * dz) < minSpacingSq then
+                    return true
+                end
+            end
+            return false
+        end
+
+        local function isTooCloseToCandidate(world)
+            local flatWorld = Vector3.new(world.X, 0, world.Z)
+            for _, previous in ipairs(localCandidates) do
+                local dx = previous.X - flatWorld.X
+                local dz = previous.Z - flatWorld.Z
+                if (dx * dx + dz * dz) < minSpacingSq then
+                    return true
+                end
+            end
+            return false
+        end
+
+        -- Uniform random X/Z across the full safe rectangle. There is no
+        -- center-out sorting, grid order, or "near last egg" preference.
+        while #candidates < RANDOM_CANDIDATE_COUNT and tries < RANDOM_CANDIDATE_TRIES do
+            tries += 1
+
+            local localX = placementRandom:NextNumber(-safeHalfX, safeHalfX)
+            local localZ = placementRandom:NextNumber(-safeHalfZ, safeHalfZ)
+            local world = (surface.CFrame * CFrame.new(localX, localY, localZ)).Position
+            local key = positionKey(world)
+
+            if not added[key]
+                and not usedPositionKeys[key]
+                and not isTooCloseToExistingEgg(world)
+                and not isTooCloseToCandidate(world) then
+
+                added[key] = true
+                table.insert(localCandidates, world)
+                table.insert(candidates, world)
+            end
+        end
+
+        -- On very crowded/small plots, relax candidate-to-candidate spacing
+        -- while still staying inside the full PlotSurface and avoiding eggs.
+        if #candidates < 8 then
+            local relaxedTries = 0
+            while #candidates < math.min(60, RANDOM_CANDIDATE_COUNT) and relaxedTries < 700 do
+                relaxedTries += 1
+
+                local localX = placementRandom:NextNumber(-safeHalfX, safeHalfX)
+                local localZ = placementRandom:NextNumber(-safeHalfZ, safeHalfZ)
+                local world = (surface.CFrame * CFrame.new(localX, localY, localZ)).Position
+                local key = positionKey(world)
+
+                if not added[key]
+                    and not usedPositionKeys[key]
+                    and not isTooCloseToExistingEgg(world) then
+
+                    added[key] = true
+                    table.insert(candidates, world)
+                end
+            end
+        end
+
+        if #candidates > 0 then
+            report(
+                "Base ready • " .. tostring(#candidates)
+                    .. " RANDOM full-plot egg positions",
+                "success"
+            )
+            return true
+        end
+
+        report("No free random positions inside your plot", "warning")
+        return false
+    end
+
+    local function getNextCandidate()
+        while candidateIndex <= #candidates do
+            local position = candidates[candidateIndex]
+            candidateIndex += 1
+            if not usedPositionKeys[positionKey(position)] then
+                return position
+            end
+        end
+        return nil
+    end
+
+    local function findFloor(x, z, approxY)
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = Player.Character and {Player.Character} or {}
+        local result = Workspace:Raycast(
+            Vector3.new(x, approxY + 100, z),
+            Vector3.new(0, -250, 0),
+            params
+        )
+        if not result or result.Normal.Y < 0.65 then return nil end
+        return result.Position + Vector3.new(0, 0.15, 0)
+    end
+
+    local function teleportToPlacementPoint(position)
+        local root = getRoot()
+        if not root then return false end
+        local stand = position + Vector3.new(0, TP_HEIGHT_ABOVE_FLOOR, 0)
+        local look = root.CFrame.LookVector
+        local flat = Vector3.new(look.X, 0, look.Z)
+        flat = flat.Magnitude < 0.05 and Vector3.new(0, 0, -1) or flat.Unit
+        local ok = pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            root.CFrame = CFrame.lookAt(stand, stand + flat)
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+        task.wait(TP_SETTLE_DELAY)
+        return ok
+    end
+
+    local function restorePlayerCamera()
+        local camera = Workspace.CurrentCamera
+        if camera then
+            pcall(function()
+                camera.CameraType = Enum.CameraType.Custom
+                camera.CameraSubject = getHumanoid()
+            end)
+        end
+    end
+
+    local function snapshotEgg(egg)
+        local attributes = egg:GetAttributes()
+        local values = {}
+        for _, object in ipairs(egg:GetDescendants()) do
+            if object:IsA("ValueBase") then
+                values[object] = object.Value
+            end
+        end
+        return attributes, values
+    end
+
+    local function placementObserved(egg, eggName, beforeCount, beforeAttributes, beforeValues)
+        if not egg or egg.Parent == nil then return true end
+        if countEggName(eggName) < beforeCount then return true end
+        if egg.Parent then
+            for key, oldValue in pairs(beforeAttributes or {}) do
+                if egg:GetAttribute(key) ~= oldValue then return true end
+            end
+            for object, oldValue in pairs(beforeValues or {}) do
+                if not object.Parent or object.Value ~= oldValue then return true end
+            end
+        end
+        return false
+    end
+
+    local function waitForPlacement(egg, eggName, beforeCount, beforeAttributes, beforeValues)
+        local startedAt = os.clock()
+        while os.clock() - startedAt < PLACE_CONFIRM_TIMEOUT do
+            task.wait(0.04)
+            if placementObserved(egg, eggName, beforeCount, beforeAttributes, beforeValues) then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function referenceCameraPlaceClick(position, egg, eggName, beforeCount)
+        local camera = Workspace.CurrentCamera
+        if not camera or not position or not egg then
+            return false
+        end
+
+        local restoreType = camera.CameraType
+        local restoreCF = camera.CFrame
+        local originalMouse = UserInputService:GetMouseLocation()
+
+        -- Snapshot stack/value state before any placement action. This is
+        -- important for eggs that reuse one Tool and only decrement Quantity.
+        local beforeAttributes = egg:GetAttributes()
+        local beforeValues = {}
+        for _, object in ipairs(egg:GetDescendants()) do
+            if object:IsA("ValueBase") then
+                beforeValues[object] = object.Value
+            end
+        end
+
+        local function placementWasObserved()
+            if not egg or egg.Parent == nil then
+                return true
+            end
+
+            if countEggName(eggName) < beforeCount then
+                return true
+            end
+
+            if egg and egg.Parent then
+                for key, oldValue in pairs(beforeAttributes) do
+                    if egg:GetAttribute(key) ~= oldValue then
+                        return true
+                    end
+                end
+
+                for object, oldValue in pairs(beforeValues) do
+                    if not object.Parent or object.Value ~= oldValue then
+                        return true
+                    end
+                end
+            end
+
+            return false
+        end
+
+        local function stillInInventory()
+            if not egg or not egg.Parent then
+                return false
+            end
+            return egg.Parent == Backpack or egg.Parent == Player.Character
+        end
+
+        -- Exact reference-camera style: aim a Scriptable camera at the floor
+        -- point, project that point to screen coordinates, then virtual-click.
+        pcall(function()
+            camera.CameraType = Enum.CameraType.Scriptable
+            camera.CFrame = CFrame.lookAt(position + Vector3.new(0, 24, 8), position)
+        end)
+
+        pcall(function()
+            RunService.RenderStepped:Wait()
+        end)
+        task.wait(0.03)
+
+        local point = camera:WorldToScreenPoint(position)
+
+        if point.Z <= 0 then
+            pcall(function()
+                camera.CFrame = CFrame.lookAt(position + Vector3.new(0, 28, 2), position)
+            end)
+            pcall(function()
+                RunService.RenderStepped:Wait()
+            end)
+            task.wait(0.03)
+            point = camera:WorldToScreenPoint(position)
+        end
+
+        local function moveVirtualMouse()
+            if point.Z <= 0 then
+                return false
+            end
+
+            return pcall(function()
+                VirtualInputManager:SendMouseMoveEvent(point.X, point.Y, game)
+                task.wait(0.025)
+                VirtualInputManager:SendMouseMoveEvent(point.X, point.Y, game)
+                task.wait(0.025)
+                VirtualInputManager:SendMouseMoveEvent(point.X, point.Y, game)
+            end)
+        end
+
+        local function sendVirtualClick()
+            if not moveVirtualMouse() then
+                return false
+            end
+
+            return pcall(function()
+                task.wait(0.035)
+                VirtualInputManager:SendMouseButtonEvent(
+                    point.X, point.Y, 0, true, game, 0
+                )
+                task.wait(0.055)
+                VirtualInputManager:SendMouseButtonEvent(
+                    point.X, point.Y, 0, false, game, 0
+                )
+            end)
+        end
+
+        local success = false
+
+        -- A: click exact floor point.
+        sendVirtualClick()
+        task.wait(0.16)
+        success = placementWasObserved()
+
+        -- B: activate while Mouse.Hit/cursor is still aimed there.
+        if not success and stillInInventory() then
+            moveVirtualMouse()
+            pcall(function()
+                egg:Activate()
+            end)
+            task.wait(0.18)
+            success = placementWasObserved()
+        end
+
+        -- C: click again after Activate.
+        if not success and stillInInventory() then
+            sendVirtualClick()
+            task.wait(0.18)
+            success = placementWasObserved()
+        end
+
+        pcall(function()
+            VirtualInputManager:SendMouseMoveEvent(originalMouse.X, originalMouse.Y, game)
+        end)
+        pcall(function()
+            camera.CFrame = restoreCF
+            camera.CameraType = restoreType
+        end)
+
+        return success
+    end
+
+    local function firePlaceEgg(eggName, position)
+        local remote = getMergeRemote()
+        if not remote then return false, "MergeMachineRemote not found" end
+        return pcall(function()
+            remote:FireServer("PlaceEgg", eggName, position.X, position.Y, position.Z)
+        end)
+    end
+
+    local function tryPlaceEgg(egg, position)
+        if not egg or not egg.Parent or not position then
+            return false
+        end
+
+        report("TP + reference camera aiming...", "working")
+
+        if not teleportToPlacementPoint(position) then
+            return false
+        end
+
+        local eggName = egg.Name
+
+        -- Count before equipping; Backpack + Character are both counted, so
+        -- merely equipping the tool cannot fake a successful placement.
+        local beforeCount = countEggName(eggName)
+
+        if not equipEgg(egg) then
+            report("Could not equip " .. tostring(eggName), "warning")
+            return false
+        end
+
+        task.wait(EQUIP_DELAY)
+
+        -- First use the exact camera/click/activate sequence from the supplied
+        -- working Auto Place Egg script.
+        local placed = referenceCameraPlaceClick(position, egg, eggName, beforeCount)
+
+        -- Fallback to the exact action-log remote only when the click sequence
+        -- did not consume/decrement the egg.
+        if not placed then
+            local remoteBeforeCount = countEggName(eggName)
+            local remoteBeforeAttributes, remoteBeforeValues = snapshotEgg(egg)
+
+            local fired, err = firePlaceEgg(eggName, position)
+            if not fired then
+                report("PlaceEgg remote failed: " .. tostring(err), "error")
+                unequipEverything()
+                restorePlayerCamera()
+                return false
+            end
+
+            placed = waitForPlacement(
+                egg,
+                eggName,
+                remoteBeforeCount,
+                remoteBeforeAttributes,
+                remoteBeforeValues
+            )
+        end
+
+        if placed then
+            local key = positionKey(position)
+            usedPositionKeys[key] = true
+            table.insert(successfulPositions, position)
+            report(
+                "Placed " .. eggName
+                    .. " • " .. tostring(math.floor(position.X))
+                    .. ", " .. tostring(math.floor(position.Z))
+                    .. " • eggs left: " .. tostring(getEggTotal()),
+                "success"
+            )
+            return true
+        end
+
+        unequipEverything()
+        task.wait(0.05)
+        restorePlayerCamera()
+        return false
+    end
+
+    local function placeOneEggSmart(egg)
+        if not egg or not egg.Parent then
+            return false
+        end
+
+        local attempts = 0
+
+        -- Every placement attempt now picks from a freshly randomized set of
+        -- points spread across the whole plot. We intentionally do NOT try
+        -- around the previous successful egg, which caused middle clustering.
+        while attempts < MAX_POSITION_ATTEMPTS_PER_EGG do
+            if hatchRequested or currentlyHatching then
+                report("Placement yielding • Auto Hatch priority", "warning")
+                return false
+            end
+
+            local position = getNextCandidate()
+
+            if not position then
+                -- Generate a brand-new random full-plot batch when the current
+                -- batch is exhausted. Used positions remain blacklisted.
+                if not buildCandidatePositions() then
+                    break
+                end
+                position = getNextCandidate()
+                if not position then
+                    break
+                end
+            end
+
+            attempts += 1
+            report(
+                "Random plot position " .. tostring(attempts)
+                    .. "/" .. tostring(MAX_POSITION_ATTEMPTS_PER_EGG),
+                "working"
+            )
+
+            if tryPlaceEgg(egg, position) then
+                return true
+            end
+
+            task.wait(PLACE_DELAY)
+        end
+
+        return false
+    end
+
+    local function waitForStealToBeIdle()
+        while placementRequested and stealBusyCheck() do
+            report("Eggs queued • finishing current Auto Steal cycle first", "warning")
+            task.wait(0.08)
+        end
+        return placementRequested
+    end
+
+    local function placeAllEggs()
+        if currentlyPlacing then
+            return
+        end
+
+        if getEggTotal() <= 0 then
+            placementRequested = false
+            publishEggCount(true)
+            return
+        end
+
+        placementRequested = true
+
+        -- HIGHEST priority belongs to Auto Hatch. Do not claim movement for
+        -- placement while a Hatch prompt is waiting.
+        if autoHatchEnabled then
+            local hatchPrompt = getNextHatchPrompt()
+            if hatchPrompt then
+                hatchRequested = true
+                report("Auto Place paused • Auto Hatch has priority", "warning")
+                if not hatchWorkerRunning then
+                    task.spawn(runHatchWorker)
+                end
+                return
+            end
+        end
+
+        -- Only integration wrapper: let the current Auto Steal finish its
+        -- already-started cycle, then the reference placer owns movement.
+        if not waitForStealToBeIdle() then
+            return
+        end
+
+        -- A Hatch prompt may have appeared while the current steal cycle was
+        -- finishing. Re-check before placement takes character movement.
+        if autoHatchEnabled then
+            local hatchPrompt = getNextHatchPrompt()
+            if hatchPrompt or hatchRequested or currentlyHatching then
+                hatchRequested = true
+                report("Auto Place paused • Auto Hatch took priority", "warning")
+                if not hatchWorkerRunning then
+                    task.spawn(runHatchWorker)
+                end
+                return
+            end
+        end
+
+        currentlyPlacing = true
+        report("Auto Place Eggs priority over Auto Steal", "working")
+
+        if #candidates == 0 then
+            local found = buildCandidatePositions()
+            if not found then
+                currentlyPlacing = false
+                placementRequested = autoPlaceEggsEnabled and getEggTotal() > 0
+                report("Could not detect your base floor", "error")
+                return
+            end
+        end
+
+        local yieldedForHatch = false
+
+        while placementRequested do
+            if autoHatchEnabled then
+                local hatchPrompt = getNextHatchPrompt()
+                if hatchPrompt then
+                    hatchRequested = true
+                    yieldedForHatch = true
+                    report("Auto Place paused • Hatch prompt detected", "warning")
+                    break
+                end
+            end
+
+            local egg = getNextEgg()
+            if not egg then
+                break
+            end
+
+            local eggName = egg.Name
+            report("Preparing " .. eggName, "working")
+
+            local success = placeOneEggSmart(egg)
+            publishEggCount(true)
+
+            if not success then
+                if hatchRequested or currentlyHatching then
+                    yieldedForHatch = true
+                    report("Placement interrupted • Auto Hatch is taking over", "warning")
+                    break
+                end
+                report("Failed to place " .. eggName .. " • retrying on next scan", "warning")
+                task.wait(0.75)
+                break
+            end
+
+            task.wait(PLACE_DELAY)
+        end
+
+        unequipEverything()
+        restorePlayerCamera()
+
+        local remaining = publishEggCount(true)
+        currentlyPlacing = false
+
+        if yieldedForHatch then
+            placementRequested = autoPlaceEggsEnabled and remaining > 0
+            if not hatchWorkerRunning then
+                task.spawn(runHatchWorker)
+            end
+            return
+        end
+
+        if remaining <= 0 then
+            placementRequested = false
+            report("ALL EGGS PLACED • Auto Steal can resume", "success")
+        else
+            placementRequested = autoPlaceEggsEnabled
+            report("Eggs remaining: " .. tostring(remaining), "warning")
+        end
+    end
+
+    function A.GetConfig()
+        return {
+            autoMergeEnabled = autoMergeEnabled,
+            autoHatchEnabled = autoHatchEnabled,
+            autoPlaceEggsEnabled = autoPlaceEggsEnabled,
+            selectedMergePet = selectedMergePet,
+        }
+    end
+
+    function A.ApplyConfig(data)
+        if type(data) ~= "table" then return end
+        if type(data.autoMergeEnabled) == "boolean" then
+            autoMergeEnabled = data.autoMergeEnabled
+        end
+        if type(data.autoHatchEnabled) == "boolean" then
+            autoHatchEnabled = data.autoHatchEnabled
+        end
+        if type(data.autoPlaceEggsEnabled) == "boolean" then
+            autoPlaceEggsEnabled = data.autoPlaceEggsEnabled
+        end
+        if type(data.selectedMergePet) == "string" and data.selectedMergePet ~= "" then
+            selectedMergePet = data.selectedMergePet
+        end
+    end
+
+    function A.SetStatusSink(fn) statusSink = fn end
+    function A.SetPetOptionsSink(fn) petOptionsSink = fn; publishPetOptions(true) end
+    function A.SetEggCountSink(fn) eggCountSink = fn; publishEggCount(true) end
+    function A.SetHatchCountSink(fn) hatchCountSink = fn; publishHatchCount() end
+    function A.SetStealBusyCheck(fn)
+        stealBusyCheck = type(fn) == "function" and fn or function() return false end
+    end
+    function A.GetPetOptions() return getPetOptions() end
+    function A.GetSelectedPet() return selectedMergePet end
+    function A.IsPlacing() return currentlyPlacing end
+    function A.IsHatching() return currentlyHatching end
+    function A.ShouldBlockSteal()
+        return hatchRequested or currentlyHatching or placementRequested or currentlyPlacing
+    end
+    function A.GetBlockReason()
+        if hatchRequested or currentlyHatching then
+            return "Auto Hatch"
+        end
+        if placementRequested or currentlyPlacing then
+            return "Auto Place Eggs"
+        end
+        return nil
+    end
+
+    function A.SetSelectedPet(name)
+        if type(name) == "string" and name ~= "" and name ~= "No eligible pets" then
+            selectedMergePet = name
+            report("Merge pet selected: " .. name, "success")
+        else
+            selectedMergePet = nil
+        end
+        publishPetOptions(true)
+    end
+
+    function A.SetAutoMerge(enabled)
+        autoMergeEnabled = enabled == true
+        if autoMergeEnabled and not selectedMergePet then
+            report("Auto Merge enabled • select a pet first", "warning")
+        else
+            report(autoMergeEnabled and "Auto Merge enabled" or "Auto Merge disabled", autoMergeEnabled and "success" or "warning")
+        end
+    end
+
+    function A.SetAutoHatch(enabled)
+        autoHatchEnabled = enabled == true
+        if autoHatchEnabled then
+            local count = publishHatchCount()
+            if count > 0 then
+                hatchRequested = true
+                task.spawn(runHatchWorker)
+            end
+        else
+            hatchRequested = false
+        end
+        report(autoHatchEnabled and "Auto Hatch enabled • HIGHEST priority" or "Auto Hatch disabled", autoHatchEnabled and "success" or "warning")
+    end
+
+    function A.SetAutoPlaceEggs(enabled)
+        autoPlaceEggsEnabled = enabled == true
+        if autoPlaceEggsEnabled and getEggTotal() > 0 then
+            placementRequested = true
+            if not hatchRequested and not currentlyHatching then
+                task.spawn(placeAllEggs)
+            end
+        elseif not autoPlaceEggsEnabled then
+            placementRequested = false
+        end
+        report(autoPlaceEggsEnabled and "Auto Place Eggs enabled" or "Auto Place Eggs disabled", autoPlaceEggsEnabled and "success" or "warning")
+    end
+
+    function A.MergeOnce() task.spawn(mergeSelectedOnce) end
+    function A.PlaceNow()
+        if getEggTotal() <= 0 then
+            placementRequested = false
+            report("No eggs detected in Backpack", "warning")
+            return
+        end
+        placementRequested = true
+        task.spawn(placeAllEggs)
+    end
+
+    function A.RefreshBase()
+        candidates = {}
+        candidateIndex = 1
+        usedPositionKeys = {}
+        successfulPositions = {}
+        return buildCandidatePositions()
+    end
+
+    function A.Start()
+        if started then return end
+        started = true
+
+        task.spawn(function()
+            while task.wait(0.18) do
+                local hatchCount = publishHatchCount()
+                if autoHatchEnabled and hatchCount > 0 then
+                    hatchRequested = true
+                    if not hatchWorkerRunning then
+                        task.spawn(runHatchWorker)
+                    end
+                elseif hatchCount <= 0 and not currentlyHatching then
+                    hatchRequested = false
+                end
+            end
+        end)
+
+        task.spawn(function()
+            while task.wait(SCAN_DELAY) do
+                pcall(publishPetOptions)
+                local eggs = publishEggCount()
+                if autoPlaceEggsEnabled and eggs > 0 then
+                    placementRequested = true
+                    if not currentlyPlacing and not stealBusyCheck()
+                        and not hatchRequested and not currentlyHatching then
+                        task.spawn(placeAllEggs)
+                    end
+                elseif eggs <= 0 and not currentlyPlacing then
+                    placementRequested = false
+                end
+            end
+        end)
+
+        task.spawn(function()
+            while task.wait(MERGE_DELAY) do
+                if autoMergeEnabled and selectedMergePet and not currentlyMerging then
+                    pcall(mergeSelectedOnce)
+                end
+            end
+        end)
+
+        Backpack.ChildAdded:Connect(function(object)
+            task.defer(function()
+                publishPetOptions(true)
+                publishEggCount(true)
+            end)
+            if autoPlaceEggsEnabled and isEgg(object) then
+                placementRequested = true
+            end
+        end)
+        Backpack.ChildRemoved:Connect(function()
+            task.defer(function()
+                publishPetOptions(true)
+                publishEggCount(true)
+            end)
+        end)
+
+        local characterConnections = {}
+        local function connectCharacter(character)
+            for _, connection in ipairs(characterConnections) do
+                pcall(function() connection:Disconnect() end)
+            end
+            characterConnections = {}
+            table.insert(characterConnections, character.ChildAdded:Connect(function(object)
+                if isEgg(object) then task.defer(function() publishEggCount(true) end) end
+            end))
+            table.insert(characterConnections, character.ChildRemoved:Connect(function(object)
+                if isEgg(object) then task.defer(function() publishEggCount(true) end) end
+            end))
+        end
+        if Player.Character then connectCharacter(Player.Character) end
+        Player.CharacterAdded:Connect(function(character)
+            connectCharacter(character)
+            candidates = {}
+            candidateIndex = 1
+            usedPositionKeys = {}
+            successfulPositions = {}
+            task.delay(1.5, function() pcall(buildCandidatePositions) end)
+        end)
+
+        task.defer(function()
+            publishPetOptions(true)
+            publishEggCount(true)
+            publishHatchCount()
+            pcall(buildCandidatePositions)
+            if autoHatchEnabled and publishHatchCount() > 0 then
+                hatchRequested = true
+                task.spawn(runHatchWorker)
+            elseif autoPlaceEggsEnabled and getEggTotal() > 0 then
+                placementRequested = true
+            end
+        end)
+    end
+
+    return A
+end)()
 
 -- Load BEFORE building the UI so every saved toggle/dropdown starts correctly.
 pcall(loadConfig)
@@ -1009,6 +2706,12 @@ local protectionAntiPushMover = nil
 local protectionAntiPushRoot = nil
 local protectionForceField = nil
 local protectionConstraintStates = setmetatable({}, {__mode = "k"})
+
+if PetEggAutomation and PetEggAutomation.SetStealBusyCheck then
+    PetEggAutomation.SetStealBusyCheck(function()
+        return targetLockActive or autoStealReturning
+    end)
+end
 local POST_TELEPORT_SETTLE = 0.03
 -- Rapid hit mode: no fixed artificial delay.
 -- Resolve the correct server-accepted egg once per Heartbeat, then send a
@@ -2982,6 +4685,21 @@ local function runAutoStealManager()
                 break
             end
 
+            if PetEggAutomation and PetEggAutomation.ShouldBlockSteal and PetEggAutomation.ShouldBlockSteal() then
+                local reason = PetEggAutomation.GetBlockReason and PetEggAutomation.GetBlockReason() or "Egg automation"
+                setStatus("Paused • " .. tostring(reason) .. " has priority", "warning")
+                while autoStealEnabled and PetEggAutomation.ShouldBlockSteal() do
+                    task.wait(0.05)
+                end
+                if autoStealEnabled then
+                    setStatus("Higher-priority egg task finished • resuming Auto Steal", "working")
+                end
+            end
+
+            if not autoStealEnabled then
+                break
+            end
+
             local ok, completedOrError = pcall(runAutoStealCycle)
             if not ok then
                 setStatus("Error: " .. tostring(completedOrError), "error")
@@ -3530,9 +5248,142 @@ function UI.createToggleRow(parent, labelText, description, order, initialValue,
                 end)
             end
         end,
+        SetDescription = function(value)
+            sub.Text = tostring(value or "")
+        end,
     }
 end
 
+
+function UI.createSingleSelectDropdown(parent, labelText, description, order, initialValue, onChanged)
+    local wrapper = Instance.new("Frame")
+    wrapper.Name = labelText:gsub("%W+", "") .. "SingleDropdown"
+    wrapper.Size = UDim2.new(1, 0, 0, 54)
+    wrapper.AutomaticSize = Enum.AutomaticSize.Y
+    wrapper.BackgroundColor3 = THEME.surface
+    wrapper.BorderSizePixel = 0
+    wrapper.LayoutOrder = order
+    wrapper.Parent = parent
+    UI.addCorner(wrapper, 10)
+    UI.addStroke(wrapper, THEME.line, 1, 0.45)
+    UI.addPadding(wrapper, 6, 6, 6, 6)
+
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 5)
+    layout.Parent = wrapper
+
+    local header = Instance.new("TextButton")
+    header.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 48 or 44)
+    header.BackgroundColor3 = THEME.card
+    header.BorderSizePixel = 0
+    header.AutoButtonColor = false
+    header.Text = ""
+    header.LayoutOrder = 1
+    header.Parent = wrapper
+    UI.addCorner(header, 8)
+
+    local title = UI.makeText(header, labelText, 13, THEME.text, Enum.Font.GothamBold)
+    title.Position = UDim2.fromOffset(10, 3)
+    title.Size = UDim2.new(1, -46, 0, 19)
+
+    local summary = UI.makeText(header, initialValue or description or "None selected", 9, THEME.muted, Enum.Font.GothamBold)
+    summary.Position = UDim2.fromOffset(10, 22)
+    summary.Size = UDim2.new(1, -46, 0, 16)
+    summary.TextTruncate = Enum.TextTruncate.AtEnd
+
+    local arrow = UI.makeText(header, "⌄", 18, THEME.muted, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+    arrow.AnchorPoint = Vector2.new(1, 0.5)
+    arrow.Position = UDim2.new(1, -6, 0.5, 0)
+    arrow.Size = UDim2.fromOffset(28, 28)
+
+    local options = Instance.new("Frame")
+    options.Size = UDim2.new(1, 0, 0, 0)
+    options.AutomaticSize = Enum.AutomaticSize.Y
+    options.BackgroundTransparency = 1
+    options.Visible = false
+    options.LayoutOrder = 2
+    options.Parent = wrapper
+
+    local optionsLayout = Instance.new("UIListLayout")
+    optionsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    optionsLayout.Padding = UDim.new(0, 4)
+    optionsLayout.Parent = options
+
+    local currentValue = initialValue
+    local currentOptions = {}
+    local opened = false
+
+    local function refresh(list, counts, selectedOverride)
+        currentOptions = {}
+        for _, value in ipairs(list or {}) do
+            table.insert(currentOptions, value)
+        end
+        if selectedOverride ~= nil then
+            currentValue = selectedOverride
+        end
+
+        for _, child in ipairs(options:GetChildren()) do
+            if child ~= optionsLayout then child:Destroy() end
+        end
+
+        if #currentOptions == 0 then
+            summary.Text = currentValue or "No eligible pets"
+        else
+            summary.Text = currentValue or description or "Select a pet"
+        end
+
+        for index, value in ipairs(currentOptions) do
+            local option = Instance.new("TextButton")
+            option.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 40 or 34)
+            option.BackgroundColor3 = currentValue == value and Color3.fromRGB(43, 39, 75) or THEME.card
+            option.BorderSizePixel = 0
+            option.AutoButtonColor = false
+            option.Text = ""
+            option.LayoutOrder = index
+            option.Parent = options
+            UI.addCorner(option, 9)
+
+            local labelText = value
+            if counts and counts[value] ~= nil then
+                labelText = value .. "  ×" .. tostring(counts[value])
+            end
+            local label = UI.makeText(option, labelText, 11, THEME.text, Enum.Font.GothamBold)
+            label.Position = UDim2.fromOffset(10, 0)
+            label.Size = UDim2.new(1, -20, 1, 0)
+
+            option.Activated:Connect(function()
+                currentValue = value
+                summary.Text = value
+                opened = false
+                options.Visible = false
+                arrow.Text = "⌄"
+                if onChanged then
+                    task.spawn(function() onChanged(value) end)
+                end
+                refresh(currentOptions, counts, currentValue)
+            end)
+        end
+    end
+
+    header.Activated:Connect(function()
+        opened = not opened
+        options.Visible = opened
+        arrow.Text = opened and "⌃" or "⌄"
+    end)
+
+    refresh({})
+
+    return {
+        Frame = wrapper,
+        Refresh = refresh,
+        Get = function() return currentValue end,
+        Set = function(value)
+            currentValue = value
+            summary.Text = value or description or "None selected"
+        end,
+    }
+end
 
 function UI.createMultiSelectDropdown(parent, labelText, description, order, selectionTable, onChanged)
     local wrapper = Instance.new("Frame")
@@ -3989,14 +5840,114 @@ function UI.launchMainGui()
         end
     )
 
-    UI.createSectionLabel(content, "Utilities", 6)
+    UI.createSectionLabel(content, "Pet & Egg", 6)
+
+    local mergePetDropdown = UI.createSingleSelectDropdown(
+        content,
+        "Merge Pet",
+        "Live scanner • only pets with 3+ are listed",
+        7,
+        PetEggAutomation.GetSelectedPet(),
+        function(value)
+            PetEggAutomation.SetSelectedPet(value)
+            queueSaveConfig()
+        end
+    )
+
+    PetEggAutomation.SetPetOptionsSink(function(names, counts, selected)
+        if mergePetDropdown and mergePetDropdown.Refresh then
+            mergePetDropdown.Refresh(names, counts, selected)
+        end
+    end)
+
+    PetEggAutomation.SetStatusSink(function(message, kind)
+        if statusSink then
+            statusSink("Pet/Egg: " .. tostring(message), kind)
+        end
+    end)
+
+    UI.createToggleRow(
+        content,
+        "Auto Merge",
+        "Continuously merges 3 of the selected pet",
+        8,
+        PetEggAutomation.GetConfig().autoMergeEnabled,
+        function(enabled)
+            PetEggAutomation.SetAutoMerge(enabled)
+            queueSaveConfig()
+        end
+    )
+
+    local autoHatchToggle = UI.createToggleRow(
+        content,
+        "Auto Hatch",
+        "Hatch prompts: scanning… • HIGHEST priority",
+        9,
+        PetEggAutomation.GetConfig().autoHatchEnabled,
+        function(enabled)
+            PetEggAutomation.SetAutoHatch(enabled)
+            queueSaveConfig()
+        end
+    )
+
+    PetEggAutomation.SetHatchCountSink(function(total)
+        if autoHatchToggle and autoHatchToggle.SetDescription then
+            autoHatchToggle.SetDescription(
+                "Hatch prompts: " .. tostring(total) .. " • HIGHEST priority"
+            )
+        end
+    end)
+
+    local autoPlaceEggToggle = UI.createToggleRow(
+        content,
+        "Auto Place Eggs",
+        "Eggs: scanning… • priority below Auto Hatch",
+        10,
+        PetEggAutomation.GetConfig().autoPlaceEggsEnabled,
+        function(enabled)
+            PetEggAutomation.SetAutoPlaceEggs(enabled)
+            queueSaveConfig()
+        end
+    )
+
+    PetEggAutomation.SetEggCountSink(function(total)
+        if autoPlaceEggToggle and autoPlaceEggToggle.SetDescription then
+            autoPlaceEggToggle.SetDescription(
+                "Eggs: " .. tostring(total) .. " • priority below Auto Hatch"
+            )
+        end
+    end)
+
+    UI.createActionRow(
+        content,
+        "Place Eggs Now",
+        "Places every detected egg inside your plot",
+        "PLACE",
+        11,
+        function()
+            PetEggAutomation.PlaceNow()
+        end
+    )
+
+    UI.createActionRow(
+        content,
+        "Refresh My Base",
+        "Rebuilds safe interior egg positions",
+        "SCAN",
+        12,
+        function()
+            PetEggAutomation.RefreshBase()
+        end
+    )
+
+    UI.createSectionLabel(content, "Utilities", 13)
 
 
     UI.createToggleRow(
         content,
         "Anti AFK",
         "Prevents Roblox idle disconnects",
-        7,
+        14,
         antiAfkEnabled,
         function(enabled)
             antiAfkEnabled = enabled
@@ -4019,7 +5970,7 @@ function UI.launchMainGui()
         content,
         "FPS Booster",
         "Low graphics • removes effects/textures • FPS counter",
-        9,
+        15,
         fpsBoosterEnabled,
         function(enabled)
             setFpsBoosterEnabled(enabled)
@@ -4037,7 +5988,7 @@ function UI.launchMainGui()
         "Save Config",
         "Changes auto-save • tap to save now",
         "SAVE",
-        10,
+        16,
         function()
             local ok, err = saveConfigNow()
             if ok then
@@ -4052,7 +6003,7 @@ function UI.launchMainGui()
         content,
         "Auto Buy Pickaxe",
         "Buys and equips the best affordable tier",
-        11,
+        17,
         autoBuyEnabled,
         function(enabled)
             autoBuyEnabled = enabled
@@ -4067,7 +6018,7 @@ function UI.launchMainGui()
         content,
         "Upgrade Plot",
         "Continuously requests the next plot upgrade",
-        12,
+        18,
         upgradePlotEnabled,
         function(enabled)
             upgradePlotEnabled = enabled
@@ -4078,13 +6029,13 @@ function UI.launchMainGui()
         end
     )
 
-    UI.createSectionLabel(content, "Auto Sell", 13)
+    UI.createSectionLabel(content, "Auto Sell", 19)
 
     UI.createToggleRow(
         content,
         "Auto Sell",
         "Sells only the rarities selected below",
-        14,
+        20,
         sellAllEnabled,
         function(enabled)
             sellAllEnabled = enabled
@@ -4099,7 +6050,7 @@ function UI.launchMainGui()
         content,
         "Sell Rarities",
         "Selected rarities will be sold automatically",
-        15,
+        21,
         selectedSellRarities,
         function()
             queueSaveConfig()
@@ -4117,11 +6068,12 @@ function UI.launchMainGui()
 
     scanRarities()
     task.spawn(runRarityScanner)
+    PetEggAutomation.Start()
 
     local footer = Instance.new("Frame")
     footer.Size = UDim2.new(1, 0, 0, 28)
     footer.BackgroundTransparency = 1
-    footer.LayoutOrder = 16
+    footer.LayoutOrder = 22
     footer.Parent = content
 
     local footerText = UI.makeText(
