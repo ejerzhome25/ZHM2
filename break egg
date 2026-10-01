@@ -13,6 +13,10 @@
       * ALL-EDGE DRAG: drag from top/header, left edge, right edge, or bottom edge
       * MOBILE NORMAL SIZE: larger balanced mobile panel, still compact
       * RESIZABLE UI: drag the bottom-right grip to resize the expanded VNDT window
+      * SMOOTH MOBILE SCROLL: manual canvas sync prevents AutomaticCanvasSize stalls
+      * DIRECT FINGER SCROLL: swipe anywhere inside the content area to scroll up/down
+      * TOUCH FIX: taps stay taps; vertical movement becomes scrolling after a small threshold
+      * TOUCH FIX: thinner edge drag zones reduce accidental swipe capture
       * PERFORMANCE: cached ProximityPrompts + plot lookup to avoid repeated full Workspace scans
       * PERFORMANCE: mobile UI drag updates throttled + background scanners run at lighter mobile intervals
       * LOW-LAG PASS: reduced per-frame remote spam, deep character scans, workspace rescans, and random-candidate work
@@ -5262,7 +5266,7 @@ end
 function UI.addAllEdgeDragHandles(frame)
     -- Thin transparent grip zones let mobile users drag from any outer side
     -- without covering the actual buttons in the center of the UI.
-    local thickness = IS_TOUCH_DEVICE and 10 or 6
+    local thickness = IS_TOUCH_DEVICE and 5 or 6
     local handles = {}
 
     local function makeHandle(name, position, size, anchorPoint)
@@ -5288,6 +5292,198 @@ function UI.addAllEdgeDragHandles(frame)
     return handles
 end
 
+function UI.bindSmoothScrolling(scroller, layout)
+    -- Mobile uses a direct finger-pan fallback instead of relying on Roblox's
+    -- native ScrollingFrame gesture state. This makes swiping work even when the
+    -- touch starts over a button/toggle/dropdown row inside the VNDT content.
+    if not scroller or not layout then
+        return
+    end
+
+    scroller.AutomaticCanvasSize = Enum.AutomaticSize.None
+    scroller.ScrollingDirection = Enum.ScrollingDirection.Y
+    scroller.Active = true
+    scroller.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
+    scroller.ScrollBarThickness = IS_TOUCH_DEVICE and 4 or 3
+    scroller.ScrollBarImageTransparency = IS_TOUCH_DEVICE and 0.08 or 0.15
+
+    -- Desktop keeps Roblox's normal wheel/drag scrolling.
+    -- Mobile CanvasPosition is controlled directly by the finger-pan code below
+    -- so a frozen native touch gesture cannot block the menu.
+    scroller.ScrollingEnabled = not IS_TOUCH_DEVICE
+
+    pcall(function()
+        scroller.VerticalScrollBarInset = Enum.ScrollBarInset.ScrollBar
+    end)
+
+    local updateQueued = false
+    local destroyed = false
+    local activeTouch = nil
+    local touchStart = nil
+    local canvasStartY = 0
+    local manualScroll = false
+    local cancelledTouch = false
+    local TOUCH_THRESHOLD = 6
+
+    local function getCanvasHeight()
+        return math.max(
+            0,
+            math.ceil(layout.AbsoluteContentSize.Y + (IS_TOUCH_DEVICE and 8 or 12))
+        )
+    end
+
+    local function getMaxScrollY()
+        return math.max(
+            0,
+            getCanvasHeight() - math.max(0, scroller.AbsoluteWindowSize.Y)
+        )
+    end
+
+    local function setScrollY(y)
+        if destroyed or not scroller.Parent then
+            return
+        end
+
+        scroller.CanvasPosition = Vector2.new(
+            0,
+            math.clamp(y, 0, getMaxScrollY())
+        )
+    end
+
+    local function updateCanvasNow()
+        updateQueued = false
+
+        if destroyed or not scroller.Parent or not layout.Parent then
+            return
+        end
+
+        local canvasHeight = getCanvasHeight()
+        scroller.CanvasSize = UDim2.fromOffset(0, canvasHeight)
+
+        local current = scroller.CanvasPosition
+        setScrollY(current.Y)
+    end
+
+    local function queueUpdate()
+        if updateQueued or destroyed then
+            return
+        end
+
+        updateQueued = true
+        task.defer(function()
+            -- Let AutomaticSize descendants finish before reading layout height.
+            task.wait()
+            updateCanvasNow()
+        end)
+    end
+
+    local function pointInsideScroller(position)
+        if not position or not scroller.Visible then
+            return false
+        end
+
+        local p = scroller.AbsolutePosition
+        local s = scroller.AbsoluteSize
+        local x = position.X
+        local y = position.Y
+
+        -- Keep a few pixels away from the outer frame's drag/resize grips so
+        -- finger scrolling and window movement never fight over the same touch.
+        local sideGuard = IS_TOUCH_DEVICE and 7 or 0
+        local bottomGuard = IS_TOUCH_DEVICE and 22 or 0
+
+        return x >= p.X + sideGuard
+            and x <= p.X + s.X - sideGuard
+            and y >= p.Y
+            and y <= p.Y + s.Y - bottomGuard
+    end
+
+    layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(queueUpdate)
+    scroller:GetPropertyChangedSignal("AbsoluteWindowSize"):Connect(queueUpdate)
+
+    -- Dropdowns and dynamic sections can change height while the menu is open.
+    scroller.DescendantAdded:Connect(queueUpdate)
+    scroller.DescendantRemoving:Connect(queueUpdate)
+
+    scroller.AncestryChanged:Connect(function(_, parent)
+        if parent == nil then
+            destroyed = true
+            activeTouch = nil
+        end
+    end)
+
+    if IS_TOUCH_DEVICE then
+        UserInputService.InputBegan:Connect(function(input)
+            if destroyed
+                or activeTouch
+                or input.UserInputType ~= Enum.UserInputType.Touch
+                or not pointInsideScroller(input.Position) then
+                return
+            end
+
+            activeTouch = input
+            touchStart = input.Position
+            canvasStartY = scroller.CanvasPosition.Y
+            manualScroll = false
+            cancelledTouch = false
+            queueUpdate()
+        end)
+
+        UserInputService.InputChanged:Connect(function(input)
+            if destroyed or input ~= activeTouch or not touchStart then
+                return
+            end
+
+            local delta = input.Position - touchStart
+            local absX = math.abs(delta.X)
+            local absY = math.abs(delta.Y)
+
+            if not manualScroll then
+                if absY < TOUCH_THRESHOLD and absX < TOUCH_THRESHOLD then
+                    return
+                end
+
+                -- A clear horizontal gesture is not treated as menu scrolling.
+                -- This keeps normal taps/side gestures responsive.
+                if absX > absY * 1.25 then
+                    cancelledTouch = true
+                    return
+                end
+
+                manualScroll = true
+            end
+
+            if manualScroll and not cancelledTouch then
+                -- Finger up = content down; finger down = content up.
+                setScrollY(canvasStartY - delta.Y)
+            end
+        end)
+
+        UserInputService.InputEnded:Connect(function(input)
+            if input ~= activeTouch then
+                return
+            end
+
+            activeTouch = nil
+            touchStart = nil
+            manualScroll = false
+            cancelledTouch = false
+            queueUpdate()
+        end)
+    else
+        -- Safety net for desktop/external mouse use.
+        scroller.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseWheel
+                and not scroller.ScrollingEnabled then
+                scroller.ScrollingEnabled = true
+            end
+            queueUpdate()
+        end)
+    end
+
+    updateCanvasNow()
+end
+
 function UI.makeResizable(frame, onResize, canResize)
     -- One compact bottom-right grip. Keeping resize logic inside this function
     -- avoids adding more long-lived locals to the main chunk.
@@ -5295,7 +5491,7 @@ function UI.makeResizable(frame, onResize, canResize)
     grip.Name = "ResizeGrip"
     grip.AnchorPoint = Vector2.new(1, 1)
     grip.Position = UDim2.new(1, -4, 1, -4)
-    grip.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(24, 24) or UDim2.fromOffset(18, 18)
+    grip.Size = IS_TOUCH_DEVICE and UDim2.fromOffset(20, 20) or UDim2.fromOffset(18, 18)
     grip.BackgroundColor3 = THEME.surface2
     grip.BackgroundTransparency = IS_TOUCH_DEVICE and 0.08 or 0.18
     grip.BorderSizePixel = 0
@@ -6081,13 +6277,14 @@ function UI.launchMainGui()
     content.Size = IS_TOUCH_DEVICE and UDim2.new(1, -8, 1, -36) or UDim2.new(1, -16, 1, -63)
     content.BackgroundTransparency = 1
     content.BorderSizePixel = 0
-    content.ScrollBarThickness = IS_TOUCH_DEVICE and 2 or 2
+    content.ScrollBarThickness = IS_TOUCH_DEVICE and 4 or 3
     content.ScrollBarImageColor3 = THEME.accent
+    content.ScrollBarImageTransparency = IS_TOUCH_DEVICE and 0.08 or 0.15
     content.ScrollingDirection = Enum.ScrollingDirection.Y
     content.Active = true
     content.ScrollingEnabled = true
     content.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
-    content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    content.AutomaticCanvasSize = Enum.AutomaticSize.None
     content.CanvasSize = UDim2.new(0, 0, 0, 0)
     content.Parent = mainFrame
     UI.addPadding(content, 1, 2, 1, 3)
@@ -6096,6 +6293,8 @@ function UI.launchMainGui()
     contentLayout.SortOrder = Enum.SortOrder.LayoutOrder
     contentLayout.Padding = UDim.new(0, IS_TOUCH_DEVICE and 2 or 6)
     contentLayout.Parent = content
+
+    UI.bindSmoothScrolling(content, contentLayout)
 
     local hero = Instance.new("Frame")
     hero.Name = "StatusCard"
