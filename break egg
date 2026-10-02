@@ -4140,7 +4140,8 @@ local function protectCharacterStep()
     -- This keeps the character movable from the game's point of view so the
     -- pickaxe can continue breaking eggs normally.
     if ((targetLockActive and not autoStealReturning) or (AutoSnatch.enabled and AutoSnatch.protecting))
-        and not (BreakTween.active and BreakTween.active.PlaybackState == Enum.PlaybackState.Playing) then
+        and not (BreakTween.active and BreakTween.active.PlaybackState == Enum.PlaybackState.Playing)
+        and not (AutoSnatch.followTween and AutoSnatch.followTween.PlaybackState == Enum.PlaybackState.Playing) then
         local mover = ensureAntiPushMover(root)
 
         if mover then
@@ -4975,6 +4976,9 @@ end
 
 -- Auto Snatch owns movement above Auto Break, below Hatch and Place.
 do
+-- Use a separate function frame: a plain do-block still shares the main chunk's
+-- 200-register limit while its locals are active.
+(function()
     local function key(value)
         return tostring(value or ""):lower():gsub("[^%w]", "")
     end
@@ -5450,14 +5454,14 @@ end
         if not preparedPrompts[prompt] then
             local ok = pcall(function()
                 prompt.HoldDuration = 0
-                prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, 50)
+                prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, 150)
                 prompt.RequiresLineOfSight = false
             end)
             preparedPrompts[prompt] = ok
         end
         local fired = false
         -- Zero-wait burst for the logged StealPrompt; yield only in the outer loop.
-        for _ = 1, 3 do
+        for _ = 1, 5 do
             if not AutoSnatch.enabled or higherPriority() or not prompt.Parent or not prompt.Enabled then break end
             local ok = false
             if type(fireproximityprompt) == "function" then
@@ -5542,7 +5546,7 @@ end
             local root = character and character:FindFirstChild("HumanoidRootPart")
             if promptPosition then
                 local distance = (position - promptPosition).Magnitude
-                if (detectedName == name and distance <= 24)
+                if (detectedName == name and distance <= 60)
                     or (not detectedName and distance <= 8 and root and (root.Position - promptPosition).Magnitude <= 12) then
                     return loggedPrompt
                 end
@@ -5558,7 +5562,7 @@ end
                         local d = (position - promptPosition).Magnitude
                         -- Some games place the prompt beside the displayed animal model.
                         if prompt:IsDescendantOf(model) and not excluded(prompt) then return prompt end
-                        if d <= 24 and animalName(prompt) == name and d < bestDistance and not excluded(prompt) then
+                        if d <= 60 and animalName(prompt) == name and d < bestDistance and not excluded(prompt) then
                             best, bestDistance = prompt, d
                         end
                     end
@@ -5608,7 +5612,54 @@ end
         weightCache[model] = {time = now, kg = kg}
         return kg
     end
+    local follow = {connection = nil, proxy = nil, root = nil, goal = nil}
+    function AutoSnatch.CancelFollow()
+        if follow.connection then follow.connection:Disconnect(); follow.connection = nil end
+        if AutoSnatch.followTween then AutoSnatch.followTween:Cancel(); AutoSnatch.followTween = nil end
+        if follow.proxy then follow.proxy:Destroy(); follow.proxy = nil end
+        follow.root, follow.goal = nil, nil
+    end
+    local function followTarget(model, prompt)
+        local character = LocalPlayer.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        local position = prompt and prompt.Parent and prompt.Enabled and getPromptWorldPosition(prompt)
+            or (model.Parent and modelPosition(model))
+        if not root or not position or not AutoSnatch.protecting or higherPriority() then
+            AutoSnatch.CancelFollow()
+            return
+        end
+        local goal = Vector3.new(position.X, 0, position.Z + 5)
+        if AutoSnatch.followTween and follow.root == root and follow.goal
+            and (follow.goal - goal).Magnitude < 0.75
+            and AutoSnatch.followTween.PlaybackState == Enum.PlaybackState.Playing then return end
+        local current = Vector3.new(root.Position.X, 0, root.Position.Z)
+        if (current - goal).Magnitude < 0.6 then AutoSnatch.CancelFollow(); return end
+        AutoSnatch.CancelFollow()
+        releaseAntiPushMover()
+        root.Anchored = false
+        follow.root, follow.goal = root, goal
+        local proxy = Instance.new("Vector3Value")
+        proxy.Value = current
+        follow.proxy = proxy
+        AutoSnatch.followTween = TweenService:Create(proxy,
+            TweenInfo.new(0.20, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {Value = goal})
+        follow.connection = RunService.Heartbeat:Connect(function()
+            if not AutoSnatch.enabled or not AutoSnatch.protecting or higherPriority()
+                or not root.Parent or LocalPlayer.Character ~= character or excluded(model)
+                or (prompt and (not prompt.Parent or not prompt.Enabled)) then
+                AutoSnatch.CancelFollow()
+                return
+            end
+            root.CFrame = CFrame.new(proxy.Value.X, root.Position.Y, proxy.Value.Z) * root.CFrame.Rotation
+            if AutoSnatch.followTween and AutoSnatch.followTween.PlaybackState == Enum.PlaybackState.Completed then
+                AutoSnatch.CancelFollow()
+            end
+        end)
+        AutoSnatch.followTween:Play()
+    end
+
     local function returnToBoard()
+        AutoSnatch.CancelFollow()
         AutoSnatch.protecting = false
         protectCharacterStep()
         clearTargetLock()
@@ -5670,13 +5721,12 @@ end
                         status("Teleporting to " .. name .. (AutoSnatch.highestKg
                             and (kg ~= nil and string.format(" • %.2f kg", kg) or " • KG unknown") or ""))
                         AutoSnatch.protecting = true
-                        if not teleportCharacter(CFrame.new(position + Vector3.new(0, 2, 2))) then return end
+                        if not teleportCharacter(CFrame.new(position + Vector3.new(0, 2, 5))) then return end
                         needsReturn = true
                         protectCharacterStep()
                         prompt = findStealPrompt(model, name)
                         local attempted = false
                         local completed = false
-                        local lastTeleport = -math.huge
                         local deadline = os.clock() + 10
                         while AutoSnatch.enabled and not higherPriority() and AutoSnatch.selected[name] == true and (attempted or os.clock() < deadline) do
                             if attempted and prompt and (not prompt.Parent or not prompt.Enabled) then
@@ -5689,15 +5739,8 @@ end
                                 break
                             end
                             prompt = prompt or findStealPrompt(model, name)
+                            followTarget(model, prompt)
                             if prompt and prompt.Parent and prompt.Enabled then
-                                local livePosition = getPromptWorldPosition(prompt)
-                                local character = LocalPlayer.Character
-                                local root = character and character:FindFirstChild("HumanoidRootPart")
-                                if livePosition and root and (root.Position - (livePosition + Vector3.new(0, 6, 2))).Magnitude > 3
-                                    and os.clock() - lastTeleport >= 0.04 then
-                                    teleportCharacter(CFrame.new(livePosition + Vector3.new(0, 2, 2)))
-                                    lastTeleport = os.clock()
-                                end
                                 if not AutoSnatch.enabled or higherPriority() or excluded(model, true) or excluded(prompt, true) then break end
                                 status("Stealing " .. name)
                                 attempted = fireSnatchPromptRapid(prompt) or attempted
@@ -5705,7 +5748,7 @@ end
                                 prompt = nil
                                 status("At " .. name .. " • waiting for steal prompt")
                             end
-                            if prompt then RunService.Heartbeat:Wait() else task.wait(0.1) end
+                            RunService.Heartbeat:Wait()
                         end
                         cooldown[model] = os.clock() + 10
                         if AutoSnatch.enabled and not higherPriority() and not completed then
@@ -5717,6 +5760,7 @@ end
                         needsReturn = not returnedThisCycle
                     end
                 end)
+                AutoSnatch.CancelFollow()
                 if AutoSnatch.protecting then
                     AutoSnatch.protecting = false
                     pcall(protectCharacterStep)
@@ -5732,8 +5776,10 @@ end
             AutoSnatch.busy = false
             AutoSnatch.running = false
             AutoSnatch.protecting = false
+            AutoSnatch.CancelFollow()
         end)
     end
+end)()
 end
 
 local function runAutoSteal()
@@ -7858,13 +7904,13 @@ function UI.launchMainGui()
     UI.createToggleRow(
         content,
         "Auto Snatch",
-        "Steals selected animals • returns to treadmill",
+        "TP + stable tween to selected animals • returns to treadmill",
         4,
         AutoSnatch.enabled,
         function(enabled)
             AutoSnatch.enabled = enabled
             queueSaveConfig()
-            if enabled then AutoSnatch.Start() end
+            if enabled then AutoSnatch.Start() else AutoSnatch.CancelFollow() end
         end
     )
 
