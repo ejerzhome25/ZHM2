@@ -101,7 +101,7 @@ local BUY_ROUND_DELAY = 0.05
 --// ROUTE
 --//====================================================
 
-local MARKET_WAIT = 5
+local MARKET_WAIT = 8
 
 local STORE_LOAD_WAIT = 0.75
 local STORE_WAIT = 6
