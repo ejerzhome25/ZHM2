@@ -5712,7 +5712,7 @@ local function runUpgradePlot()
     end
 end
 
---// Auto Sell - selected pet names, with an optional selected-rarity filter.
+--// Auto Sell - pet names or rarities; selecting both requires both filters.
 do
     local function nameKey(value)
         local text = tostring(value or ""):gsub("<[^>]*>", ""):gsub("%b[]", "")
@@ -5757,7 +5757,7 @@ end
 local function sellSelectedRarityTools()
     local byName = getSelectedCount(PetSales.selected) > 0
     local byRarity = getSelectedCount(selectedSellRarities) > 0
-    if not byName then
+    if not byName and not byRarity then
         return 0
     end
 
@@ -5802,7 +5802,7 @@ local function sellSelectedRarityTools()
                 end
 
                 if sellable then
-                    local nameMatches = PetSales.Matches(object)
+                    local nameMatches = not byName or PetSales.Matches(object)
                     local rarity = nameMatches and byRarity and detectObjectRarity(object) or nil
                     if nameMatches and (not byRarity or (rarity and selectedSellRarities[rarity])) then
                         seen[object] = true
@@ -8009,7 +8009,7 @@ function UI.launchMainGui()
     UI.createToggleRow(
         content,
         "Auto Sell",
-        "Select pet names • selected rarities further filter sales",
+        "Names or rarities • select both to require both filters",
         20,
         sellAllEnabled,
         function(enabled)
