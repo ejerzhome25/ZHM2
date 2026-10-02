@@ -4983,7 +4983,6 @@ do
         return tostring(value or ""):lower():gsub("[^%w]", "")
     end
     local names = [[
-_Secretary_Bird
 Aardvark
 Akita
 Albatross
@@ -4992,17 +4991,19 @@ Anglerfish
 Ankylosaurus
 Anteater
 ARCHAEOPTERYX
+archerfish
 ARGENTAVIS
-AustralianCattleDog
+Australian Cattle Dog
 AZHDARCHID
 Badger
-Barracuda
+barracuda
 Bat
 Bear
 BichonFrise
 Binturong
 Blobfish
-BostonTerrier
+Boston Terrier
+Boxfish
 Brachiosaurus
 Bull
 Bunny
@@ -5013,27 +5014,28 @@ Capybara
 Caracal
 Cassowary
 Cat
-CavalierKingCharlesSpaniel
+Cavalier King Charles Spaniel
 CERBERUS
 Chicken
-CHIMERA
+CHIREMA
 ChowChow
 Chupacabra
-ClassicDragon
+CLASSICDRAGON
 Cobra
 COCKATRICE
+CoralGoby
 Cow
+cowfish
 Crab
 Crocodile
 Cuttlefish
 DIMETRODON
 Dingo
-Dog
-DullahanHorse
+Dullahan
 DumboOctopus
 Elephant
 Emu
-EnglishBulldog
+English Bulldog
 FangtoothFish
 Fenrir
 FIREPHOENIX
@@ -5043,22 +5045,25 @@ Gallimimus
 GARGOYLE_BAT
 GARUDA
 GiantIsopod
-Giraffe
+Giraffee
 Goat
 GoblinShark
 GoldenRetriver
 Goldfish
 Gorilla
-GreatDane
-Griffin
+Great Dane
+GRIFFIN
 GuiennaPig
 Hamster
+HARPY
+hawkfish
 HoneyBadger
 Horse
-Hydra
+HYDRA
 Hyena
 Jackal
 Jackalope
+Jellyfish
 Kangaroo
 Kappa
 Kitsune
@@ -5069,43 +5074,47 @@ LeafySeaDragon
 LEVIATHAN
 Lindworm
 Lion
+Lionfish
 Lizard
 Llama
 Maltese
-Mammoth
+Mamoth
 Mandarinfish
-Manticore
-MantiShrimp5
+MANTICORE
+MantisShrimp
 MEGALODON
 MICRORAPTOR
 MINOTAUR
-Moorish
+Moorish idol
 Mosasaurus
 MOTHMAN
-Muscovy_Duck
+Muscovy Duck
 Nautilus
 Ostrich
 Owl
 Papillon
 Parrot
-Pegasus
+PEGASUS
 Pigeon
 PLESIOSAUR
-PolarBear
+Polar Bear
 Pony
 PREHISTORIC_DRAGONFLY
 PREHISTORIC_MOTH
 PTERANODON
 PTERODACTYL
-PufferFish
+pufferfish
 QILIN
 QUETZALCOATLUS
 Quokka
 Raiju
 Regal
 ROC
-SaborToothTiger
+SABER_TOOTHED_TIGER
+sailfish
+Seahorse
 Seal
+SecretaryBird
 Serval
 Shark
 Shoebill
@@ -5115,22 +5124,26 @@ Snake
 SPHINX
 Spinosaurus
 STEGOSAURUS
-Stingray
+stingray
 STYMPHALIANBIRD
 Surgeonfish
 Swordfish
+T-Rex
 Tanuki
 THUNDERBIRD
 Tiger
-TRex
 Triceratops
-TrumpetFish
+TripleCobra
+trumpet
+tuna
 Turtle
 Unicorn
 Velicoraptor
 Whale
 WINGED_IMP
+wobbegong
 Wolf
+Wrasse
 WYVERN
 Yak
 YI_QI
@@ -5146,11 +5159,14 @@ Zebra
             table.insert(AutoSnatch.options, name)
         end
     end
-    -- Migrate selections from the two spellings in the previous dropdown.
-    if AutoSnatch.selected.GoldenRetriever then AutoSnatch.selected.GoldenRetriver = true end
-    if AutoSnatch.selected.MantisShrimp then AutoSnatch.selected.MantiShrimp5 = true end
-    for name in pairs(AutoSnatch.selected) do
-        if not Animals[name] then AutoSnatch.selected[name] = nil end
+    -- Keep saved choices only when they match the replacement list.
+    do
+        local migrated = {}
+        for name, selected in pairs(AutoSnatch.selected) do
+            local canonical = allowed[key(name)]
+            if selected and canonical then migrated[canonical] = true end
+        end
+        replaceBooleanMap(AutoSnatch.selected, migrated)
     end
     local models = setmetatable({}, {__mode = "k"})
     local scannerStarted = false
@@ -5880,15 +5896,185 @@ do
         return text:lower():gsub("[^%w]", "")
     end
     local allowedNames = {}
-    for _, name in ipairs(AutoSnatch.options) do
-        if name == "_Secretary_Bird" then name = "SecretaryBird"
-        elseif name == "WINGED_IMP" then name = "WINGEDIMP"
-        elseif name == "YI_QI" then name = "YIQI" end
+    local sellNames = [[
+Aardvark
+Akita
+Albatross
+Amphiptere
+Anglerfish
+Ankylosaurus
+Anteater
+ARCHAEOPTERYX
+archerfish
+ARGENTAVIS
+Australian Cattle Dog
+AZHDARCHID
+Badger
+barracuda
+Bat
+Bear
+BichonFrise
+Binturong
+Blobfish
+Boston Terrier
+Boxfish
+Brachiosaurus
+Bull
+Bunny
+Bunyip
+Butterflyfish
+CALADRIUS
+Capybara
+Caracal
+Cassowary
+Cat
+Cavalier King Charles Spaniel
+CERBERUS
+Chicken
+CHIREMA
+ChowChow
+Chupacabra
+CLASSICDRAGON
+Cobra
+COCKATRICE
+CoralGoby
+Cow
+cowfish
+Crab
+Crocodile
+Cuttlefish
+DIMETRODON
+Dingo
+Dullahan
+DumboOctopus
+Elephant
+Emu
+English Bulldog
+FangtoothFish
+Fenrir
+FIREPHOENIX
+Fossa
+Frog
+Gallimimus
+GARGOYLE_BAT
+GARUDA
+GiantIsopod
+Giraffee
+Goat
+GoblinShark
+GoldenRetriver
+Goldfish
+Gorilla
+Great Dane
+GRIFFIN
+GuiennaPig
+Hamster
+HARPY
+hawkfish
+HoneyBadger
+Horse
+HYDRA
+Hyena
+Jackal
+Jackalope
+Jellyfish
+Kangaroo
+Kappa
+Kitsune
+Koala
+Kookaburra
+KRAKEN
+LeafySeaDragon
+LEVIATHAN
+Lindworm
+Lion
+Lionfish
+Lizard
+Llama
+Maltese
+Mamoth
+Mandarinfish
+MANTICORE
+MantisShrimp
+MEGALODON
+MICRORAPTOR
+MINOTAUR
+Moorish idol
+Mosasaurus
+MOTHMAN
+Muscovy Duck
+Nautilus
+Ostrich
+Owl
+Papillon
+Parrot
+PEGASUS
+Pigeon
+PLESIOSAUR
+Polar Bear
+Pony
+PREHISTORIC_DRAGONFLY
+PREHISTORIC_MOTH
+PTERANODON
+PTERODACTYL
+pufferfish
+QILIN
+QUETZALCOATLUS
+Quokka
+Raiju
+Regal
+ROC
+SABER_TOOTHED_TIGER
+sailfish
+Seahorse
+Seal
+SecretaryBird
+Serval
+Shark
+Shoebill
+SIMURGH
+Snail
+Snake
+SPHINX
+Spinosaurus
+STEGOSAURUS
+stingray
+STYMPHALIANBIRD
+Surgeonfish
+Swordfish
+T-Rex
+Tanuki
+THUNDERBIRD
+Tiger
+Triceratops
+TripleCobra
+trumpet
+tuna
+Turtle
+Unicorn
+Velicoraptor
+Whale
+WINGED_IMP
+wobbegong
+Wolf
+Wrasse
+WYVERN
+Yak
+YI_QI
+Zebra
+]]
+    for name in sellNames:gmatch("[^\r\n]+") do
         table.insert(PetSales.options, name)
         allowedNames[nameKey(name)] = name
     end
-    allowedNames[nameKey("GoldenRetriever")] = "GoldenRetriver"
-    allowedNames[nameKey("MantisShrimp")] = "MantiShrimp5"
+    do
+        local migrated = {}
+        for name, selected in pairs(PetSales.selected) do
+            local canonical = allowedNames[nameKey(name)]
+            if selected and canonical then migrated[canonical] = true end
+        end
+        replaceBooleanMap(PetSales.selected, migrated)
+    end
     function PetSales.Matches(tool)
         local function inspect(object)
             for _, field in ipairs({"PetName", "AnimalName", "Species", "PetType", "DisplayName"}) do
