@@ -1,5 +1,5 @@
 --[[
-    VNDT - Rarity Auto Steal / Rarity Auto Sell
+    VNDT - Rarity Auto Break / Rarity Auto Sell
 
     Updated from the supplied readable Luau source.
     Changes:
@@ -34,28 +34,28 @@
       * LOW-LAG PASS: reduced per-frame remote spam, deep character scans, workspace rescans, and random-candidate work
       * MOBILE FREE DRAG: window can move horizontally and vertically while staying on-screen
       * Added minimize / restore support
-      * Auto Steal now targets selected live-scanned rarities
+      * Auto Break now targets selected live-scanned rarities
       * No fixed egg-search delay: rescans immediately / every frame when empty
       * Removed continuous egg position/tween lock
       * Highest-HP priority added as an optional toggle
-      * STRICT RETURN-FIRST: returns and confirms TreadmillBoard before any new egg scan
-      * Claim-safe pickup: stays at the egg until pickup can register
+      * Hit-only cycle: breaks selected eggs without activating steal prompts
+      * Advances to the next selected egg without returning to the treadmill
       * No fixed delay before finding/scanning for the next egg
       * One Character Protection toggle controls anti-push/ragdoll/stun/godmode
       * Anti-push no longer anchors HumanoidRootPart, so egg breaking still works
-      * Auto Steal stays on the same egg until it is actually broken
-      * Waits 5 seconds after break, then blocks until steal is confirmed
-      * Blocks again until TreadmillBoard return is confirmed before any new target
-      * Waits 0.5 second after confirmed return before finding the next egg
+      * Auto Break stays on the same egg until it is actually broken
+      * No post-break claim delay or steal confirmation wait
+      * No treadmill return barrier between targets
+      * Finds the next egg on the next Heartbeat after breaking
       * Auto Sell now sells only selected rarities
-      * Returns to TreadmillBoard after a successful steal
+      * Remains at the broken egg until the next target is selected
       * FIX: reduced top-level locals to prevent Luau register-limit compile errors
       * FIX: restored exact EggTargeting.Pick resolution before each rapid burst
       * RAPID HIT: 4 zero-delay EggHitRequest calls per Heartbeat
       * OPTIMIZED: expensive HP/break scans throttled while hit loop stays Heartbeat-fast
       * REGISTER FIX: scoped FPS + Anti-AFK internals to stay below Luau 200-local limit
-      * CONFLICT FIX: strict movement ownership prevents Auto Place Eggs and Auto Steal from teleporting/equipping at the same time
-      * STRICT PRIORITY STOP: Auto Hatch / Auto Place immediately interrupt the current Auto Steal cycle, then Auto Steal resumes afterward
+      * CONFLICT FIX: strict movement ownership prevents Auto Place Eggs and Auto Break from teleporting/equipping at the same time
+      * STRICT PRIORITY STOP: Auto Hatch / Auto Place immediately interrupt the current Auto Break cycle, then Auto Break resumes afterward
 ]]
 
 --// Services
@@ -75,6 +75,24 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local LocalPlayer = Players.LocalPlayer
 
+-- Spread large startup traversals across frames instead of allocating one huge list.
+local function walkBatched(root, visit, cancelled)
+    local stack = {root}
+    local sliceStart = os.clock()
+    while #stack > 0 do
+        if cancelled and cancelled() then return end
+        local object = table.remove(stack)
+        if object == root or object.Parent then
+            if object ~= root then visit(object) end
+            for _, child in ipairs(object:GetChildren()) do table.insert(stack, child) end
+        end
+        if os.clock() - sliceStart >= 0.003 then
+            task.wait()
+            sliceStart = os.clock()
+        end
+    end
+end
+
 --// Shared live ProximityPrompt cache
 -- One initial Workspace scan, then event-driven updates. This replaces repeated
 -- Workspace:GetDescendants() prompt scans used by Auto Hatch / pickup checks.
@@ -88,18 +106,6 @@ local function ensureProximityPromptCache()
 
     proximityPromptCacheStarted = true
 
-    -- Build the initial cache in small batches so large maps do not freeze mobile.
-    local descendants = Workspace:GetDescendants()
-    local batchSize = UserInputService.TouchEnabled and 320 or 700
-    for index, object in ipairs(descendants) do
-        if object:IsA("ProximityPrompt") then
-            PROXIMITY_PROMPT_CACHE[object] = true
-        end
-        if index % batchSize == 0 then
-            task.wait()
-        end
-    end
-
     Workspace.DescendantAdded:Connect(function(object)
         if object:IsA("ProximityPrompt") then
             PROXIMITY_PROMPT_CACHE[object] = true
@@ -110,6 +116,14 @@ local function ensureProximityPromptCache()
         if PROXIMITY_PROMPT_CACHE[object] then
             PROXIMITY_PROMPT_CACHE[object] = nil
         end
+    end)
+
+    task.spawn(function()
+        walkBatched(Workspace, function(object)
+            if object:IsA("ProximityPrompt") and object:IsDescendantOf(Workspace) then
+                PROXIMITY_PROMPT_CACHE[object] = true
+            end
+        end)
     end)
 
     return PROXIMITY_PROMPT_CACHE
@@ -268,15 +282,18 @@ local function restoreFpsObject(object, state)
     end
 end
 
+
 local function optimizeFpsObject(object)
     if not fpsBoosterEnabled or not object then
         return
     end
+    if not object:IsDescendantOf(Workspace) and not object:IsDescendantOf(Lighting) then return end
 
     -- Never modify VNDT/game GUI.
     if FPS_IGNORE_GUI and object:FindFirstAncestorOfClass("ScreenGui") then
         return
     end
+
 
     rememberObjectState(object)
 
@@ -555,27 +572,14 @@ local function enableFpsBooster()
     optimizeFpsLighting()
     optimizeFpsTerrain()
 
-    -- Initial pass.
-    local descendants = game:GetDescendants()
-    for index, object in ipairs(descendants) do
-        if not fpsBoosterEnabled then
-            break
-        end
-
-        optimizeFpsObject(object)
-
-        -- Avoid freezing large maps during the first pass.
-        local batchSize = IS_TOUCH_DEVICE and 180 or 400
-        if index % batchSize == 0 then
-            task.wait(IS_TOUCH_DEVICE and 0.02 or 0)
-        end
-    end
+    -- Optimize graphics in short batches to keep startup responsive.
+    walkBatched(Workspace, optimizeFpsObject, function() return not fpsBoosterEnabled end)
 
     if not fpsBoosterEnabled then
         return
     end
 
-    fpsDescendantConnection = game.DescendantAdded:Connect(function(object)
+    fpsDescendantConnection = Workspace.DescendantAdded:Connect(function(object)
         if not fpsBoosterEnabled then
             return
         end
@@ -642,6 +646,7 @@ local function disableFpsBooster()
     disconnectFpsConnections()
     destroyFpsCounter()
 
+
     -- Restore object properties changed by this execution.
     for object, state in pairs(fpsOriginalState) do
         restoreFpsObject(object, state)
@@ -682,15 +687,17 @@ end -- FPS register scope
 
 --// Runtime state
 local autoStealEnabled = false
+local AutoSnatch = {enabled = false, running = false, pending = false, busy = false, protecting = false, selected = {}, options = {}, highestKg = false}
 local autoBuyEnabled = false
 local upgradePlotEnabled = false
 local sellAllEnabled = false
-local highestHpPriorityEnabled = false -- internal: automatically follows Auto Steal
+local highestHpPriorityEnabled = false -- internal: automatically follows Auto Break
 local characterProtectionEnabled = true
 local antiAfkEnabled = true
 
 local selectedStealRarities = {}
 local selectedSellRarities = {}
+local PetSales = {selected = {}, options = {}, running = false}
 
 --// Persistent config
 -- Uses executor file APIs when available.
@@ -776,6 +783,10 @@ local function buildConfig()
         version = CONFIG_VERSION,
 
         autoStealEnabled = autoStealEnabled,
+        autoSnatchEnabled = AutoSnatch.enabled,
+        snatchHighestKgEnabled = AutoSnatch.highestKg,
+        selectedSnatchAnimals = copyBooleanMap(AutoSnatch.selected),
+        snatchSource = "CustomAnimalList",
         autoBuyEnabled = autoBuyEnabled,
         upgradePlotEnabled = upgradePlotEnabled,
         sellAllEnabled = sellAllEnabled,
@@ -790,6 +801,7 @@ local function buildConfig()
 
         selectedStealRarities = copyBooleanMap(selectedStealRarities),
         selectedSellRarities = copyBooleanMap(selectedSellRarities),
+        selectedSellPets = copyBooleanMap(PetSales.selected),
     }
 end
 
@@ -849,6 +861,8 @@ local function loadConfig()
     if type(data.autoStealEnabled) == "boolean" then
         autoStealEnabled = data.autoStealEnabled
     end
+    AutoSnatch.enabled = data.autoSnatchEnabled == true
+    AutoSnatch.highestKg = data.snatchHighestKgEnabled == true
     if type(data.autoBuyEnabled) == "boolean" then
         autoBuyEnabled = data.autoBuyEnabled
     end
@@ -873,10 +887,13 @@ local function loadConfig()
     end
 
     replaceBooleanMap(selectedStealRarities, data.selectedStealRarities)
+    replaceBooleanMap(AutoSnatch.selected,
+        data.snatchSource == "CustomAnimalList" and data.selectedSnatchAnimals or nil)
     replaceBooleanMap(selectedSellRarities, data.selectedSellRarities)
+    replaceBooleanMap(PetSales.selected, data.selectedSellPets)
 
     -- Highest HP is no longer a separate user setting.
-    -- It is always ON while Auto Steal is ON.
+    -- It is always ON while Auto Break is ON.
     highestHpPriorityEnabled = autoStealEnabled
 
     configLoaded = true
@@ -886,7 +903,7 @@ end
 --// Pet Auto Merge + Auto Hatch + Smart Auto Place Eggs
 -- Auto Place Egg core copied from the supplied working VNDT reference script.
 -- Placement points are randomized across nearly the entire detected PlotSurface.
--- Priority: Auto Hatch > Auto Place Eggs > Auto Steal.
+-- Priority: Auto Hatch > Auto Place Eggs > Auto Break.
 -- Encapsulated in one table to avoid adding many top-level locals to this large script.
 PetEggAutomation = (function()
     local A = {}
@@ -1367,7 +1384,7 @@ PetEggAutomation = (function()
 
     --============================================================
     -- AUTO HATCH
-    -- Highest movement priority: Hatch > Place Eggs > Auto Steal
+    -- Highest movement priority: Hatch > Place Eggs > Auto Break
     --============================================================
 
     local function isHatchPrompt(prompt)
@@ -2233,10 +2250,10 @@ PetEggAutomation = (function()
 
     local function waitForStealToBeIdle()
         -- placementRequested is already TRUE before this runs. The active
-        -- Auto Steal cycle sees that priority flag and aborts immediately.
+        -- Auto Break cycle sees that priority flag and aborts immediately.
         -- We only wait for its movement lock to be released before placing.
         while placementRequested and stealBusyCheck() do
-            report("Auto Place priority • stopping current Auto Steal", "warning")
+            report("Auto Place priority • stopping current Auto Break", "warning")
             task.wait(0.03)
         end
         return placementRequested
@@ -2269,7 +2286,7 @@ PetEggAutomation = (function()
             end
         end
 
-        -- Only integration wrapper: let the current Auto Steal finish its
+        -- Only integration wrapper: let the current Auto Break finish its
         -- already-started cycle, then the reference placer owns movement.
         if not waitForStealToBeIdle() then
             return
@@ -2290,7 +2307,7 @@ PetEggAutomation = (function()
         end
 
         currentlyPlacing = true
-        report("Auto Place Eggs priority over Auto Steal", "working")
+        report("Auto Place Eggs priority over Auto Break", "working")
 
         if #candidates == 0 then
             local found = buildCandidatePositions()
@@ -2356,7 +2373,7 @@ PetEggAutomation = (function()
 
         if remaining <= 0 then
             placementRequested = false
-            report("ALL EGGS PLACED • Auto Steal can resume", "success")
+            report("ALL EGGS PLACED • Auto Break can resume", "success")
         else
             placementRequested = autoPlaceEggsEnabled
             report("Eggs remaining: " .. tostring(remaining), "warning")
@@ -2487,7 +2504,7 @@ PetEggAutomation = (function()
         task.spawn(function()
             -- Cached prompt scan: 0.45s remains responsive but avoids unnecessary
             -- UI/status work every few frames on mobile.
-            while task.wait(IS_TOUCH_DEVICE and 1.00 or 0.70) do
+            while task.wait(autoHatchEnabled and (IS_TOUCH_DEVICE and 1.00 or 0.70) or 2.5) do
                 local hatchCount = publishHatchCount()
                 if autoHatchEnabled and hatchCount > 0 then
                     hatchRequested = true
@@ -2501,7 +2518,7 @@ PetEggAutomation = (function()
         end)
 
         task.spawn(function()
-            while task.wait(IS_TOUCH_DEVICE and 0.90 or 0.65) do
+            while task.wait((autoPlaceEggsEnabled or autoMergeEnabled) and (IS_TOUCH_DEVICE and 0.90 or 0.65) or 2.5) do
                 pcall(publishPetOptions)
                 local eggs = publishEggCount()
                 if autoPlaceEggsEnabled and eggs > 0 then
@@ -2517,7 +2534,7 @@ PetEggAutomation = (function()
         end)
 
         task.spawn(function()
-            while task.wait(IS_TOUCH_DEVICE and 0.60 or 0.40) do
+            while task.wait(autoMergeEnabled and (IS_TOUCH_DEVICE and 0.60 or 0.40) or 2.5) do
                 if autoMergeEnabled and selectedMergePet and not currentlyMerging then
                     pcall(mergeSelectedOnce)
                 end
@@ -2790,13 +2807,13 @@ local function getRootPart(character)
 end
 
 
---// VNDT Auto Steal v5 - live rarity targeting + TreadmillBoard return
+--// VNDT Auto Break - live rarity targeting, hit-only cycles
 local statusSink = nil
 local rarityStatusSink = nil
 local rarityUiRefreshSink = nil
 local autoStealManagerRunning = false
 local autoStealReturning = false
--- Strict movement ownership for Auto Steal. This becomes true BEFORE a new
+-- Strict movement ownership for Auto Break. This becomes true BEFORE a new
 -- steal cycle can teleport/scan/attack, so Auto Place Eggs can never start
 -- in the small window before targetLockActive is enabled.
 local autoStealCycleBusy = false
@@ -2815,8 +2832,8 @@ if PetEggAutomation and PetEggAutomation.SetStealBusyCheck then
     PetEggAutomation.SetStealBusyCheck(function()
         -- Treat the ENTIRE steal cycle as busy, not only the target-lock/return
         -- phases. This prevents Auto Place Eggs from teleporting/equipping an
-        -- egg while Auto Steal is selecting a target or beginning a teleport.
-        return autoStealCycleBusy or targetLockActive or autoStealReturning
+        -- egg while Auto Break is selecting a target or beginning a teleport.
+        return autoStealCycleBusy or targetLockActive or autoStealReturning or AutoSnatch.busy
     end)
 end
 local POST_TELEPORT_SETTLE = 0.03
@@ -2848,7 +2865,7 @@ local lastAutoStealStatusText = nil
 local lastAutoStealStatusKind = nil
 
 local function setStatus(text, kind)
-    local prefix = "Auto Steal: "
+    local prefix = "Auto Break: "
     local full = prefix .. tostring(text or "Idle")
     kind = kind or "idle"
 
@@ -3698,7 +3715,7 @@ local function chooseSelectedRarityEgg()
     return nil, nil, nil, nil, nil, "none"
 end
 
---// Auto Steal character protection
+--// Auto Break character protection
 local STUN_ATTRIBUTE_NAMES = {
     "Stunned",
     "Stun",
@@ -3967,7 +3984,7 @@ local function cleanupCharacterProtection()
 end
 
 local function protectCharacterStep()
-    if not characterProtectionEnabled or not autoStealEnabled then
+    if not characterProtectionEnabled or not (autoStealEnabled or (AutoSnatch.enabled and AutoSnatch.protecting)) then
         -- Cleanup only once when protection transitions from active -> inactive.
         -- The old version rebuilt/cleaned protection state every 0.10s even while idle.
         if protectionWasActive then
@@ -4063,7 +4080,7 @@ local function protectCharacterStep()
     -- Strong anti-push WITHOUT anchoring and WITHOUT continuous tween/CFrame.
     -- This keeps the character movable from the game's point of view so the
     -- pickaxe can continue breaking eggs normally.
-    if targetLockActive and not autoStealReturning then
+    if (targetLockActive and not autoStealReturning) or (AutoSnatch.enabled and AutoSnatch.protecting) then
         local mover = ensureAntiPushMover(root)
 
         if mover then
@@ -4114,7 +4131,7 @@ local function startProtectionWorker()
         protectionAntiPushRoot = nil
         protectionForceField = nil
 
-        if characterProtectionEnabled and autoStealEnabled then
+        if characterProtectionEnabled and (autoStealEnabled or AutoSnatch.protecting) then
             task.defer(captureProtectionBaseline)
         end
     end)
@@ -4389,15 +4406,15 @@ local function findTreadmillBoard()
 end
 
 
---// Strict higher-priority interruption for Auto Steal
--- Auto Hatch > Auto Place Eggs > Auto Steal.
+--// Strict higher-priority interruption for Auto Break
+-- Auto Hatch > Auto Place Eggs > Auto Break.
 -- When either higher-priority task is requested, the current steal cycle yields
--- immediately instead of finishing the egg first. The Auto Steal toggle remains
+-- immediately instead of finishing the egg first. The Auto Break toggle remains
 -- ON, so the manager automatically resumes after the priority task completes.
 local function autoStealPriorityRequested()
-    return PetEggAutomation
+    return AutoSnatch.pending or AutoSnatch.busy or (PetEggAutomation
         and PetEggAutomation.ShouldBlockSteal
-        and PetEggAutomation.ShouldBlockSteal() == true
+        and PetEggAutomation.ShouldBlockSteal() == true)
 end
 
 local function stopCurrentStealForPriority()
@@ -4407,11 +4424,11 @@ local function stopCurrentStealForPriority()
 
     clearTargetLock()
 
-    local reason = PetEggAutomation.GetBlockReason
+    local reason = (AutoSnatch.pending or AutoSnatch.busy) and "Auto Snatch" or PetEggAutomation.GetBlockReason
         and PetEggAutomation.GetBlockReason()
         or "Egg automation"
 
-    setStatus("Stopped current Auto Steal • " .. tostring(reason) .. " has priority", "warning")
+    setStatus("Stopped current Auto Break • " .. tostring(reason) .. " has priority", "warning")
     return true
 end
 
@@ -4729,8 +4746,6 @@ local function runAutoStealCycle()
         return false
     end
 
-    local originalEggPosition = eggCF.Position
-    local prompt = nil
     local lastDetailUpdate = 0
     local lastBreakCheck = 0
     local BREAK_CHECK_INTERVAL = IS_TOUCH_DEVICE and 0.14 or 0.10
@@ -4750,24 +4765,8 @@ local function runAutoStealCycle()
             lastBreakCheck = tick()
         end
 
-        if targetPrompt then
-            prompt = targetPrompt
-            setStatus("Egg broken • pickup ready", "success")
-            break
-        end
-
-        if broken then
-            setStatus("Egg broken • waiting for pickup prompt", "success")
-
-            -- The broken egg may be replaced by a new pickup model/prompt.
-            local promptDeadline = tick() + 1.5
-            while autoStealEnabled and not autoStealPriorityRequested() and tick() < promptDeadline and not prompt do
-                prompt = findPickupPromptNearPosition(originalEggPosition, 20)
-                if not prompt then
-                    task.wait(IS_TOUCH_DEVICE and 0.10 or 0.07)
-                end
-            end
-
+        if broken or targetPrompt then
+            setStatus("Egg broken • finding next selected-rarity egg", "success")
             break
         end
 
@@ -4811,103 +4810,14 @@ local function runAutoStealCycle()
         return false
     end
 
-    -- At this point the selected egg has actually broken/disappeared.
-    -- Wait 5 seconds BEFORE pickup/claim, as requested.
-    if autoStealEnabled then
-        setStatus("Egg broken • waiting 5 seconds before claim", "success")
-
-        local waitUntil = tick() + POST_BREAK_WAIT
-        while autoStealEnabled and not autoStealPriorityRequested() and tick() < waitUntil do
-            RunService.Heartbeat:Wait()
-        end
-    end
-
-    if not autoStealEnabled or stopCurrentStealForPriority() then
-        clearTargetLock()
-        return false
-    end
-
-    -- STRICT PICKUP-PROMPT BARRIER:
-    -- Do not give up and do not find another egg just because the pickup prompt
-    -- has not spawned yet.
-    while autoStealEnabled and not autoStealPriorityRequested() and not prompt do
-        prompt = findPickupPromptNearPosition(originalEggPosition, 20)
-
-        if not prompt then
-            setStatus("Egg broken • waiting for steal prompt…", "working")
-            task.wait(IS_TOUCH_DEVICE and 0.10 or 0.07)
-        end
-    end
-
-    if not autoStealEnabled or stopCurrentStealForPriority() then
-        clearTargetLock()
-        return false
-    end
-
-    setStatus(
-        "Stealing broken " .. tostring(rarity) .. " egg",
-        "success"
-    )
-
-    local claimed = claimEggBeforeReturn(
-        egg,
-        prompt,
-        rarity,
-        originalEggPosition
-    )
-
-    if not autoStealEnabled or stopCurrentStealForPriority() then
-        clearTargetLock()
-        return false
-    end
-
-    -- A failed/unconfirmed steal is not allowed to advance to another egg.
-    while autoStealEnabled and not autoStealPriorityRequested() and not claimed do
-        prompt = findPickupPromptNearPosition(originalEggPosition, 20)
-
-        if prompt then
-            claimed = claimEggBeforeReturn(
-                egg,
-                prompt,
-                rarity,
-                originalEggPosition
-            )
-        else
-            setStatus("Steal not confirmed • waiting for pickup prompt…", "warning")
-            task.wait(IS_TOUCH_DEVICE and 0.10 or 0.07)
-        end
-    end
-
-    if not autoStealEnabled or stopCurrentStealForPriority() then
-        clearTargetLock()
-        return false
-    end
-
-    -- Release egg protection only after steal confirmation.
+    -- Breaking completes the cycle; proceed without pickup or treadmill return.
     clearTargetLock()
 
     if stopCurrentStealForPriority() then
         return false
     end
 
-    -- STRICT RETURN BARRIER:
-    -- This call does not finish until TreadmillBoard arrival is confirmed.
-    local returned = returnFromSteal()
-
-    -- The manager cannot start another cycle until this function returns.
-    while autoStealEnabled and not autoStealPriorityRequested() and not returned do
-        returned = returnFromSteal()
-        if not returned then
-            RunService.Heartbeat:Wait()
-        end
-    end
-
-    if autoStealPriorityRequested() then
-        stopCurrentStealForPriority()
-        return false
-    end
-
-    return returned == true
+    return true
 end
 local function runAutoStealManager()
     if autoStealManagerRunning then
@@ -4915,7 +4825,7 @@ local function runAutoStealManager()
     end
 
     autoStealManagerRunning = true
-    autoStealReturnCFrame = getReturnCFrame()
+    autoStealReturnCFrame = nil
     protectionBaseline = nil
     captureProtectionBaseline()
 
@@ -4931,10 +4841,10 @@ local function runAutoStealManager()
             end
 
             local resumedFromPriorityTask = false
-            if PetEggAutomation and PetEggAutomation.ShouldBlockSteal and PetEggAutomation.ShouldBlockSteal() then
-                local reason = PetEggAutomation.GetBlockReason and PetEggAutomation.GetBlockReason() or "Egg automation"
+            if autoStealPriorityRequested() then
+                local reason = (AutoSnatch.pending or AutoSnatch.busy) and "Auto Snatch" or PetEggAutomation.GetBlockReason and PetEggAutomation.GetBlockReason() or "Egg automation"
                 setStatus("Paused • " .. tostring(reason) .. " has priority", "warning")
-                while autoStealEnabled and PetEggAutomation.ShouldBlockSteal() do
+                while autoStealEnabled and autoStealPriorityRequested() do
                     task.wait(IS_TOUCH_DEVICE and 0.10 or 0.07)
                 end
                 resumedFromPriorityTask = autoStealEnabled
@@ -4949,12 +4859,12 @@ local function runAutoStealManager()
             -- assignment. In Luau's cooperative scheduler, whichever task gets
             -- here first owns movement:
             --   * Auto Place first -> placementRequested blocks this cycle.
-            --   * Auto Steal first -> autoStealCycleBusy makes Auto Place wait.
+            --   * Auto Break first -> autoStealCycleBusy makes Auto Place wait.
             -- This removes the TP/equip conflict between the two automations.
             autoStealCycleBusy = true
 
             if resumedFromPriorityTask then
-                setStatus("Higher-priority egg task finished • resuming Auto Steal", "working")
+                setStatus("Higher-priority egg task finished • resuming Auto Break", "working")
             end
 
             local ok, completedOrError = pcall(runAutoStealCycle)
@@ -4972,10 +4882,8 @@ local function runAutoStealManager()
                     rapidTargetCacheEgg = nil
                     rapidTargetCacheTarget = nil
                     rapidTargetCacheUntil = 0
-                    -- Only wait after a FULL successful:
-                    -- break -> claim -> return.
-                    setStatus("Returned • scanning next selected-rarity egg", "success")
-                    task.wait(NEXT_EGG_DELAY)
+                    setStatus("Egg broken • scanning next selected-rarity egg", "success")
+                    RunService.Heartbeat:Wait()
                 else
                     -- No target: rescan quickly instead of
                     -- sleeping a whole second or behaving like a one-shot.
@@ -4985,15 +4893,736 @@ local function runAutoStealManager()
         end
 
         -- Always release ownership when the manager exits so Auto Place Eggs
-        -- can immediately continue if Auto Steal was toggled off mid-cycle.
+        -- can immediately continue if Auto Break was toggled off mid-cycle.
         autoStealCycleBusy = false
         autoStealManagerRunning = false
         autoStealReturnCFrame = nil
         clearTargetLock()
-        cleanupCharacterProtection()
-        protectionBaseline = nil
+        if not AutoSnatch.protecting then
+            cleanupCharacterProtection()
+            protectionBaseline = nil
+        end
         setStatus("Idle", "idle")
     end)
+end
+
+-- Auto Snatch owns movement above Auto Break, below Hatch and Place.
+do
+    local function key(value)
+        return tostring(value or ""):lower():gsub("[^%w]", "")
+    end
+    local names = [[
+_Secretary_Bird
+Aardvark
+Akita
+Albatross
+Amphiptere
+Anglerfish
+Ankylosaurus
+Anteater
+ARCHAEOPTERYX
+ARGENTAVIS
+AustralianCattleDog
+AZHDARCHID
+Badger
+Barracuda
+Bat
+Bear
+BichonFrise
+Binturong
+Blobfish
+BostonTerrier
+Brachiosaurus
+Bull
+Bunny
+Bunyip
+Butterflyfish
+CALADRIUS
+Capybara
+Caracal
+Cassowary
+Cat
+CavalierKingCharlesSpaniel
+CERBERUS
+Chicken
+CHIMERA
+ChowChow
+Chupacabra
+ClassicDragon
+Cobra
+COCKATRICE
+Cow
+Crab
+Crocodile
+Cuttlefish
+DIMETRODON
+Dingo
+Dog
+DullahanHorse
+DumboOctopus
+Elephant
+Emu
+EnglishBulldog
+FangtoothFish
+Fenrir
+FIREPHOENIX
+Fossa
+Frog
+Gallimimus
+GARGOYLE_BAT
+GARUDA
+GiantIsopod
+Giraffe
+Goat
+GoblinShark
+GoldenRetriver
+Goldfish
+Gorilla
+GreatDane
+Griffin
+GuiennaPig
+Hamster
+HoneyBadger
+Horse
+Hydra
+Hyena
+Jackal
+Jackalope
+Kangaroo
+Kappa
+Kitsune
+Koala
+Kookaburra
+KRAKEN
+LeafySeaDragon
+LEVIATHAN
+Lindworm
+Lion
+Lizard
+Llama
+Maltese
+Mammoth
+Mandarinfish
+Manticore
+MantiShrimp5
+MEGALODON
+MICRORAPTOR
+MINOTAUR
+Moorish
+Mosasaurus
+MOTHMAN
+Muscovy_Duck
+Nautilus
+Ostrich
+Owl
+Papillon
+Parrot
+Pegasus
+Pigeon
+PLESIOSAUR
+PolarBear
+Pony
+PREHISTORIC_DRAGONFLY
+PREHISTORIC_MOTH
+PTERANODON
+PTERODACTYL
+PufferFish
+QILIN
+QUETZALCOATLUS
+Quokka
+Raiju
+Regal
+ROC
+SaborToothTiger
+Seal
+Serval
+Shark
+Shoebill
+SIMURGH
+Snail
+Snake
+SPHINX
+Spinosaurus
+STEGOSAURUS
+Stingray
+STYMPHALIANBIRD
+Surgeonfish
+Swordfish
+Tanuki
+THUNDERBIRD
+Tiger
+TRex
+Triceratops
+TrumpetFish
+Turtle
+Unicorn
+Velicoraptor
+Whale
+WINGED_IMP
+Wolf
+WYVERN
+Yak
+YI_QI
+Zebra
+]]
+    local Animals = {}
+    local allowed = {}
+    for name in names:gmatch("[^\r\n]+") do
+        name = name:match("^%s*(.-)%s*$")
+        if name ~= "" then
+            Animals[name] = true
+            allowed[key(name)] = name
+            table.insert(AutoSnatch.options, name)
+        end
+    end
+    -- Migrate selections from the two spellings in the previous dropdown.
+    if AutoSnatch.selected.GoldenRetriever then AutoSnatch.selected.GoldenRetriver = true end
+    if AutoSnatch.selected.MantisShrimp then AutoSnatch.selected.MantiShrimp5 = true end
+    for name in pairs(AutoSnatch.selected) do
+        if not Animals[name] then AutoSnatch.selected[name] = nil end
+    end
+    local models = setmetatable({}, {__mode = "k"})
+    local scannerStarted = false
+    local carryCache = setmetatable({}, {__mode = "k"})
+    local characters = {}
+    local lastCharacterRefresh = -math.huge
+    local function excluded(model, fresh)
+        if not model or not model.Parent or not model:IsDescendantOf(Workspace) then return true end
+        local now = os.clock()
+        if fresh or now - lastCharacterRefresh > 0.5 then
+            characters = {}
+            for _, player in ipairs(Players:GetPlayers()) do
+                if player.Character then table.insert(characters, player.Character) end
+            end
+            lastCharacterRefresh = now
+        end
+        local function onCharacter(object)
+            if not object then return false end
+            for _, character in ipairs(characters) do
+                if object == character or object:IsDescendantOf(character) then return true end
+            end
+            return false
+        end
+        local function markedHeld(node)
+            for _, field in ipairs({"IsCarried", "Carried", "IsHeld", "Held", "IsHolding", "IsPickedUp"}) do
+                if node:GetAttribute(field) == true then return true end
+            end
+            for _, field in ipairs({"HeldBy", "CarriedBy", "Holder", "Carrier", "HolderUserId", "CarrierUserId", "HoldingPlayer"}) do
+                local value = node:GetAttribute(field)
+                if (type(value) == "number" and value > 0)
+                    or (type(value) == "string" and value ~= "" and value ~= "0" and value:lower() ~= "none")
+                    or value == true then return true end
+            end
+            return false
+        end
+        local node = model
+        while node and node ~= Workspace do
+            local baseNumber = tonumber(node.Name:lower():match("^base_(%d+)$"))
+            if baseNumber and baseNumber >= 1 and baseNumber <= 7 then return true end
+            if node:IsA("Tool") or onCharacter(node) or markedHeld(node) then return true end
+            node = node.Parent
+        end
+        -- Held animals can remain in Workspace while welded to a player's hand.
+        local entry = carryCache[model]
+        if not fresh and entry and entry.parent == model.Parent and now - entry.time < 1.5 then
+            return entry.held
+        end
+        local function finish(held)
+            carryCache[model] = {parent = model.Parent, time = now, held = held}
+            return held
+        end
+        local checkedParts = {}
+        for _, object in ipairs(model:GetDescendants()) do
+            if markedHeld(object) then return finish(true) end
+            if object:IsA("BasePart") and not checkedParts[object] then
+                checkedParts[object] = true
+                local ok, connected = pcall(function() return object:GetConnectedParts(true) end)
+                if ok then
+                    for _, part in ipairs(connected) do
+                        checkedParts[part] = true
+                        if onCharacter(part) then return finish(true) end
+                    end
+                end
+            elseif object:IsA("ObjectValue") then
+                local field = key(object.Name)
+                if field == "heldby" or field == "carriedby" or field == "holder" or field == "carrier" then
+                    if object.Value and (object.Value:IsA("Player") or onCharacter(object.Value)) then return finish(true) end
+                end
+            elseif object:IsA("AlignPosition") or object:IsA("AlignOrientation") then
+                if onCharacter(object.Attachment0) or onCharacter(object.Attachment1) then return finish(true) end
+            end
+        end
+        return finish(false)
+    end
+    local SETTINGS = {BlockedDifficulties = {easy = true, medium = true}}
+local function textHasBlockedDifficulty(text)
+	if typeof(text) ~= "string" then
+		return false
+	end
+
+	text = string.lower(text)
+
+	for difficulty in pairs(SETTINGS.BlockedDifficulties) do
+		if string.find(text, difficulty, 1, true) then
+			return true
+		end
+	end
+
+	return false
+end
+
+--------------------------------------------------
+-- ATTRIBUTE CHECK
+--------------------------------------------------
+
+local function checkAttributes(object)
+	local possibleAttributes = {
+		"Difficulty",
+		"difficulty",
+		"DifficultyName",
+		"DifficultyType",
+		"Tier",
+		"Level"
+	}
+
+	for _, attributeName in ipairs(possibleAttributes) do
+		local value = object:GetAttribute(attributeName)
+
+		if value ~= nil and textHasBlockedDifficulty(tostring(value)) then
+			return true
+		end
+	end
+
+	return false
+end
+
+--------------------------------------------------
+-- CHECK EASY / MEDIUM
+--------------------------------------------------
+
+local function hasBlockedDifficulty(model)
+	if not model or not model.Parent then
+		return false
+	end
+
+	if checkAttributes(model) then
+		return true
+	end
+
+	if textHasBlockedDifficulty(model.Name) then
+		return true
+	end
+
+	for _, object in ipairs(model:GetDescendants()) do
+
+		if checkAttributes(object) then
+			return true
+		end
+
+		if object:IsA("TextLabel")
+			or object:IsA("TextButton")
+			or object:IsA("TextBox") then
+
+			if textHasBlockedDifficulty(object.Text) then
+				return true
+			end
+		end
+
+		if object:IsA("StringValue") then
+			if textHasBlockedDifficulty(object.Value) then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
+--------------------------------------------------
+-- FIND DISPLAY PART
+--------------------------------------------------
+
+local function getPart(model)
+	if model.PrimaryPart
+		and model.PrimaryPart:IsA("BasePart") then
+
+		return model.PrimaryPart
+	end
+
+	local part =
+		model:FindFirstChild("HumanoidRootPart")
+		or model:FindFirstChild("Head")
+		or model:FindFirstChild("RootPart")
+
+	if part and part:IsA("BasePart") then
+		return part
+	end
+
+	return model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+--------------------------------------------------
+-- REMOVE ESP
+--------------------------------------------------
+
+
+    -- Original scanner eligibility checks; its ESP output stays hidden.
+    local function removeESP(model) models[model] = nil end
+    local function addESP(model)
+        if not model or not model.Parent or not model:IsA("Model") then return end
+        if not Animals[model.Name] or models[model] then return end
+        if hasBlockedDifficulty(model) or not getPart(model) then return end
+        models[model] = true
+    end
+local function scanModel(model)
+	if not model:IsA("Model") then
+		return
+	end
+
+	if not Animals[model.Name] then
+		return
+	end
+
+	--------------------------------------------------
+	-- WAIT FOR DIFFICULTY GUI / VALUES TO LOAD
+	--------------------------------------------------
+
+	task.spawn(function()
+
+		for _ = 1, 10 do
+
+			if not model.Parent then
+				return
+			end
+
+			if hasBlockedDifficulty(model) then
+				removeESP(model)
+				return
+			end
+
+			task.wait(0.1)
+		end
+
+		addESP(model)
+	end)
+end
+
+--------------------------------------------------
+
+    local function hideOverlay(object)
+        if (object.Name == "VNDT_AnimalESP" and object:IsA("Highlight"))
+            or (object.Name == "VNDT_AnimalName" and object:IsA("BillboardGui")) then
+            object.Enabled = false
+        end
+    end
+    function AutoSnatch.StartScanner()
+        if scannerStarted then return end
+        scannerStarted = true
+        Workspace.DescendantAdded:Connect(function(object)
+            hideOverlay(object)
+            if object:IsA("Model") and Animals[object.Name] then
+                scanModel(object)
+                return
+            end
+            if object:IsA("TextLabel") or object:IsA("TextButton")
+                or object:IsA("TextBox") or object:IsA("StringValue") then
+                local parent = object.Parent
+                while parent and parent ~= Workspace do
+                    if parent:IsA("Model") and Animals[parent.Name] then
+                        if hasBlockedDifficulty(parent) then removeESP(parent) end
+                        break
+                    end
+                    parent = parent.Parent
+                end
+            end
+        end)
+        Workspace.DescendantRemoving:Connect(function(object)
+            if models[object] then removeESP(object) end
+        end)
+        task.spawn(function()
+            walkBatched(Workspace, function(object)
+                hideOverlay(object)
+                if object:IsA("Model") and Animals[object.Name] then scanModel(object) end
+            end)
+            while task.wait(0.75) do
+                for model in pairs(models) do
+                    if not model.Parent then models[model] = nil
+                    elseif hasBlockedDifficulty(model) then removeESP(model) end
+                end
+            end
+        end)
+    end
+    local function modelPosition(model)
+        local part = getPart(model)
+        if part then return part.Position end
+    end
+    local cooldown = setmetatable({}, {__mode = "k"})
+    local function higherPriority()
+        return PetEggAutomation and PetEggAutomation.ShouldBlockSteal()
+    end
+    local lastStatusMessage, lastStatusKind
+    local function status(message, kind)
+        if message == lastStatusMessage and kind == lastStatusKind then return end
+        lastStatusMessage, lastStatusKind = message, kind
+        if statusSink then statusSink("Auto Snatch: " .. message, kind or "working") end
+    end
+    local preparedPrompts = setmetatable({}, {__mode = "k"})
+    local function fireSnatchPromptRapid(prompt)
+        if not prompt or not prompt.Parent or not prompt.Enabled then return false end
+        if not preparedPrompts[prompt] then
+            local ok = pcall(function()
+                prompt.HoldDuration = 0
+                prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, 50)
+                prompt.RequiresLineOfSight = false
+            end)
+            preparedPrompts[prompt] = ok
+        end
+        if type(fireproximityprompt) == "function" then
+            local ok = pcall(fireproximityprompt, prompt, 0, true)
+            if ok then return true end
+        end
+        return pcall(function()
+            prompt:InputHoldBegin()
+            prompt:InputHoldEnd()
+        end)
+    end
+    local function animalName(prompt)
+        local text = tostring(prompt.ObjectText or ""):gsub("<[^>]*>", ""):gsub("%b[]", "")
+        local name = allowed[key(text)]
+        if name then return name end
+        name = allowed[key(prompt.Name)]
+        if name then return name end
+        local node = prompt.Parent
+        while node and node ~= Workspace do
+            name = allowed[key(node.Name)]
+            if name then return name end
+            for _, attribute in ipairs({"PetName", "AnimalName", "Species", "PetType", "DisplayName"}) do
+                name = allowed[key(node:GetAttribute(attribute))]
+                if name then return name end
+            end
+            node = node.Parent
+        end
+    end
+    local readWeight
+    local weightCache = setmetatable({}, {__mode = "k"})
+    local function parseWeight(value, requireUnit)
+        if type(value) == "number" then
+            if not requireUnit and value >= 0 and value < math.huge then return value end
+            return nil
+        end
+        if type(value) ~= "string" then return nil end
+        local text = value:lower():gsub("<[^>]*>", ""):gsub(",", "")
+        local number = text:match("([%+%-]?%d*%.?%d+)%s*kg")
+            or text:match("([%+%-]?%d*%.?%d+)%s*kilograms?")
+        if not number and not requireUnit then number = text:match("^%s*(%d*%.?%d+)%s*$") end
+        local kg = tonumber(number)
+        if kg and kg >= 0 and kg < math.huge then return kg end
+    end
+    local function choose()
+        local character = LocalPlayer.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        if not root then return nil end
+        local best, bestName, distance = nil, nil, math.huge
+        local bestWeight = nil
+        for model in pairs(models) do
+            local name = allowed[key(model.Name)]
+            if name and AutoSnatch.selected[name] == true and (cooldown[model] or 0) <= os.clock() and not excluded(model) then
+                local position = modelPosition(model)
+                if position then
+                    local d = (root.Position - position).Magnitude
+                    local kg = AutoSnatch.highestKg and readWeight(model, name) or nil
+                    local score, bestScore = kg or -math.huge, bestWeight or -math.huge
+                    local better = not best or (AutoSnatch.highestKg and score > bestScore)
+                        or ((not AutoSnatch.highestKg or score == bestScore) and d < distance)
+                    if better then best, bestName, distance, bestWeight = model, name, d, kg end
+                end
+            end
+        end
+        return best, bestName, bestWeight
+    end
+    local function findStealPrompt(model, name)
+        if excluded(model) then return nil end
+        local position = model.Parent and modelPosition(model)
+        if not position then return nil end
+        local best, bestDistance = nil, math.huge
+        for prompt in pairs(ensureProximityPromptCache()) do
+            if prompt.Parent and prompt.Enabled then
+                local action = key(prompt.ActionText)
+                if action:find("steal", 1, true) or action:find("snatch", 1, true) then
+                    local promptPosition = getPromptWorldPosition(prompt)
+                    if promptPosition then
+                        local d = (position - promptPosition).Magnitude
+                        -- Some games place the prompt beside the displayed animal model.
+                        if prompt:IsDescendantOf(model) and not excluded(prompt) then return prompt end
+                        if d <= 24 and animalName(prompt) == name and d < bestDistance and not excluded(prompt) then
+                            best, bestDistance = prompt, d
+                        end
+                    end
+                end
+            end
+        end
+        return best
+    end
+    readWeight = function(model, name)
+        local now = os.clock()
+        local cached = weightCache[model]
+        if cached and now - cached.time < 1 then return cached.kg end
+        local fields = {kg = true, weight = true, weightkg = true, animalweight = true,
+            petweight = true, kilograms = true}
+        local function inspect(object)
+            for field, value in pairs(object:GetAttributes()) do
+                if fields[key(field)] then
+                    local kg = parseWeight(value, false)
+                    if kg ~= nil then return kg end
+                end
+            end
+            if (object:IsA("NumberValue") or object:IsA("IntValue") or object:IsA("StringValue"))
+                and fields[key(object.Name)] then return parseWeight(object.Value, false) end
+        end
+        local kg = inspect(model)
+        if kg == nil then
+            local descendants = model:GetDescendants()
+            for _, object in ipairs(descendants) do
+                kg = inspect(object)
+                if kg ~= nil then break end
+            end
+            if kg == nil then
+                for _, object in ipairs(descendants) do
+                    if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
+                        kg = parseWeight(object.Text, true)
+                    elseif object:IsA("ProximityPrompt") then
+                        kg = parseWeight(object.ObjectText, true)
+                    end
+                    if kg ~= nil then break end
+                end
+            end
+        end
+        if kg == nil then
+            local prompt = findStealPrompt(model, name)
+            if prompt then kg = parseWeight(prompt.ObjectText, true) end
+        end
+        weightCache[model] = {time = now, kg = kg}
+        return kg
+    end
+    local function returnToBoard()
+        AutoSnatch.protecting = false
+        protectCharacterStep()
+        clearTargetLock()
+        local _, destination = findTreadmillBoard()
+        destination = destination or RETURN_CFRAME
+        local lastTeleport = -math.huge
+        while AutoSnatch.enabled and not higherPriority() do
+            local character = LocalPlayer.Character
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            if root then
+                if (root.Position - destination.Position).Magnitude <= 8 then
+                    status("Returned to treadmill", "success")
+                    return true
+                end
+                if os.clock() - lastTeleport >= 0.15 then
+                    teleportCharacter(destination)
+                    lastTeleport = os.clock()
+                end
+            end
+            RunService.Heartbeat:Wait()
+        end
+        return false
+    end
+    function AutoSnatch.Start()
+        if AutoSnatch.running then return end
+        AutoSnatch.StartScanner()
+        AutoSnatch.running = true
+        task.spawn(function()
+            local needsReturn = false
+            while AutoSnatch.enabled do
+                local ok, err = pcall(function()
+                    if higherPriority() then return end
+                    local model, name, kg
+                    if not needsReturn then
+                        model, name, kg = choose()
+                        if not model then
+                            status(getSelectedCount(AutoSnatch.selected) == 0
+                                and "Select animals in Snatch Animals" or "Scanning selected animal models…")
+                            return
+                        end
+                    end
+                    AutoSnatch.pending = true
+                    while AutoSnatch.enabled and not higherPriority() and autoStealCycleBusy do
+                        RunService.Heartbeat:Wait()
+                    end
+                    if not AutoSnatch.enabled or higherPriority() then return end
+                    AutoSnatch.busy = true
+                    AutoSnatch.pending = false
+                    if not needsReturn then
+                        if excluded(model, true) or AutoSnatch.selected[name] ~= true then return end
+                        local position = modelPosition(model)
+                        if not position then return end
+                        status("Teleporting to " .. name .. (AutoSnatch.highestKg
+                            and (kg ~= nil and string.format(" • %.2f kg", kg) or " • KG unknown") or ""))
+                        AutoSnatch.protecting = true
+                        protectCharacterStep()
+                        if not teleportCharacter(CFrame.new(position + Vector3.new(0, 2, 2))) then return end
+                        needsReturn = true
+                        RunService.Heartbeat:Wait()
+                        local prompt = nil
+                        local attempted = false
+                        local completed = false
+                        local lastTeleport = -math.huge
+                        local deadline = os.clock() + 10
+                        while AutoSnatch.enabled and not higherPriority() and AutoSnatch.selected[name] == true and (attempted or os.clock() < deadline) do
+                            if attempted and prompt and (not prompt.Parent or not prompt.Enabled) then
+                                completed = true
+                                status("Steal prompt completed • returning", "success")
+                                break
+                            end
+                            if excluded(model) then
+                                status("Target entered a base or is being carried • returning", "warning")
+                                break
+                            end
+                            prompt = prompt or findStealPrompt(model, name)
+                            if prompt and prompt.Parent and prompt.Enabled then
+                                local livePosition = getPromptWorldPosition(prompt)
+                                local character = LocalPlayer.Character
+                                local root = character and character:FindFirstChild("HumanoidRootPart")
+                                if livePosition and root and (root.Position - (livePosition + Vector3.new(0, 6, 2))).Magnitude > 3
+                                    and os.clock() - lastTeleport >= 0.12 then
+                                    teleportCharacter(CFrame.new(livePosition + Vector3.new(0, 2, 2)))
+                                    lastTeleport = os.clock()
+                                    RunService.Heartbeat:Wait()
+                                end
+                                if not AutoSnatch.enabled or higherPriority() or excluded(model, true) or excluded(prompt, true) then break end
+                                status("Stealing " .. name)
+                                attempted = fireSnatchPromptRapid(prompt) or attempted
+                            else
+                                prompt = nil
+                                status("At " .. name .. " • waiting for steal prompt")
+                            end
+                            if prompt then RunService.Heartbeat:Wait() else task.wait(0.1) end
+                        end
+                        cooldown[model] = os.clock() + 10
+                        if AutoSnatch.enabled and not higherPriority() and not completed then
+                            status("Steal unconfirmed • returning before retry", "warning")
+                        end
+                    end
+                    if AutoSnatch.enabled and not higherPriority() then
+                        needsReturn = not returnToBoard()
+                    end
+                end)
+                if AutoSnatch.protecting then
+                    AutoSnatch.protecting = false
+                    pcall(protectCharacterStep)
+                end
+                AutoSnatch.pending = false
+                AutoSnatch.busy = false
+                if not ok then status("Error: " .. tostring(err), "error") end
+                task.wait(0.3)
+            end
+            AutoSnatch.pending = false
+            AutoSnatch.busy = false
+            AutoSnatch.running = false
+            AutoSnatch.protecting = false
+        end)
+    end
 end
 
 local function runAutoSteal()
@@ -5087,9 +5716,52 @@ local function runUpgradePlot()
     end
 end
 
---// Auto Sell - selected rarities only
+--// Auto Sell - selected pet names, with an optional selected-rarity filter.
+do
+    local function nameKey(value)
+        local text = tostring(value or ""):gsub("<[^>]*>", ""):gsub("%b[]", "")
+        return text:lower():gsub("[^%w]", "")
+    end
+    local allowedNames = {}
+    for _, name in ipairs(AutoSnatch.options) do
+        if name == "_Secretary_Bird" then name = "SecretaryBird"
+        elseif name == "WINGED_IMP" then name = "WINGEDIMP"
+        elseif name == "YI_QI" then name = "YIQI" end
+        table.insert(PetSales.options, name)
+        allowedNames[nameKey(name)] = name
+    end
+    allowedNames[nameKey("GoldenRetriever")] = "GoldenRetriver"
+    allowedNames[nameKey("MantisShrimp")] = "MantiShrimp5"
+    function PetSales.Matches(tool)
+        local function inspect(object)
+            for _, field in ipairs({"PetName", "AnimalName", "Species", "PetType", "DisplayName"}) do
+                local name = allowedNames[nameKey(object:GetAttribute(field))]
+                if name then return PetSales.selected[name] == true end
+            end
+            local name = allowedNames[nameKey(object.Name)]
+            if name then return PetSales.selected[name] == true end
+            return nil
+        end
+        local result = inspect(tool)
+        if result ~= nil then return result end
+        for _, object in ipairs(tool:GetDescendants()) do
+            if object:IsA("Model") or object:IsA("StringValue") then
+                result = inspect(object)
+                if result ~= nil then return result end
+                if object:IsA("StringValue") then
+                    local name = allowedNames[nameKey(object.Value)]
+                    if name then return PetSales.selected[name] == true end
+                end
+            end
+        end
+        return false
+    end
+end
+
 local function sellSelectedRarityTools()
-    if getSelectedCount(selectedSellRarities) == 0 then
+    local byName = getSelectedCount(PetSales.selected) > 0
+    local byRarity = getSelectedCount(selectedSellRarities) > 0
+    if not byName then
         return 0
     end
 
@@ -5134,8 +5806,9 @@ local function sellSelectedRarityTools()
                 end
 
                 if sellable then
-                    local rarity = detectObjectRarity(object)
-                    if rarity and selectedSellRarities[rarity] then
+                    local nameMatches = PetSales.Matches(object)
+                    local rarity = nameMatches and byRarity and detectObjectRarity(object) or nil
+                    if nameMatches and (not byRarity or (rarity and selectedSellRarities[rarity])) then
                         seen[object] = true
                         table.insert(tools, object)
                     end
@@ -5165,10 +5838,13 @@ local function sellSelectedRarityTools()
 end
 
 local function runSellAll()
+    if PetSales.running then return end
+    PetSales.running = true
     while sellAllEnabled do
         pcall(sellSelectedRarityTools)
         task.wait(IS_TOUCH_DEVICE and 0.8 or 0.6)
     end
+    PetSales.running = false
 end
 
 --// VNDT premium UI
@@ -6571,7 +7247,7 @@ function UI.createSingleSelectDropdown(parent, labelText, description, order, in
     }
 end
 
-function UI.createMultiSelectDropdown(parent, labelText, description, order, selectionTable, onChanged)
+function UI.createMultiSelectDropdown(parent, labelText, description, order, selectionTable, onChanged, settings)
     local wrapper = Instance.new("Frame")
     wrapper.Name = labelText:gsub("%W+", "") .. "Dropdown"
     wrapper.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 34 or 54)
@@ -6630,9 +7306,60 @@ function UI.createMultiSelectDropdown(parent, labelText, description, order, sel
 
     local currentOptions = {}
     local opened = false
+    local optionRows = {}
+    local searchBox, emptyLabel
+    if settings and settings.searchable then
+        searchBox = Instance.new("TextBox")
+        searchBox.Name = "Search"
+        searchBox.Size = UDim2.new(1, 0, 0, IS_TOUCH_DEVICE and 30 or 34)
+        searchBox.BackgroundColor3 = THEME.card
+        searchBox.BorderSizePixel = 0
+        searchBox.Text = ""
+        searchBox.PlaceholderText = "Search animals..."
+        searchBox.TextColor3 = THEME.text
+        searchBox.PlaceholderColor3 = THEME.muted
+        searchBox.Font = Enum.Font.Gotham
+        searchBox.TextSize = IS_TOUCH_DEVICE and 12 or 13
+        searchBox.ClearTextOnFocus = false
+        searchBox.LayoutOrder = 2
+        searchBox.Visible = false
+        searchBox.Parent = wrapper
+        UI.addCorner(searchBox, 8)
+        options.LayoutOrder = 3
+        emptyLabel = UI.makeText(wrapper, "No animals detected", IS_TOUCH_DEVICE and 10 or 12, THEME.muted, Enum.Font.Gotham)
+        emptyLabel.Name = "EmptyResults"
+        emptyLabel.Size = UDim2.new(1, 0, 0, 28)
+        emptyLabel.LayoutOrder = 4
+        emptyLabel.Visible = false
+    end
+    local function searchKey(text)
+        return tostring(text or ""):lower():gsub("[^%w]", "")
+    end
+    local function applySearch()
+        local query = searchKey(searchBox and searchBox.Text or "")
+        local visibleCount = 0
+        for _, row in ipairs(optionRows) do
+            local matches = query == "" or searchKey(row.name):find(query, 1, true) ~= nil
+            row.button.Visible = matches
+            if matches then visibleCount += 1 end
+        end
+        if emptyLabel then
+            emptyLabel.Text = #currentOptions == 0 and "No animals detected yet" or "No animals match your search"
+            emptyLabel.Visible = opened and visibleCount == 0
+        end
+    end
+    if searchBox then searchBox:GetPropertyChangedSignal("Text"):Connect(applySearch) end
 
     local function selectedNames()
         local names = {}
+        if settings and settings.searchable then
+            -- Keep saved selections when animals temporarily despawn.
+            for name, selected in pairs(selectionTable) do
+                if selected then table.insert(names, name) end
+            end
+            table.sort(names)
+            return names
+        end
         for _, rarityName in ipairs(currentOptions) do
             if selectionTable[rarityName] then
                 table.insert(names, rarityName)
@@ -6648,7 +7375,7 @@ function UI.createMultiSelectDropdown(parent, labelText, description, order, sel
         elseif #names <= 2 then
             summary.Text = table.concat(names, ", ")
         else
-            summary.Text = tostring(#names) .. " rarities selected"
+            summary.Text = tostring(#names) .. " " .. (settings and settings.itemLabel or "rarities") .. " selected"
         end
     end
 
@@ -6660,6 +7387,7 @@ function UI.createMultiSelectDropdown(parent, labelText, description, order, sel
     end
 
     local function refresh(list)
+        optionRows = {}
         currentOptions = {}
         for _, rarityName in ipairs(list or {}) do
             table.insert(currentOptions, rarityName)
@@ -6700,6 +7428,7 @@ function UI.createMultiSelectDropdown(parent, labelText, description, order, sel
             label.Size = UDim2.new(1, IS_TOUCH_DEVICE and -22 or -42, 1, 0)
 
             renderOption(option, check, rarityName)
+            table.insert(optionRows, {button = option, name = rarityName})
 
             option.Activated:Connect(function()
                 selectionTable[rarityName] = not selectionTable[rarityName]
@@ -6714,15 +7443,18 @@ function UI.createMultiSelectDropdown(parent, labelText, description, order, sel
         end
 
         updateSummary()
+        applySearch()
     end
 
     header.Activated:Connect(function()
         opened = not opened
         options.Visible = opened
+        if searchBox then searchBox.Visible = opened end
+        applySearch()
         arrow.Text = opened and "⌃" or "⌄"
     end)
 
-    refresh(knownRarities)
+    refresh(settings and settings.options or knownRarities)
 
     return {
         Frame = wrapper,
@@ -6733,6 +7465,8 @@ function UI.createMultiSelectDropdown(parent, labelText, description, order, sel
         Close = function()
             opened = false
             options.Visible = false
+            if searchBox then searchBox.Visible = false; searchBox:ReleaseFocus() end
+            if emptyLabel then emptyLabel.Visible = false end
             arrow.Text = "⌄"
         end,
     }
@@ -6926,7 +7660,7 @@ function UI.launchMainGui()
     statusTitle.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(6, 3) or UDim2.fromOffset(10, 8)
     statusTitle.Size = UDim2.new(1, IS_TOUCH_DEVICE and -59 or -92, 0, IS_TOUCH_DEVICE and 12 or 19)
 
-    local statusSub = UI.makeText(hero, "Auto Steal: Idle", IS_TOUCH_DEVICE and 6 or 10, THEME.muted, Enum.Font.GothamBold)
+    local statusSub = UI.makeText(hero, "Auto Break: Idle", IS_TOUCH_DEVICE and 6 or 10, THEME.muted, Enum.Font.GothamBold)
     statusSub.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(6, 15) or UDim2.fromOffset(10, 29)
     statusSub.Size = UDim2.new(1, -12, 0, IS_TOUCH_DEVICE and 10 or 17)
     statusSub.TextTruncate = Enum.TextTruncate.AtEnd
@@ -6984,12 +7718,12 @@ function UI.launchMainGui()
     UI.addCorner(badge, 7)
     UI.addStroke(badge, THEME.success, 1, 0.62)
 
-    UI.createSectionLabel(content, "Auto Steal", 2)
+    UI.createSectionLabel(content, "Auto Break", 2)
 
     UI.createToggleRow(
         content,
-        "Auto Steal",
-        "Targets selected rarities • instant next-target scan",
+        "Auto Break",
+        "Hits selected-rarity eggs • next target after break",
         3,
         autoStealEnabled,
         function(enabled)
@@ -7009,9 +7743,50 @@ function UI.launchMainGui()
         end
     )
 
+    UI.createToggleRow(
+        content,
+        "Auto Snatch",
+        "Steals selected animals • returns to treadmill",
+        4,
+        AutoSnatch.enabled,
+        function(enabled)
+            AutoSnatch.enabled = enabled
+            queueSaveConfig()
+            if enabled then AutoSnatch.Start() end
+        end
+    )
+
+    UI.createToggleRow(
+        content,
+        "Snatch Highest KG Priority",
+        "ON: heaviest selected animal • OFF: nearest",
+        4,
+        AutoSnatch.highestKg,
+        function(enabled)
+            AutoSnatch.highestKg = enabled
+            queueSaveConfig()
+        end
+    )
+
+    do
+        UI.createMultiSelectDropdown(
+            content,
+            "Snatch Animals",
+            "Full animal list • search and select multiple",
+            4,
+            AutoSnatch.selected,
+            function()
+                queueSaveConfig()
+                if AutoSnatch.enabled then AutoSnatch.Start() end
+            end,
+            {options = AutoSnatch.options, itemLabel = "animals", searchable = true}
+        )
+        AutoSnatch.StartScanner()
+    end
+
     local stealRarityDropdown = UI.createMultiSelectDropdown(
         content,
-        "Steal Rarities",
+        "Break Rarities",
         "Select one or more egg rarities",
         4,
         selectedStealRarities,
@@ -7026,7 +7801,7 @@ function UI.launchMainGui()
     UI.createToggleRow(
         content,
         "Character Protection",
-        "Anti-push + anti-ragdoll + anti-stun + godmode • break-safe",
+        "Anti-push / ragdoll / stun • Auto Break + Snatch TP/steal",
         5,
         characterProtectionEnabled,
         function(enabled)
@@ -7173,7 +7948,7 @@ function UI.launchMainGui()
     UI.createToggleRow(
         content,
         "FPS Booster",
-        "Low graphics • removes effects/textures • FPS counter",
+        "Low graphics • reduces effects/textures • FPS counter",
         15,
         fpsBoosterEnabled,
         function(enabled)
@@ -7238,7 +8013,7 @@ function UI.launchMainGui()
     UI.createToggleRow(
         content,
         "Auto Sell",
-        "Sells only the rarities selected below",
+        "Select pet names • selected rarities further filter sales",
         20,
         sellAllEnabled,
         function(enabled)
@@ -7249,6 +8024,18 @@ function UI.launchMainGui()
             end
         end
     )
+
+    do
+        UI.createMultiSelectDropdown(
+            content,
+            "Sell Pets",
+            "Search and select pet names • ignores case/spaces/underscores",
+            21,
+            PetSales.selected,
+            function() queueSaveConfig() end,
+            {options = PetSales.options, itemLabel = "pets", searchable = true}
+        )
+    end
 
     local sellRarityDropdown = UI.createMultiSelectDropdown(
         content,
@@ -7291,6 +8078,17 @@ function UI.launchMainGui()
         Enum.TextXAlignment.Center
     )
     footerText.Size = UDim2.fromScale(1, 1)
+
+    -- Keep the animal picker directly below Auto Snatch, with unique row orders.
+    for _, row in ipairs(content:GetChildren()) do
+        if row:IsA("GuiObject") then
+            row.LayoutOrder = row.LayoutOrder * 10
+            if row.Name == "AutoSnatchToggle" then row.LayoutOrder = 45 end
+            if row.Name == "SnatchHighestKGPriorityToggle" then row.LayoutOrder = 46 end
+            if row.Name == "SnatchAnimalsDropdown" then row.LayoutOrder = 47 end
+            if row.Name == "SellPetsDropdown" then row.LayoutOrder = 209 end
+        end
+    end
 
     UI.makeTouchDraggable(header, mainFrame, true)
     UI.addAllEdgeDragHandles(mainFrame)
@@ -7405,6 +8203,9 @@ function UI.launchMainGui()
     end
 
     -- Auto-resume saved ON states after the UI has loaded.
+    if AutoSnatch.enabled then
+        AutoSnatch.Start()
+    end
     if configLoaded then
         highestHpPriorityEnabled = autoStealEnabled
 
