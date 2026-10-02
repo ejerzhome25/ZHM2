@@ -144,6 +144,7 @@ local GUI_TITLE = "VNDT"
 local RETURN_CFRAME = CFrame.new(-62, 4, 4)
 local RETURN_TARGET_NAME = "TreadmillBoard"
 local RETURN_HEIGHT = 3
+local RETURN_BOARD_HOLD = 0.3
 local EGG_PICK_RANGE = 999
 local PROMPT_RANGE = 28
 local PROMPT_FIRE_TIME = 0.35
@@ -4597,7 +4598,16 @@ local function returnFromSteal()
                     root.AssemblyAngularVelocity = Vector3.zero
                 end)
 
-                setStatus("Return confirmed • finding next egg", "success")
+                setStatus("Return confirmed • holding 0.3s before next teleport", "success")
+                local holdUntil = os.clock() + RETURN_BOARD_HOLD
+                while os.clock() < holdUntil do
+                    -- Auto Hatch / Auto Place Eggs / Auto Snatch must be able to
+                    -- take movement immediately instead of being blocked by this hold.
+                    if not autoStealEnabled or autoStealPriorityRequested() then
+                        return finish(false)
+                    end
+                    RunService.Heartbeat:Wait()
+                end
                 return finish(true)
             end
 
@@ -5687,7 +5697,17 @@ end
             local root = character and character:FindFirstChild("HumanoidRootPart")
             if root then
                 if (root.Position - destination.Position).Magnitude <= 8 then
-                    status("Returned to treadmill", "success")
+                    status("Returned to treadmill • holding 0.3s", "success")
+                    local holdUntil = os.clock() + RETURN_BOARD_HOLD
+                    while os.clock() < holdUntil do
+                        -- Egg automation has higher movement priority. If Auto
+                        -- Place Eggs requests movement during this hold, release
+                        -- Auto Snatch immediately instead of blocking placement.
+                        if not AutoSnatch.enabled or higherPriority() then
+                            return false
+                        end
+                        RunService.Heartbeat:Wait()
+                    end
                     return true
                 end
                 if os.clock() - lastTeleport >= 0.15 then
@@ -7333,7 +7353,10 @@ function UI.createActionRow(parent, labelText, description, buttonText, order, o
     label.Position = IS_TOUCH_DEVICE and UDim2.new(0, 6, 0, 2) or UDim2.new(0, 11, 0, 6)
     label.Size = UDim2.new(1, IS_TOUCH_DEVICE and -61 or -92, 0, IS_TOUCH_DEVICE and 13 or 20)
 
-    local sub = UI.makeText(row, description or "", IS_TOUCH_DEVICE and 5 or 9, THEME.muted, Enum.Font.GothamBold)
+    local sub = UI.makeText(row, "", IS_TOUCH_DEVICE and 5 or 9, THEME.muted, Enum.Font.GothamBold)
+    sub.Visible = false
+    label.AnchorPoint = Vector2.new(0, 0.5)
+    label.Position = UDim2.fromOffset(IS_TOUCH_DEVICE and 6 or 11, (IS_TOUCH_DEVICE and 33 or 54) / 2)
     sub.Position = IS_TOUCH_DEVICE and UDim2.new(0, 6, 0, 16) or UDim2.new(0, 11, 0, 27)
     sub.Size = UDim2.new(1, IS_TOUCH_DEVICE and -61 or -92, 0, IS_TOUCH_DEVICE and 10 or 17)
     sub.TextTruncate = Enum.TextTruncate.AtEnd
@@ -7384,7 +7407,10 @@ function UI.createToggleRow(parent, labelText, description, order, initialValue,
     label.Position = IS_TOUCH_DEVICE and UDim2.new(0, 6, 0, 2) or UDim2.new(0, 11, 0, 6)
     label.Size = UDim2.new(1, IS_TOUCH_DEVICE and -51 or -76, 0, IS_TOUCH_DEVICE and 13 or 20)
 
-    local sub = UI.makeText(row, description or "", IS_TOUCH_DEVICE and 5 or 10, THEME.muted, Enum.Font.GothamBold)
+    local sub = UI.makeText(row, "", IS_TOUCH_DEVICE and 5 or 10, THEME.muted, Enum.Font.GothamBold)
+    sub.Visible = false
+    label.AnchorPoint = Vector2.new(0, 0.5)
+    label.Position = UDim2.fromOffset(IS_TOUCH_DEVICE and 6 or 11, (IS_TOUCH_DEVICE and 33 or 54) / 2)
     sub.Position = IS_TOUCH_DEVICE and UDim2.new(0, 6, 0, 16) or UDim2.new(0, 11, 0, 27)
     sub.Size = UDim2.new(1, IS_TOUCH_DEVICE and -51 or -76, 0, IS_TOUCH_DEVICE and 10 or 17)
     sub.TextTruncate = Enum.TextTruncate.AtEnd
@@ -7454,7 +7480,8 @@ function UI.createToggleRow(parent, labelText, description, order, initialValue,
             end
         end,
         SetDescription = function(value)
-            sub.Text = tostring(value or "")
+            sub.Text = ""
+            sub.Visible = false
         end,
     }
 end
@@ -7492,7 +7519,7 @@ function UI.createSingleSelectDropdown(parent, labelText, description, order, in
     title.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(6, 0) or UDim2.fromOffset(10, 3)
     title.Size = UDim2.new(1, -35, 0, IS_TOUCH_DEVICE and 12 or 19)
 
-    local summary = UI.makeText(header, initialValue or description or "None selected", IS_TOUCH_DEVICE and 5 or 9, THEME.muted, Enum.Font.GothamBold)
+    local summary = UI.makeText(header, initialValue or "None selected", IS_TOUCH_DEVICE and 5 or 9, THEME.muted, Enum.Font.GothamBold)
     summary.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(6, 12) or UDim2.fromOffset(10, 22)
     summary.Size = UDim2.new(1, -35, 0, IS_TOUCH_DEVICE and 11 or 16)
     summary.TextTruncate = Enum.TextTruncate.AtEnd
@@ -7535,7 +7562,7 @@ function UI.createSingleSelectDropdown(parent, labelText, description, order, in
         if #currentOptions == 0 then
             summary.Text = currentValue or "No eligible pets"
         else
-            summary.Text = currentValue or description or "Select a pet"
+            summary.Text = currentValue or "Select a pet"
         end
 
         for index, value in ipairs(currentOptions) do
@@ -7585,7 +7612,7 @@ function UI.createSingleSelectDropdown(parent, labelText, description, order, in
         Get = function() return currentValue end,
         Set = function(value)
             currentValue = value
-            summary.Text = value or description or "None selected"
+            summary.Text = value or "None selected"
         end,
     }
 end
@@ -7623,7 +7650,7 @@ function UI.createMultiSelectDropdown(parent, labelText, description, order, sel
     title.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(6, 0) or UDim2.fromOffset(10, 3)
     title.Size = UDim2.new(1, -35, 0, IS_TOUCH_DEVICE and 12 or 19)
 
-    local summary = UI.makeText(header, description or "None selected", IS_TOUCH_DEVICE and 5 or 9, THEME.muted, Enum.Font.GothamBold)
+    local summary = UI.makeText(header, "None selected", IS_TOUCH_DEVICE and 5 or 9, THEME.muted, Enum.Font.GothamBold)
     summary.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(6, 12) or UDim2.fromOffset(10, 22)
     summary.Size = UDim2.new(1, -35, 0, IS_TOUCH_DEVICE and 11 or 16)
     summary.TextTruncate = Enum.TextTruncate.AtEnd
@@ -7930,6 +7957,7 @@ function UI.launchMainGui()
     local subtitle = UI.makeText(header, "Automation Hub", IS_TOUCH_DEVICE and 5 or 9, THEME.muted, Enum.Font.GothamBold)
     subtitle.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(25, 14) or UDim2.fromOffset(58, 32)
     subtitle.Size = UDim2.new(1, IS_TOUCH_DEVICE and -51 or -94, 0, IS_TOUCH_DEVICE and 9 or 15)
+    subtitle.Visible = false
 
     local minimize = Instance.new("TextButton")
     minimize.Name = "Minimize"
@@ -8422,6 +8450,7 @@ function UI.launchMainGui()
         Enum.TextXAlignment.Center
     )
     footerText.Size = UDim2.fromScale(1, 1)
+    footer.Visible = false
 
     -- Keep the animal picker directly below Auto Snatch, with unique row orders.
     for _, row in ipairs(content:GetChildren()) do
@@ -8501,7 +8530,7 @@ function UI.launchMainGui()
             content.Visible = true
             divider.Visible = true
             brandDot.Visible = true
-            subtitle.Visible = true
+            subtitle.Visible = false
 
             title.Position = IS_TOUCH_DEVICE and UDim2.fromOffset(25, 2) or UDim2.fromOffset(46, 4)
             title.Size = UDim2.new(1, IS_TOUCH_DEVICE and -51 or -94, 0, IS_TOUCH_DEVICE and 13 or 21)
