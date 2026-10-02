@@ -36,7 +36,7 @@
       * Added minimize / restore support
       * Auto Break now targets selected live-scanned rarities
       * No fixed egg-search delay: rescans immediately / every frame when empty
-      * Removed continuous egg position/tween lock
+      * Auto Break teleports once, then continuously tweens toward its target egg
       * Highest-HP priority added as an optional toggle
       * Hit-only cycle: breaks selected eggs without activating steal prompts
       * Advances to the next selected egg without returning to the treadmill
@@ -2818,6 +2818,7 @@ local autoStealReturning = false
 local autoStealCycleBusy = false
 local targetLockActive = false
 local targetLockCFrame = nil
+local BreakTween = {active = nil, root = nil, goal = nil, proxy = nil, connection = nil, offset = nil, rotation = nil}
 local protectionBaseline = nil
 local protectionWorkerStarted = false
 local protectionAntiPushMover = nil
@@ -3781,7 +3782,67 @@ local function ensureAntiPushMover(root)
     return mover
 end
 
+function BreakTween.Cancel()
+    if BreakTween.connection then BreakTween.connection:Disconnect(); BreakTween.connection = nil end
+    if BreakTween.active then pcall(function() BreakTween.active:Cancel() end) end
+    if BreakTween.proxy then BreakTween.proxy:Destroy(); BreakTween.proxy = nil end
+    BreakTween.active, BreakTween.root, BreakTween.goal = nil, nil, nil
+end
+
+function BreakTween.Prepare(eggCF)
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local delta = root and (root.Position - eggCF.Position) or Vector3.new(0, 0, 1)
+    delta = Vector3.new(delta.X, 0, delta.Z)
+    BreakTween.offset = delta.Magnitude > 0.1 and delta.Unit * 5 or Vector3.new(0, 0, 5)
+    BreakTween.rotation = root and root.CFrame.Rotation or CFrame.identity
+    return CFrame.new(eggCF.Position + BreakTween.offset) * BreakTween.rotation
+end
+
+function BreakTween.Step(egg)
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local eggCF = egg and egg.Parent and getObjectCFrame(egg)
+    if not autoStealEnabled or not targetLockActive or not root or not eggCF then
+        BreakTween.Cancel()
+        return
+    end
+    local position = eggCF.Position + (BreakTween.offset or Vector3.new(0, 0, 5))
+    local goal = CFrame.new(position.X, root.Position.Y, position.Z) * (BreakTween.rotation or root.CFrame.Rotation)
+    targetLockCFrame = goal
+    if BreakTween.active and BreakTween.root == root and BreakTween.goal
+        and Vector3.new(BreakTween.goal.X - goal.X, 0, BreakTween.goal.Z - goal.Z).Magnitude < 0.75
+        and BreakTween.active.PlaybackState == Enum.PlaybackState.Playing then return end
+    local horizontalError = Vector3.new(root.Position.X - goal.X, 0, root.Position.Z - goal.Z).Magnitude
+    if horizontalError < 0.6 then
+        if BreakTween.active then BreakTween.Cancel() end
+        return
+    end
+    BreakTween.Cancel()
+    releaseAntiPushMover()
+    root.Anchored = false
+    BreakTween.root, BreakTween.goal = root, goal
+    local proxy = Instance.new("Vector3Value")
+    proxy.Value = Vector3.new(root.Position.X, 0, root.Position.Z)
+    BreakTween.proxy = proxy
+    BreakTween.active = TweenService:Create(proxy, TweenInfo.new(0.20, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+        {Value = Vector3.new(goal.X, 0, goal.Z)})
+    BreakTween.connection = RunService.Heartbeat:Connect(function()
+        if not autoStealEnabled or not targetLockActive or not root.Parent
+            or AutoSnatch.pending or AutoSnatch.busy or PetEggAutomation.ShouldBlockSteal() then
+            BreakTween.Cancel()
+            return
+        end
+        -- Preserve live height and rotation so gravity and the humanoid can settle.
+        root.CFrame = CFrame.new(proxy.Value.X, root.Position.Y, proxy.Value.Z) * root.CFrame.Rotation
+        if BreakTween.active and BreakTween.active.PlaybackState == Enum.PlaybackState.Completed then BreakTween.Cancel() end
+    end)
+    BreakTween.active:Play()
+end
+
 local function clearTargetLock()
+    BreakTween.Cancel()
+    BreakTween.offset, BreakTween.rotation = nil, nil
     targetLockActive = false
     targetLockCFrame = nil
     releaseAntiPushMover()
@@ -3793,8 +3854,7 @@ local function setTargetLock(targetCF)
         return
     end
 
-    -- This flag only means "currently working on an egg".
-    -- It no longer continuously tweens or CFrames the player to that egg.
+    -- Own the egg movement until the cycle ends or a higher priority interrupts.
     targetLockCFrame = targetCF + Vector3.new(0, 4, 0)
     targetLockActive = true
 end
@@ -4079,7 +4139,8 @@ local function protectCharacterStep()
     -- Strong anti-push WITHOUT anchoring and WITHOUT continuous tween/CFrame.
     -- This keeps the character movable from the game's point of view so the
     -- pickaxe can continue breaking eggs normally.
-    if (targetLockActive and not autoStealReturning) or (AutoSnatch.enabled and AutoSnatch.protecting) then
+    if ((targetLockActive and not autoStealReturning) or (AutoSnatch.enabled and AutoSnatch.protecting))
+        and not (BreakTween.active and BreakTween.active.PlaybackState == Enum.PlaybackState.Playing) then
         local mover = ensureAntiPushMover(root)
 
         if mover then
@@ -4125,6 +4186,7 @@ local function startProtectionWorker()
     end)
 
     LocalPlayer.CharacterAdded:Connect(function()
+        BreakTween.Cancel()
         protectionBaseline = nil
         protectionAntiPushMover = nil
         protectionAntiPushRoot = nil
@@ -4729,16 +4791,17 @@ local function runAutoStealCycle()
         return false
     end
 
-    if not teleportCharacter(eggCF) then
+    local approachCF = BreakTween.Prepare(eggCF)
+    if not teleportCharacter(approachCF) then
         clearTargetLock()
         setStatus("Teleport failed", "error")
         RunService.Heartbeat:Wait()
         return false
     end
 
-    -- Marks the period where anti-push protection is active.
-    -- There is still NO continuous tween or continuous CFrame-to-egg behavior.
-    setTargetLock(eggCF)
+    -- Teleport once, then continuously tween toward the live egg position.
+    setTargetLock(approachCF)
+    BreakTween.Step(egg)
 
     task.wait(POST_TELEPORT_SETTLE)
 
@@ -4770,6 +4833,7 @@ local function runAutoStealCycle()
             break
         end
 
+        BreakTween.Step(egg)
         local didAnything, hasTool, hasRemote, hasTarget, rapidHits = attackEggRapid(egg)
 
         if tick() - lastDetailUpdate > 1.0 then
@@ -5276,6 +5340,7 @@ end
         if not Animals[model.Name] or models[model] then return end
         if hasBlockedDifficulty(model) or not getPart(model) then return end
         models[model] = true
+        if AutoSnatch.Wake then AutoSnatch.Wake() end
     end
     local pendingModels = setmetatable({}, {__mode = "k"})
     local function scanModel(model)
@@ -5341,9 +5406,33 @@ end
             end
         end)
     end
+    local partCache = setmetatable({}, {__mode = "k"})
     local function modelPosition(model)
-        local part = getPart(model)
+        local part = partCache[model]
+        if not part or not part.Parent or not part:IsDescendantOf(model) then
+            part = getPart(model)
+            partCache[model] = part
+        end
         if part then return part.Position end
+    end
+    local sleepingThread = nil
+    local wakeGeneration = 0
+    function AutoSnatch.Wake()
+        if sleepingThread then
+            local thread = sleepingThread
+            sleepingThread = nil
+            wakeGeneration += 1
+            task.spawn(thread)
+        end
+    end
+    local function waitForTargetChange()
+        sleepingThread = coroutine.running()
+        wakeGeneration += 1
+        local generation = wakeGeneration
+        task.delay(0.01, function()
+            if sleepingThread and wakeGeneration == generation then AutoSnatch.Wake() end
+        end)
+        coroutine.yield()
     end
     local cooldown = setmetatable({}, {__mode = "k"})
     local function higherPriority()
@@ -5366,14 +5455,23 @@ end
             end)
             preparedPrompts[prompt] = ok
         end
-        if type(fireproximityprompt) == "function" then
-            local ok = pcall(fireproximityprompt, prompt, 0, true)
-            if ok then return true end
+        local fired = false
+        -- Zero-wait burst for the logged StealPrompt; yield only in the outer loop.
+        for _ = 1, 3 do
+            if not AutoSnatch.enabled or higherPriority() or not prompt.Parent or not prompt.Enabled then break end
+            local ok = false
+            if type(fireproximityprompt) == "function" then
+                ok = pcall(fireproximityprompt, prompt, 0, true)
+            end
+            if not ok then
+                ok = pcall(function()
+                    prompt:InputHoldBegin()
+                    prompt:InputHoldEnd()
+                end)
+            end
+            fired = ok or fired
         end
-        return pcall(function()
-            prompt:InputHoldBegin()
-            prompt:InputHoldEnd()
-        end)
+        return fired
     end
     local function animalName(prompt)
         local text = tostring(prompt.ObjectText or ""):gsub("<[^>]*>", ""):gsub("%b[]", "")
@@ -5433,6 +5531,23 @@ end
         if excluded(model) then return nil end
         local position = model.Parent and modelPosition(model)
         if not position then return nil end
+        -- ActionLogs_V10 records Workspace.PromptAnchor.StealPrompt.
+        -- Bind that shared anchor to the selected animal before activating it.
+        local anchor = Workspace:FindFirstChild("PromptAnchor")
+        local loggedPrompt = anchor and anchor:FindFirstChild("StealPrompt")
+        if loggedPrompt and loggedPrompt:IsA("ProximityPrompt") and loggedPrompt.Enabled and not excluded(loggedPrompt) then
+            local promptPosition = getPromptWorldPosition(loggedPrompt)
+            local detectedName = animalName(loggedPrompt)
+            local character = LocalPlayer.Character
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            if promptPosition then
+                local distance = (position - promptPosition).Magnitude
+                if (detectedName == name and distance <= 24)
+                    or (not detectedName and distance <= 8 and root and (root.Position - promptPosition).Magnitude <= 12) then
+                    return loggedPrompt
+                end
+            end
+        end
         local best, bestDistance = nil, math.huge
         for prompt in pairs(ensureProximityPromptCache()) do
             if prompt.Parent and prompt.Enabled then
@@ -5518,7 +5633,7 @@ end
         return false
     end
     function AutoSnatch.Start()
-        if AutoSnatch.running then return end
+        if AutoSnatch.running then AutoSnatch.Wake(); return end
         AutoSnatch.StartScanner()
         AutoSnatch.running = true
         task.spawn(function()
@@ -5551,14 +5666,14 @@ end
                         if excluded(model, true) or hasBlockedDifficulty(model) or AutoSnatch.selected[name] ~= true then return end
                         local position = modelPosition(model)
                         if not position then return end
-                        local prompt = findStealPrompt(model, name)
-                        if prompt then position = getPromptWorldPosition(prompt) or position end
+                        local prompt = nil
                         status("Teleporting to " .. name .. (AutoSnatch.highestKg
                             and (kg ~= nil and string.format(" • %.2f kg", kg) or " • KG unknown") or ""))
                         AutoSnatch.protecting = true
-                        protectCharacterStep()
                         if not teleportCharacter(CFrame.new(position + Vector3.new(0, 2, 2))) then return end
                         needsReturn = true
+                        protectCharacterStep()
+                        prompt = findStealPrompt(model, name)
                         local attempted = false
                         local completed = false
                         local lastTeleport = -math.huge
@@ -5609,9 +5724,9 @@ end
                 AutoSnatch.pending = false
                 AutoSnatch.busy = false
                 if not ok then status("Error: " .. tostring(err), "error") end
-                -- After return, scan immediately. Idle/blocked cycles yield one
-                -- frame so an empty map cannot turn this into a busy loop.
-                if not returnedThisCycle then RunService.Heartbeat:Wait() end
+                -- After return, scan immediately. Idle cycles wake on new models
+                -- or the short fallback check without busy-looping an empty map.
+                if not returnedThisCycle then waitForTargetChange() end
             end
             AutoSnatch.pending = false
             AutoSnatch.busy = false
@@ -7719,7 +7834,7 @@ function UI.launchMainGui()
     UI.createToggleRow(
         content,
         "Auto Break",
-        "Hits selected-rarity eggs • next target after break",
+        "TP + continuous tween to egg • next target after break",
         3,
         autoStealEnabled,
         function(enabled)
@@ -7734,6 +7849,7 @@ function UI.launchMainGui()
                 end
                 task.spawn(runAutoSteal)
             else
+                clearTargetLock()
                 setStatus("Stopping…", "idle")
             end
         end
