@@ -903,7 +903,7 @@ end
 --// Pet Auto Merge + Auto Hatch + Smart Auto Place Eggs
 -- Auto Place Egg core copied from the supplied working VNDT reference script.
 -- Placement points are randomized across nearly the entire detected PlotSurface.
--- Priority: Auto Hatch > Auto Place Eggs > Auto Break.
+-- Priority: Auto Hatch > Auto Place Eggs > Auto Snatch > Auto Break.
 -- Encapsulated in one table to avoid adding many top-level locals to this large script.
 PetEggAutomation = (function()
     local A = {}
@@ -1706,8 +1706,7 @@ PetEggAutomation = (function()
         hatchRequested = true
         report("READY EGG detected • Auto Hatch taking HIGHEST priority", "warning")
 
-        -- Let an already-started steal/return action finish, but block the next
-        -- steal immediately through hatchRequested/ShouldBlockSteal.
+        -- Request priority first so Auto Snatch/Break stop and release movement.
         while autoHatchEnabled and stealBusyCheck() do
             task.wait(0.03)
         end
@@ -2253,7 +2252,7 @@ PetEggAutomation = (function()
         -- Auto Break cycle sees that priority flag and aborts immediately.
         -- We only wait for its movement lock to be released before placing.
         while placementRequested and stealBusyCheck() do
-            report("Auto Place priority • stopping current Auto Break", "warning")
+            report("Auto Place priority • stopping Auto Snatch / Auto Break", "warning")
             task.wait(0.03)
         end
         return placementRequested
@@ -2307,7 +2306,7 @@ PetEggAutomation = (function()
         end
 
         currentlyPlacing = true
-        report("Auto Place Eggs priority over Auto Break", "working")
+        report("Auto Place Eggs priority over Auto Snatch / Auto Break", "working")
 
         if #candidates == 0 then
             local found = buildCandidatePositions()
@@ -4407,7 +4406,7 @@ end
 
 
 --// Strict higher-priority interruption for Auto Break
--- Auto Hatch > Auto Place Eggs > Auto Break.
+-- Auto Hatch > Auto Place Eggs > Auto Snatch > Auto Break.
 -- When either higher-priority task is requested, the current steal cycle yields
 -- immediately instead of finishing the egg first. The Auto Break toggle remains
 -- ON, so the manager automatically resumes after the priority task completes.
@@ -4424,8 +4423,9 @@ local function stopCurrentStealForPriority()
 
     clearTargetLock()
 
-    local reason = (AutoSnatch.pending or AutoSnatch.busy) and "Auto Snatch" or PetEggAutomation.GetBlockReason
-        and PetEggAutomation.GetBlockReason()
+    local reason = (PetEggAutomation and PetEggAutomation.GetBlockReason
+        and PetEggAutomation.GetBlockReason())
+        or ((AutoSnatch.pending or AutoSnatch.busy) and "Auto Snatch")
         or "Egg automation"
 
     setStatus("Stopped current Auto Break • " .. tostring(reason) .. " has priority", "warning")
@@ -4842,7 +4842,9 @@ local function runAutoStealManager()
 
             local resumedFromPriorityTask = false
             if autoStealPriorityRequested() then
-                local reason = (AutoSnatch.pending or AutoSnatch.busy) and "Auto Snatch" or PetEggAutomation.GetBlockReason and PetEggAutomation.GetBlockReason() or "Egg automation"
+                local reason = (PetEggAutomation and PetEggAutomation.GetBlockReason
+                    and PetEggAutomation.GetBlockReason())
+                    or ((AutoSnatch.pending or AutoSnatch.busy) and "Auto Snatch") or "Egg automation"
                 setStatus("Paused • " .. tostring(reason) .. " has priority", "warning")
                 while autoStealEnabled and autoStealPriorityRequested() do
                     task.wait(IS_TOUCH_DEVICE and 0.10 or 0.07)
@@ -4871,6 +4873,7 @@ local function runAutoStealManager()
             autoStealCycleBusy = false
 
             if not ok then
+                clearTargetLock()
                 setStatus("Error: " .. tostring(completedOrError), "error")
             end
 
@@ -5535,8 +5538,12 @@ end
         task.spawn(function()
             local needsReturn = false
             while AutoSnatch.enabled do
+                local returnedThisCycle = false
                 local ok, err = pcall(function()
-                    if higherPriority() then return end
+                    if higherPriority() then
+                        status("Paused • " .. tostring(PetEggAutomation.GetBlockReason() or "Egg automation") .. " has priority", "warning")
+                        return
+                    end
                     local model, name, kg
                     if not needsReturn then
                         model, name, kg = choose()
@@ -5547,7 +5554,8 @@ end
                         end
                     end
                     AutoSnatch.pending = true
-                    while AutoSnatch.enabled and not higherPriority() and autoStealCycleBusy do
+                    while AutoSnatch.enabled and not higherPriority()
+                        and (autoStealCycleBusy or targetLockActive or autoStealReturning) do
                         RunService.Heartbeat:Wait()
                     end
                     if not AutoSnatch.enabled or higherPriority() then return end
@@ -5605,7 +5613,8 @@ end
                         end
                     end
                     if AutoSnatch.enabled and not higherPriority() then
-                        needsReturn = not returnToBoard()
+                        returnedThisCycle = returnToBoard()
+                        needsReturn = not returnedThisCycle
                     end
                 end)
                 if AutoSnatch.protecting then
@@ -5615,7 +5624,9 @@ end
                 AutoSnatch.pending = false
                 AutoSnatch.busy = false
                 if not ok then status("Error: " .. tostring(err), "error") end
-                task.wait(0.3)
+                -- After return, scan immediately. Idle/blocked cycles yield one
+                -- frame so an empty map cannot turn this into a busy loop.
+                if not returnedThisCycle then RunService.Heartbeat:Wait() end
             end
             AutoSnatch.pending = false
             AutoSnatch.busy = false
