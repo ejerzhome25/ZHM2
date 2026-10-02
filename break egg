@@ -5277,40 +5277,25 @@ end
         if hasBlockedDifficulty(model) or not getPart(model) then return end
         models[model] = true
     end
-local function scanModel(model)
-	if not model:IsA("Model") then
-		return
-	end
-
-	if not Animals[model.Name] then
-		return
-	end
-
-	--------------------------------------------------
-	-- WAIT FOR DIFFICULTY GUI / VALUES TO LOAD
-	--------------------------------------------------
-
-	task.spawn(function()
-
-		for _ = 1, 10 do
-
-			if not model.Parent then
-				return
-			end
-
-			if hasBlockedDifficulty(model) then
-				removeESP(model)
-				return
-			end
-
-			task.wait(0.1)
-		end
-
-		addESP(model)
-	end)
-end
-
---------------------------------------------------
+    local pendingModels = setmetatable({}, {__mode = "k"})
+    local function scanModel(model)
+        if not model:IsA("Model") or not Animals[model.Name] or not model.Parent then return end
+        if hasBlockedDifficulty(model) then removeESP(model); return end
+        if models[model] then return end
+        if getPart(model) then addESP(model); return end
+        -- Register ready models immediately; retry only incomplete streamed models.
+        if pendingModels[model] then return end
+        pendingModels[model] = true
+        task.spawn(function()
+            local deadline = os.clock() + 1
+            while model.Parent and os.clock() < deadline do
+                if hasBlockedDifficulty(model) then break end
+                if getPart(model) then addESP(model); break end
+                RunService.Heartbeat:Wait()
+            end
+            pendingModels[model] = nil
+        end)
+    end
 
     local function hideOverlay(object)
         if (object.Name == "VNDT_AnimalESP" and object:IsA("Highlight"))
@@ -5327,12 +5312,13 @@ end
                 scanModel(object)
                 return
             end
-            if object:IsA("TextLabel") or object:IsA("TextButton")
-                or object:IsA("TextBox") or object:IsA("StringValue") then
+            -- Parts, attributes represented by values, and late UI can all make
+            -- an incomplete streamed animal ready without waiting for a rescan.
+            if object.Parent then
                 local parent = object.Parent
                 while parent and parent ~= Workspace do
                     if parent:IsA("Model") and Animals[parent.Name] then
-                        if hasBlockedDifficulty(parent) then removeESP(parent) end
+                        scanModel(parent)
                         break
                     end
                     parent = parent.Parent
@@ -5562,17 +5548,17 @@ end
                     AutoSnatch.busy = true
                     AutoSnatch.pending = false
                     if not needsReturn then
-                        if excluded(model, true) or AutoSnatch.selected[name] ~= true then return end
+                        if excluded(model, true) or hasBlockedDifficulty(model) or AutoSnatch.selected[name] ~= true then return end
                         local position = modelPosition(model)
                         if not position then return end
+                        local prompt = findStealPrompt(model, name)
+                        if prompt then position = getPromptWorldPosition(prompt) or position end
                         status("Teleporting to " .. name .. (AutoSnatch.highestKg
                             and (kg ~= nil and string.format(" • %.2f kg", kg) or " • KG unknown") or ""))
                         AutoSnatch.protecting = true
                         protectCharacterStep()
                         if not teleportCharacter(CFrame.new(position + Vector3.new(0, 2, 2))) then return end
                         needsReturn = true
-                        RunService.Heartbeat:Wait()
-                        local prompt = nil
                         local attempted = false
                         local completed = false
                         local lastTeleport = -math.huge
@@ -5583,7 +5569,7 @@ end
                                 status("Steal prompt completed • returning", "success")
                                 break
                             end
-                            if excluded(model) then
+                            if excluded(model) or hasBlockedDifficulty(model) then
                                 status("Target entered a base or is being carried • returning", "warning")
                                 break
                             end
@@ -5593,10 +5579,9 @@ end
                                 local character = LocalPlayer.Character
                                 local root = character and character:FindFirstChild("HumanoidRootPart")
                                 if livePosition and root and (root.Position - (livePosition + Vector3.new(0, 6, 2))).Magnitude > 3
-                                    and os.clock() - lastTeleport >= 0.12 then
+                                    and os.clock() - lastTeleport >= 0.04 then
                                     teleportCharacter(CFrame.new(livePosition + Vector3.new(0, 2, 2)))
                                     lastTeleport = os.clock()
-                                    RunService.Heartbeat:Wait()
                                 end
                                 if not AutoSnatch.enabled or higherPriority() or excluded(model, true) or excluded(prompt, true) then break end
                                 status("Stealing " .. name)
