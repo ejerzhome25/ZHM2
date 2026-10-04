@@ -618,6 +618,284 @@ function Window:Notify(config)
     end)
 end
 
+
+function Tab:CreateMultiDropdown(config)
+    config = config or {}
+
+    local options = config.Options or {}
+    local selected = config.Selected or config.Default or {}
+    local searchable = config.Searchable ~= false
+    local opened = false
+    local query = ""
+    local maxListHeight = config.MaxHeight or 185
+
+    local holder = new("Frame", {
+        BackgroundColor3 = Theme.Surface,
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 54),
+        ClipsDescendants = true,
+        Parent = self.Page
+    })
+    corner(holder, 10)
+    stroke(holder, Theme.Stroke, 1, 0.22)
+
+    local header = makeButton(holder, {
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 54)
+    })
+
+    local title = textLabel(header, config.Name or "Multi Select", 12, Theme.Muted, Enum.Font.GothamMedium)
+    title.Position = UDim2.fromOffset(13, 4)
+    title.Size = UDim2.new(0.48, -13, 0, 22)
+
+    local summary = textLabel(header, config.Placeholder or "None selected", 11, Theme.Text, Enum.Font.Gotham)
+    summary.Position = UDim2.fromOffset(13, 26)
+    summary.Size = UDim2.new(1, -48, 0, 21)
+    summary.TextTruncate = Enum.TextTruncate.AtEnd
+
+    local arrow = textLabel(header, "⌄", 14, Theme.Muted, Enum.Font.GothamBold)
+    arrow.AnchorPoint = Vector2.new(1, 0)
+    arrow.Position = UDim2.new(1, -12, 0, 0)
+    arrow.Size = UDim2.fromOffset(22, 54)
+    arrow.TextXAlignment = Enum.TextXAlignment.Center
+
+    local body = new("Frame", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(8, 54),
+        Size = UDim2.new(1, -16, 0, 0),
+        Parent = holder
+    })
+
+    local searchHeight = searchable and 34 or 0
+    local searchBox
+
+    if searchable then
+        local searchHolder = new("Frame", {
+            Position = UDim2.fromOffset(0, 3),
+            Size = UDim2.new(1, 0, 0, 30),
+            BackgroundColor3 = Theme.Surface2,
+            BorderSizePixel = 0,
+            Parent = body
+        })
+        corner(searchHolder, 8)
+        stroke(searchHolder, Theme.Stroke, 1, 0.3)
+
+        searchBox = new("TextBox", {
+            BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(10, 0),
+            Size = UDim2.new(1, -20, 1, 0),
+            ClearTextOnFocus = false,
+            Text = "",
+            PlaceholderText = config.SearchPlaceholder or "Search...",
+            PlaceholderColor3 = Theme.Muted,
+            TextColor3 = Theme.Text,
+            TextSize = 11,
+            Font = Enum.Font.Gotham,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Parent = searchHolder
+        })
+    end
+
+    local list = new("ScrollingFrame", {
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Position = UDim2.fromOffset(0, searchHeight + 4),
+        Size = UDim2.new(1, 0, 0, maxListHeight),
+        CanvasSize = UDim2.new(),
+        ScrollBarThickness = UserInputService.TouchEnabled and 5 or 3,
+        ScrollBarImageColor3 = Theme.Accent,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
+        Parent = body
+    })
+
+    local listLayout = new("UIListLayout", {
+        Padding = UDim.new(0, 5),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Parent = list
+    })
+    setCanvas(list, listLayout, 4)
+
+    local optionButtons = {}
+
+    local function selectedCount()
+        local count = 0
+        for _, option in ipairs(options) do
+            if selected[option] == true then
+                count += 1
+            end
+        end
+        return count
+    end
+
+    local function updateSummary()
+        local count = selectedCount()
+        if count == 0 then
+            summary.Text = config.Placeholder or "None selected"
+            summary.TextColor3 = Theme.Muted
+            return
+        end
+
+        if count == 1 then
+            for _, option in ipairs(options) do
+                if selected[option] == true then
+                    summary.Text = tostring(option)
+                    break
+                end
+            end
+        else
+            summary.Text = tostring(count) .. " selected"
+        end
+
+        summary.TextColor3 = Theme.Text
+    end
+
+    local function matchesSearch(option)
+        if query == "" then return true end
+        return string.find(string.lower(tostring(option)), query, 1, true) ~= nil
+    end
+
+    local function updateBodyHeight()
+        local visibleCount = 0
+        for _, button in pairs(optionButtons) do
+            if button.Visible then
+                visibleCount += 1
+            end
+        end
+
+        local listHeight = math.min(maxListHeight, math.max(36, visibleCount * 39))
+        list.Size = UDim2.new(1, 0, 0, listHeight)
+        body.Size = UDim2.new(1, -16, 0, searchHeight + listHeight + 10)
+
+        if opened then
+            holder.Size = UDim2.new(1, 0, 0, 54 + body.Size.Y.Offset)
+        end
+    end
+
+    local function renderOptions()
+        for option, button in pairs(optionButtons) do
+            local active = selected[option] == true
+            button.Text = (active and "✓  " or "    ") .. tostring(option)
+            button.BackgroundColor3 = active and Theme.Surface3 or Theme.Surface2
+            button.TextColor3 = active and Theme.Text or Theme.Muted
+            button.Visible = matchesSearch(option)
+        end
+
+        updateSummary()
+        updateBodyHeight()
+    end
+
+    local function rebuild()
+        for _, child in ipairs(list:GetChildren()) do
+            if child:IsA("TextButton") then
+                child:Destroy()
+            end
+        end
+
+        table.clear(optionButtons)
+
+        for index, option in ipairs(options) do
+            local button = makeButton(list, {
+                LayoutOrder = index,
+                Size = UDim2.new(1, -2, 0, 34),
+                BackgroundColor3 = Theme.Surface2,
+                Text = tostring(option),
+                TextColor3 = Theme.Muted,
+                TextSize = 11,
+                Font = Enum.Font.Gotham,
+                TextXAlignment = Enum.TextXAlignment.Left
+            })
+            corner(button, 8)
+            padding(button, 10, 10, 0, 0)
+            optionButtons[option] = button
+
+            button.MouseButton1Click:Connect(function()
+                selected[option] = not (selected[option] == true)
+                renderOptions()
+
+                if config.Callback then
+                    task.spawn(config.Callback, option, selected[option], selected)
+                end
+            end)
+        end
+
+        renderOptions()
+    end
+
+    local function setOpen(value)
+        opened = value == true
+
+        if opened then
+            updateBodyHeight()
+            tween(arrow, nil, {Rotation = 180})
+        else
+            tween(holder, nil, {Size = UDim2.new(1, 0, 0, 54)})
+            tween(arrow, nil, {Rotation = 0})
+        end
+    end
+
+    header.MouseButton1Click:Connect(function()
+        setOpen(not opened)
+    end)
+
+    if searchBox then
+        searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+            query = string.lower(searchBox.Text or "")
+            renderOptions()
+        end)
+    end
+
+    local api = {}
+
+    function api:SetOptions(newOptions)
+        options = newOptions or {}
+        rebuild()
+    end
+
+    function api:Refresh(newOptions)
+        if newOptions then
+            options = newOptions
+        end
+        rebuild()
+    end
+
+    function api:GetSelected()
+        return selected
+    end
+
+    function api:SetSelected(map, fire)
+        for key in pairs(selected) do
+            selected[key] = nil
+        end
+
+        for key, value in pairs(map or {}) do
+            if value == true then
+                selected[key] = true
+            end
+        end
+
+        renderOptions()
+
+        if fire and config.Callback then
+            task.spawn(config.Callback, nil, nil, selected)
+        end
+    end
+
+    function api:Clear(fire)
+        for key in pairs(selected) do
+            selected[key] = nil
+        end
+
+        renderOptions()
+
+        if fire and config.Callback then
+            task.spawn(config.Callback, nil, nil, selected)
+        end
+    end
+
+    rebuild()
+    return api
+end
+
 function Window:SetVisible(state)
     self.Gui.Enabled = state == true
 end
