@@ -990,7 +990,7 @@ function Tab:CreateButton(config)
     )
     arrow.AnchorPoint = Vector2.new(1, 0)
     arrow.Position = UDim2.new(1, -13, 0, 0)
-    arrow.Size = UDim2.fromOffset(20, 44)
+    arrow.Size = UDim2.fromOffset(20, hasDescription and 58 or 44)
     arrow.TextXAlignment = Enum.TextXAlignment.Center
 
     local click = Button(row, {
@@ -1091,6 +1091,12 @@ function Tab:CreateToggle(config)
 
     function api:Get()
         return value
+    end
+
+    function api:SetDescription(v)
+        if description then
+            description.Text = tostring(v or "")
+        end
     end
 
     click.MouseButton1Click:Connect(function()
