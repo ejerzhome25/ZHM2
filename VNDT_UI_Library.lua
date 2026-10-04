@@ -1701,8 +1701,8 @@ function Tab:CreateDropdown(config)
         RenderOpen()
     end)
 
-    function api:Set(value)
-        Select(value, true)
+    function api:Set(value, fireCallback)
+        Select(value, fireCallback == true)
     end
 
     function api:Get()
