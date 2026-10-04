@@ -186,7 +186,8 @@ function VNDT:CreateWindow(config)
     local gui = New("ScreenGui", {
         Name = "VNDT_" .. HttpService:GenerateGUID(false),
         ResetOnSpawn = false,
-        IgnoreGuiInset = false,
+        IgnoreGuiInset = true,
+        DisplayOrder = 999999,
         ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
         Parent = GetGuiParent()
     })
@@ -288,24 +289,99 @@ function VNDT:CreateWindow(config)
 
     local minimizedBubble = Button(gui, {
         Name = "VNDT_MinimizedBubble",
-        AnchorPoint = Vector2.new(1, 0),
-        Position = UDim2.new(1, -18, 0, 76),
-        Size = UDim2.fromOffset(50, 50),
+        AnchorPoint = Vector2.new(0, 0),
+        Position = UDim2.fromOffset(18, 74),
+        Size = UDim2.fromOffset(52, 52),
         BackgroundColor3 = Theme.Accent,
+        BackgroundTransparency = 0,
         Text = "V",
         TextColor3 = Color3.fromRGB(255, 255, 255),
-        TextSize = 18,
+        TextSize = 19,
         Font = Enum.Font.GothamBold,
         Visible = false,
-        ZIndex = 50
+        ZIndex = 999,
+        Active = true
     })
     Corner(minimizedBubble, 99)
-    Stroke(minimizedBubble, Color3.fromRGB(255, 255, 255), 1, 0.75)
+    Stroke(minimizedBubble, Color3.fromRGB(255, 255, 255), 1.4, 0.55)
 
     local bubbleScale = New("UIScale", {
         Scale = 1,
         Parent = minimizedBubble
     })
+
+    local bubbleShadow = New("Frame", {
+        Name = "Shadow",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(60, 60),
+        BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+        BackgroundTransparency = 0.65,
+        BorderSizePixel = 0,
+        ZIndex = 998,
+        Parent = minimizedBubble
+    })
+    Corner(bubbleShadow, 99)
+
+    -- Keep the text above the shadow.
+    minimizedBubble.TextStrokeTransparency = 0.8
+
+    local function clampBubbleToScreen()
+        local camera = workspace.CurrentCamera
+        if not camera then return end
+
+        local viewport = camera.ViewportSize
+        local size = minimizedBubble.AbsoluteSize
+        local pos = minimizedBubble.AbsolutePosition
+
+        local x = math.clamp(pos.X, 8, math.max(8, viewport.X - size.X - 8))
+        local y = math.clamp(pos.Y, 8, math.max(8, viewport.Y - size.Y - 8))
+
+        minimizedBubble.Position = UDim2.fromOffset(x, y)
+    end
+
+    local bubbleDragging = false
+    local bubbleDragStart = nil
+    local bubbleStartPos = nil
+    local bubbleMoved = false
+
+    minimizedBubble.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            bubbleDragging = true
+            bubbleMoved = false
+            bubbleDragStart = input.Position
+            bubbleStartPos = minimizedBubble.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    bubbleDragging = false
+                    task.defer(clampBubbleToScreen)
+                end
+            end)
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if not bubbleDragging then return end
+
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement
+        and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+
+        local delta = input.Position - bubbleDragStart
+        if delta.Magnitude > 4 then
+            bubbleMoved = true
+        end
+
+        minimizedBubble.Position = UDim2.new(
+            bubbleStartPos.X.Scale,
+            bubbleStartPos.X.Offset + delta.X,
+            bubbleStartPos.Y.Scale,
+            bubbleStartPos.Y.Offset + delta.Y
+        )
+    end)
 
     minimizedBubble.MouseEnter:Connect(function()
         Tween(bubbleScale, {Scale = 1.08})
@@ -393,9 +469,11 @@ function VNDT:CreateWindow(config)
         self.Minimized = state == true
 
         if self.Minimized then
+            minimizedBubble.Visible = true
+            minimizedBubble.ZIndex = 999
+            clampBubbleToScreen()
             main.Visible = false
             shadow.Visible = false
-            minimizedBubble.Visible = true
         else
             minimizedBubble.Visible = false
             shadow.Visible = true
@@ -411,6 +489,10 @@ function VNDT:CreateWindow(config)
     end)
 
     minimizedBubble.MouseButton1Click:Connect(function()
+        if bubbleMoved then
+            bubbleMoved = false
+            return
+        end
         setMinimized(false)
     end)
 
