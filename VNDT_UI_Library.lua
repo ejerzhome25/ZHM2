@@ -27,7 +27,7 @@ local Theme = {
     Stroke = Color3.fromRGB(55, 58, 68),
     Text = Color3.fromRGB(238, 240, 246),
     Muted = Color3.fromRGB(155, 160, 175),
-    Accent = Color3.fromRGB(120, 135, 255),
+    Accent = Color3.fromRGB(124, 104, 255),
     Danger = Color3.fromRGB(240, 95, 105)
 }
 
@@ -286,6 +286,35 @@ function VNDT:CreateWindow(config)
     Corner(close, 8)
     Stroke(close, Theme.Stroke, 1, 0.25)
 
+    local minimizedBubble = Button(gui, {
+        Name = "VNDT_MinimizedBubble",
+        AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.new(1, -18, 0, 76),
+        Size = UDim2.fromOffset(50, 50),
+        BackgroundColor3 = Theme.Accent,
+        Text = "V",
+        TextColor3 = Color3.fromRGB(255, 255, 255),
+        TextSize = 18,
+        Font = Enum.Font.GothamBold,
+        Visible = false,
+        ZIndex = 50
+    })
+    Corner(minimizedBubble, 99)
+    Stroke(minimizedBubble, Color3.fromRGB(255, 255, 255), 1, 0.75)
+
+    local bubbleScale = New("UIScale", {
+        Scale = 1,
+        Parent = minimizedBubble
+    })
+
+    minimizedBubble.MouseEnter:Connect(function()
+        Tween(bubbleScale, {Scale = 1.08})
+    end)
+
+    minimizedBubble.MouseLeave:Connect(function()
+        Tween(bubbleScale, {Scale = 1})
+    end)
+
     local sidebar = New("Frame", {
         BackgroundColor3 = Theme.Surface,
         BorderSizePixel = 0,
@@ -329,16 +358,7 @@ function VNDT:CreateWindow(config)
         Parent = main
     })
 
-    local pageLayout = New("UIPageLayout", {
-        FillDirection = Enum.FillDirection.Horizontal,
-        EasingDirection = Enum.EasingDirection.Out,
-        EasingStyle = Enum.EasingStyle.Quad,
-        TweenTime = 0.2,
-        GamepadInputEnabled = false,
-        ScrollWheelInputEnabled = false,
-        TouchInputEnabled = false,
-        Parent = pages
-    })
+    local pageLayout = nil
 
     local self = setmetatable({
         Gui = gui,
@@ -352,7 +372,8 @@ function VNDT:CreateWindow(config)
         Tabs = {},
         SelectedTab = nil,
         Minimized = false,
-        OriginalSize = main.Size
+        OriginalSize = main.Size,
+        MinimizedBubble = minimizedBubble
     }, Window)
 
     MakeDraggable(topbar, main)
@@ -368,22 +389,32 @@ function VNDT:CreateWindow(config)
         )
     end)
 
-    minimize.MouseButton1Click:Connect(function()
-        self.Minimized = not self.Minimized
+    local function setMinimized(state)
+        self.Minimized = state == true
 
         if self.Minimized then
-            self.OriginalSize = main.Size
-            Tween(main, {
-                Size = UDim2.fromOffset(main.AbsoluteSize.X, 54)
-            })
-            minimize.Text = "+"
+            main.Visible = false
+            shadow.Visible = false
+            minimizedBubble.Visible = true
         else
-            Tween(main, {
-                Size = self.OriginalSize
-            })
-            minimize.Text = "—"
+            minimizedBubble.Visible = false
+            shadow.Visible = true
+            main.Visible = true
+
+            bubbleScale.Scale = 0.88
+            Tween(bubbleScale, {Scale = 1}, 0.14)
         end
+    end
+
+    minimize.MouseButton1Click:Connect(function()
+        setMinimized(true)
     end)
+
+    minimizedBubble.MouseButton1Click:Connect(function()
+        setMinimized(false)
+    end)
+
+
 
     close.MouseEnter:Connect(function()
         Tween(close, {
@@ -460,6 +491,8 @@ function Window:CreateTab(name)
         ScrollBarThickness = UserInputService.TouchEnabled and 5 or 3,
         ScrollBarImageColor3 = Theme.Accent,
         ScrollingDirection = Enum.ScrollingDirection.Y,
+        Visible = false,
+        LayoutOrder = #self.Tabs + 1,
         Parent = self.Pages
     })
 
@@ -522,6 +555,8 @@ function Window:SelectTab(tab)
     for _, current in ipairs(self.Tabs) do
         local selected = current == tab
 
+        current.Page.Visible = selected
+
         Tween(current.Button, {
             BackgroundColor3 = selected and Theme.Surface2 or Theme.Surface
         })
@@ -534,8 +569,6 @@ function Window:SelectTab(tab)
             BackgroundTransparency = selected and 0 or 1
         })
     end
-
-    self.PageLayout:JumpTo(tab.Page)
 end
 
 function Window:Notify(config)
@@ -629,58 +662,76 @@ function Tab:CreateMultiDropdown(config)
     local query = ""
     local maxListHeight = config.MaxHeight or 185
 
-    local holder = new("Frame", {
+    local holder = New("Frame", {
         BackgroundColor3 = Theme.Surface,
         BorderSizePixel = 0,
         Size = UDim2.new(1, 0, 0, 54),
         ClipsDescendants = true,
         Parent = self.Page
     })
-    corner(holder, 10)
-    stroke(holder, Theme.Stroke, 1, 0.22)
+    Corner(holder, 10)
+    Stroke(holder, Theme.Stroke, 1, 0.22)
 
-    local header = makeButton(holder, {
+    local header = Button(holder, {
         BackgroundTransparency = 1,
         Size = UDim2.new(1, 0, 0, 54)
     })
 
-    local title = textLabel(header, config.Name or "Multi Select", 12, Theme.Muted, Enum.Font.GothamMedium)
+    local title = Label(
+        header,
+        config.Name or "Multi Select",
+        12,
+        Theme.Muted,
+        Enum.Font.GothamMedium
+    )
     title.Position = UDim2.fromOffset(13, 4)
     title.Size = UDim2.new(0.48, -13, 0, 22)
 
-    local summary = textLabel(header, config.Placeholder or "None selected", 11, Theme.Text, Enum.Font.Gotham)
-    summary.Position = UDim2.fromOffset(13, 26)
-    summary.Size = UDim2.new(1, -48, 0, 21)
+    local summary = Label(
+        header,
+        config.Placeholder or "None selected",
+        11,
+        Theme.Text,
+        Enum.Font.Gotham
+    )
+    summary.Position = UDim2.fromOffset(13, 27)
+    summary.Size = UDim2.new(1, -48, 0, 20)
     summary.TextTruncate = Enum.TextTruncate.AtEnd
 
-    local arrow = textLabel(header, "⌄", 14, Theme.Muted, Enum.Font.GothamBold)
+    local arrow = Label(
+        header,
+        "⌄",
+        14,
+        Theme.Muted,
+        Enum.Font.GothamBold
+    )
     arrow.AnchorPoint = Vector2.new(1, 0)
     arrow.Position = UDim2.new(1, -12, 0, 0)
     arrow.Size = UDim2.fromOffset(22, 54)
     arrow.TextXAlignment = Enum.TextXAlignment.Center
 
-    local body = new("Frame", {
+    local body = New("Frame", {
         BackgroundTransparency = 1,
         Position = UDim2.fromOffset(8, 54),
         Size = UDim2.new(1, -16, 0, 0),
         Parent = holder
     })
 
-    local searchHeight = searchable and 34 or 0
+    local searchHeight = searchable and 38 or 0
     local searchBox
 
     if searchable then
-        local searchHolder = new("Frame", {
-            Position = UDim2.fromOffset(0, 3),
+        local searchHolder = New("Frame", {
+            Position = UDim2.fromOffset(0, 4),
             Size = UDim2.new(1, 0, 0, 30),
             BackgroundColor3 = Theme.Surface2,
             BorderSizePixel = 0,
             Parent = body
         })
-        corner(searchHolder, 8)
-        stroke(searchHolder, Theme.Stroke, 1, 0.3)
+        Corner(searchHolder, 8)
+        Stroke(searchHolder, Theme.Stroke, 1, 0.3)
 
-        searchBox = new("TextBox", {
+        searchBox = New("TextBox", {
             BackgroundTransparency = 1,
             Position = UDim2.fromOffset(10, 0),
             Size = UDim2.new(1, -20, 1, 0),
@@ -696,11 +747,11 @@ function Tab:CreateMultiDropdown(config)
         })
     end
 
-    local list = new("ScrollingFrame", {
+    local list = New("ScrollingFrame", {
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
-        Position = UDim2.fromOffset(0, searchHeight + 4),
-        Size = UDim2.new(1, 0, 0, maxListHeight),
+        Position = UDim2.fromOffset(0, searchHeight),
+        Size = UDim2.new(1, 0, 0, 36),
         CanvasSize = UDim2.new(),
         ScrollBarThickness = UserInputService.TouchEnabled and 5 or 3,
         ScrollBarImageColor3 = Theme.Accent,
@@ -708,16 +759,16 @@ function Tab:CreateMultiDropdown(config)
         Parent = body
     })
 
-    local listLayout = new("UIListLayout", {
+    local listLayout = New("UIListLayout", {
         Padding = UDim.new(0, 5),
         SortOrder = Enum.SortOrder.LayoutOrder,
         Parent = list
     })
-    setCanvas(list, listLayout, 4)
+    UpdateCanvas(list, listLayout, 4)
 
     local optionButtons = {}
 
-    local function selectedCount()
+    local function countSelected()
         local count = 0
         for _, option in ipairs(options) do
             if selected[option] == true then
@@ -728,8 +779,9 @@ function Tab:CreateMultiDropdown(config)
     end
 
     local function updateSummary()
-        local count = selectedCount()
-        if count == 0 then
+        local count = countSelected()
+
+        if count <= 0 then
             summary.Text = config.Placeholder or "None selected"
             summary.TextColor3 = Theme.Muted
             return
@@ -750,38 +802,58 @@ function Tab:CreateMultiDropdown(config)
     end
 
     local function matchesSearch(option)
-        if query == "" then return true end
-        return string.find(string.lower(tostring(option)), query, 1, true) ~= nil
+        if query == "" then
+            return true
+        end
+
+        return string.find(
+            string.lower(tostring(option)),
+            query,
+            1,
+            true
+        ) ~= nil
     end
 
-    local function updateBodyHeight()
+    local function updateBodySize(animate)
         local visibleCount = 0
+
         for _, button in pairs(optionButtons) do
             if button.Visible then
                 visibleCount += 1
             end
         end
 
-        local listHeight = math.min(maxListHeight, math.max(36, visibleCount * 39))
+        local listHeight = math.min(
+            maxListHeight,
+            math.max(36, visibleCount * 39)
+        )
+
         list.Size = UDim2.new(1, 0, 0, listHeight)
-        body.Size = UDim2.new(1, -16, 0, searchHeight + listHeight + 10)
+        local bodyHeight = searchHeight + listHeight + 8
+        body.Size = UDim2.new(1, -16, 0, bodyHeight)
 
         if opened then
-            holder.Size = UDim2.new(1, 0, 0, 54 + body.Size.Y.Offset)
+            local goal = {Size = UDim2.new(1, 0, 0, 54 + bodyHeight)}
+
+            if animate then
+                Tween(holder, goal)
+            else
+                holder.Size = goal.Size
+            end
         end
     end
 
-    local function renderOptions()
+    local function render()
         for option, button in pairs(optionButtons) do
             local active = selected[option] == true
+            button.Visible = matchesSearch(option)
             button.Text = (active and "✓  " or "    ") .. tostring(option)
             button.BackgroundColor3 = active and Theme.Surface3 or Theme.Surface2
             button.TextColor3 = active and Theme.Text or Theme.Muted
-            button.Visible = matchesSearch(option)
         end
 
         updateSummary()
-        updateBodyHeight()
+        updateBodySize(false)
     end
 
     local function rebuild()
@@ -794,7 +866,7 @@ function Tab:CreateMultiDropdown(config)
         table.clear(optionButtons)
 
         for index, option in ipairs(options) do
-            local button = makeButton(list, {
+            local optionButton = Button(list, {
                 LayoutOrder = index,
                 Size = UDim2.new(1, -2, 0, 34),
                 BackgroundColor3 = Theme.Surface2,
@@ -804,43 +876,66 @@ function Tab:CreateMultiDropdown(config)
                 Font = Enum.Font.Gotham,
                 TextXAlignment = Enum.TextXAlignment.Left
             })
-            corner(button, 8)
-            padding(button, 10, 10, 0, 0)
-            optionButtons[option] = button
 
-            button.MouseButton1Click:Connect(function()
+            New("UIPadding", {
+                PaddingLeft = UDim.new(0, 10),
+                PaddingRight = UDim.new(0, 10),
+                Parent = optionButton
+            })
+
+            Corner(optionButton, 8)
+            optionButtons[option] = optionButton
+
+            optionButton.MouseEnter:Connect(function()
+                if selected[option] ~= true then
+                    Tween(optionButton, {BackgroundColor3 = Theme.Surface3})
+                end
+            end)
+
+            optionButton.MouseLeave:Connect(function()
+                if selected[option] ~= true then
+                    Tween(optionButton, {BackgroundColor3 = Theme.Surface2})
+                end
+            end)
+
+            optionButton.MouseButton1Click:Connect(function()
                 selected[option] = not (selected[option] == true)
-                renderOptions()
+                render()
 
                 if config.Callback then
-                    task.spawn(config.Callback, option, selected[option], selected)
+                    task.spawn(
+                        config.Callback,
+                        option,
+                        selected[option],
+                        selected
+                    )
                 end
             end)
         end
 
-        renderOptions()
+        render()
     end
 
-    local function setOpen(value)
+    local function setOpened(value)
         opened = value == true
 
         if opened then
-            updateBodyHeight()
-            tween(arrow, nil, {Rotation = 180})
+            updateBodySize(true)
+            Tween(arrow, {Rotation = 180})
         else
-            tween(holder, nil, {Size = UDim2.new(1, 0, 0, 54)})
-            tween(arrow, nil, {Rotation = 0})
+            Tween(holder, {Size = UDim2.new(1, 0, 0, 54)})
+            Tween(arrow, {Rotation = 0})
         end
     end
 
     header.MouseButton1Click:Connect(function()
-        setOpen(not opened)
+        setOpened(not opened)
     end)
 
     if searchBox then
         searchBox:GetPropertyChangedSignal("Text"):Connect(function()
             query = string.lower(searchBox.Text or "")
-            renderOptions()
+            render()
         end)
     end
 
@@ -852,7 +947,7 @@ function Tab:CreateMultiDropdown(config)
     end
 
     function api:Refresh(newOptions)
-        if newOptions then
+        if newOptions ~= nil then
             options = newOptions
         end
         rebuild()
@@ -862,7 +957,7 @@ function Tab:CreateMultiDropdown(config)
         return selected
     end
 
-    function api:SetSelected(map, fire)
+    function api:SetSelected(map, fireCallback)
         for key in pairs(selected) do
             selected[key] = nil
         end
@@ -873,21 +968,21 @@ function Tab:CreateMultiDropdown(config)
             end
         end
 
-        renderOptions()
+        render()
 
-        if fire and config.Callback then
+        if fireCallback and config.Callback then
             task.spawn(config.Callback, nil, nil, selected)
         end
     end
 
-    function api:Clear(fire)
+    function api:Clear(fireCallback)
         for key in pairs(selected) do
             selected[key] = nil
         end
 
-        renderOptions()
+        render()
 
-        if fire and config.Callback then
+        if fireCallback and config.Callback then
             task.spawn(config.Callback, nil, nil, selected)
         end
     end
@@ -969,7 +1064,11 @@ end
 function Tab:CreateButton(config)
     config = config or {}
 
-    local row = CreateRow(self, 44)
+    local hasDescription =
+        type(config.Description) == "string"
+        and config.Description ~= ""
+
+    local row = CreateRow(self, hasDescription and 58 or 44)
 
     local title = Label(
         row,
@@ -978,8 +1077,27 @@ function Tab:CreateButton(config)
         Theme.Text,
         Enum.Font.GothamMedium
     )
-    title.Position = UDim2.fromOffset(13, 0)
-    title.Size = UDim2.new(1, -48, 1, 0)
+    title.Position = hasDescription
+        and UDim2.fromOffset(13, 5)
+        or UDim2.fromOffset(13, 0)
+    title.Size = hasDescription
+        and UDim2.new(1, -50, 0, 23)
+        or UDim2.new(1, -50, 1, 0)
+
+    local description = nil
+
+    if hasDescription then
+        description = Label(
+            row,
+            config.Description,
+            10,
+            Theme.Muted,
+            Enum.Font.Gotham
+        )
+        description.Position = UDim2.fromOffset(13, 29)
+        description.Size = UDim2.new(1, -50, 0, 18)
+        description.TextTruncate = Enum.TextTruncate.AtEnd
+    end
 
     local arrow = Label(
         row,
@@ -988,9 +1106,9 @@ function Tab:CreateButton(config)
         Theme.Muted,
         Enum.Font.Gotham
     )
-    arrow.AnchorPoint = Vector2.new(1, 0)
-    arrow.Position = UDim2.new(1, -13, 0, 0)
-    arrow.Size = UDim2.fromOffset(20, hasDescription and 58 or 44)
+    arrow.AnchorPoint = Vector2.new(1, 0.5)
+    arrow.Position = UDim2.new(1, -13, 0.5, 0)
+    arrow.Size = UDim2.fromOffset(20, 30)
     arrow.TextXAlignment = Enum.TextXAlignment.Center
 
     local click = Button(row, {
@@ -1020,6 +1138,12 @@ function Tab:CreateButton(config)
         title.Text = tostring(value)
     end
 
+    function api:SetDescription(value)
+        if description then
+            description.Text = tostring(value or "")
+        end
+    end
+
     return api
 end
 
@@ -1027,7 +1151,11 @@ function Tab:CreateToggle(config)
     config = config or {}
 
     local value = config.Default == true
-    local row = CreateRow(self, 48)
+    local hasDescription =
+        type(config.Description) == "string"
+        and config.Description ~= ""
+
+    local row = CreateRow(self, hasDescription and 58 or 48)
 
     local title = Label(
         row,
@@ -1036,8 +1164,27 @@ function Tab:CreateToggle(config)
         Theme.Text,
         Enum.Font.GothamMedium
     )
-    title.Position = UDim2.fromOffset(13, 0)
-    title.Size = UDim2.new(1, -72, 1, 0)
+    title.Position = hasDescription
+        and UDim2.fromOffset(13, 5)
+        or UDim2.fromOffset(13, 0)
+    title.Size = hasDescription
+        and UDim2.new(1, -76, 0, 23)
+        or UDim2.new(1, -76, 1, 0)
+
+    local description = nil
+
+    if hasDescription then
+        description = Label(
+            row,
+            config.Description,
+            10,
+            Theme.Muted,
+            Enum.Font.Gotham
+        )
+        description.Position = UDim2.fromOffset(13, 29)
+        description.Size = UDim2.new(1, -76, 0, 18)
+        description.TextTruncate = Enum.TextTruncate.AtEnd
+    end
 
     local track = New("Frame", {
         AnchorPoint = Vector2.new(1, 0.5),
@@ -1068,7 +1215,7 @@ function Tab:CreateToggle(config)
 
     local api = {}
 
-    local function Render(fireCallback)
+    local function render(fireCallback)
         Tween(track, {
             BackgroundColor3 = value and Theme.Accent or Theme.Surface3
         })
@@ -1086,22 +1233,22 @@ function Tab:CreateToggle(config)
 
     function api:Set(newValue)
         value = newValue == true
-        Render(true)
+        render(true)
     end
 
     function api:Get()
         return value
     end
 
-    function api:SetDescription(v)
+    function api:SetDescription(newDescription)
         if description then
-            description.Text = tostring(v or "")
+            description.Text = tostring(newDescription or "")
         end
     end
 
     click.MouseButton1Click:Connect(function()
         value = not value
-        Render(true)
+        render(true)
     end)
 
     return api
