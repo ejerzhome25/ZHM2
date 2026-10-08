@@ -215,146 +215,371 @@ function VNDT:CreateWindow(cfg)
     Stroke(main,Theme.Stroke,1,.04)
     Gradient(main,Theme.Background,Theme.Background2,90)
 
-    --// Dark Alien background only
-    --// Keeps the rest of the Nebula UI/components unchanged.
+    --// SCI-FI BACKGROUND ONLY
+    --// IMPORTANT: everything after this block remains the original VNDT Nebula UI.
     local alienLayer=New("Frame",{
-        Name="VNDT_AlienBackground",
-        BackgroundColor3=Color3.fromRGB(7,9,10),
+        Name="VNDT_SciFiBackground",
+        BackgroundColor3=Color3.fromRGB(6,8,11),
         BorderSizePixel=0,
         Size=UDim2.fromScale(1,1),
         ZIndex=0,
+        ClipsDescendants=true,
         Parent=main
     })
     Corner(alienLayer,24)
-    Gradient(alienLayer,Color3.fromRGB(18,23,24),Color3.fromRGB(5,7,8),115)
 
-    -- soft alien energy glows
+    local alienBaseGradient=New("UIGradient",{
+        Color=ColorSequence.new({
+            ColorSequenceKeypoint.new(0,Color3.fromRGB(17,22,29)),
+            ColorSequenceKeypoint.new(.42,Color3.fromRGB(8,11,16)),
+            ColorSequenceKeypoint.new(1,Color3.fromRGB(4,6,9))
+        }),
+        Rotation=118,
+        Parent=alienLayer
+    })
+
+    -- soft cinematic sci-fi energy clouds
     local glowA=New("Frame",{
         AnchorPoint=Vector2.new(.5,.5),
-        Position=UDim2.new(1,-30,0,55),
-        Size=UDim2.fromOffset(300,220),
-        BackgroundColor3=Color3.fromRGB(50,255,174),
-        BackgroundTransparency=.93,
+        Position=UDim2.new(1,-28,0,48),
+        Size=UDim2.fromOffset(330,245),
+        BackgroundColor3=Color3.fromRGB(55,255,209),
+        BackgroundTransparency=.945,
         BorderSizePixel=0,
         ZIndex=0,
         Parent=alienLayer
     })
     Corner(glowA,999)
-    local glowAGradient=Gradient(glowA,Color3.fromRGB(72,255,180),Color3.fromRGB(20,80,70),35)
+    local glowAGradient=New("UIGradient",{
+        Color=ColorSequence.new({
+            ColorSequenceKeypoint.new(0,Color3.fromRGB(76,255,215)),
+            ColorSequenceKeypoint.new(.55,Color3.fromRGB(31,129,128)),
+            ColorSequenceKeypoint.new(1,Color3.fromRGB(8,28,42))
+        }),
+        Rotation=30,
+        Transparency=NumberSequence.new({
+            NumberSequenceKeypoint.new(0,.35),
+            NumberSequenceKeypoint.new(.58,.78),
+            NumberSequenceKeypoint.new(1,1)
+        }),
+        Parent=glowA
+    })
 
     local glowB=New("Frame",{
         AnchorPoint=Vector2.new(.5,.5),
-        Position=UDim2.new(0,35,1,-20),
-        Size=UDim2.fromOffset(260,190),
-        BackgroundColor3=Color3.fromRGB(70,160,255),
-        BackgroundTransparency=.95,
+        Position=UDim2.new(0,32,1,-10),
+        Size=UDim2.fromOffset(300,225),
+        BackgroundColor3=Color3.fromRGB(78,121,255),
+        BackgroundTransparency=.955,
         BorderSizePixel=0,
         ZIndex=0,
         Parent=alienLayer
     })
     Corner(glowB,999)
-    local glowBGradient=Gradient(glowB,Color3.fromRGB(80,190,255),Color3.fromRGB(60,35,110),-35)
+    local glowBGradient=New("UIGradient",{
+        Color=ColorSequence.new({
+            ColorSequenceKeypoint.new(0,Color3.fromRGB(96,133,255)),
+            ColorSequenceKeypoint.new(.55,Color3.fromRGB(75,62,175)),
+            ColorSequenceKeypoint.new(1,Color3.fromRGB(20,20,55))
+        }),
+        Rotation=-35,
+        Transparency=NumberSequence.new({
+            NumberSequenceKeypoint.new(0,.42),
+            NumberSequenceKeypoint.new(.62,.82),
+            NumberSequenceKeypoint.new(1,1)
+        }),
+        Parent=glowB
+    })
 
-    -- faint bio-tech grid
+    local glowC=New("Frame",{
+        AnchorPoint=Vector2.new(.5,.5),
+        Position=UDim2.fromScale(.52,.47),
+        Size=UDim2.fromOffset(255,175),
+        BackgroundColor3=Color3.fromRGB(140,255,187),
+        BackgroundTransparency=.978,
+        BorderSizePixel=0,
+        ZIndex=0,
+        Parent=alienLayer
+    })
+    Corner(glowC,999)
+
+    -- faint holographic perspective grid
     local grid=New("Frame",{
-        Name="AlienGrid",
+        Name="SciFiGrid",
         BackgroundTransparency=1,
         Size=UDim2.fromScale(1,1),
         ZIndex=0,
         Parent=alienLayer
     })
 
-    for i=1,6 do
-        New("Frame",{
-            BackgroundColor3=(i%2==0) and Color3.fromRGB(74,255,187) or Color3.fromRGB(85,150,180),
-            BackgroundTransparency=.965,
+    for i=1,7 do
+        local horizontal=New("Frame",{
+            BackgroundColor3=(i%2==0) and Color3.fromRGB(73,255,210) or Color3.fromRGB(77,131,224),
+            BackgroundTransparency=.968,
             BorderSizePixel=0,
-            Position=UDim2.new(0,0,i/7,0),
+            Position=UDim2.new(0,0,i/8,0),
             Size=UDim2.new(1,0,0,1),
             ZIndex=0,
             Parent=grid
         })
+
+        TweenService:Create(
+            horizontal,
+            TweenInfo.new(3.8+(i*.22),Enum.EasingStyle.Sine,Enum.EasingDirection.InOut,-1,true),
+            {BackgroundTransparency=.985}
+        ):Play()
     end
 
-    for i=1,8 do
+    for i=1,10 do
         New("Frame",{
-            BackgroundColor3=(i%3==0) and Color3.fromRGB(74,255,187) or Color3.fromRGB(85,150,180),
-            BackgroundTransparency=.975,
+            BackgroundColor3=(i%3==0) and Color3.fromRGB(73,255,210) or Color3.fromRGB(77,131,224),
+            BackgroundTransparency=.979,
             BorderSizePixel=0,
-            Position=UDim2.new(i/9,0,0,0),
+            Position=UDim2.new(i/11,0,0,0),
             Size=UDim2.new(0,1,1,0),
             ZIndex=0,
             Parent=grid
         })
     end
 
-    -- sparse alien nodes
+    -- thin diagonal HUD traces
+    for i=1,5 do
+        local trace=New("Frame",{
+            AnchorPoint=Vector2.new(.5,.5),
+            Position=UDim2.new(.14*i,0,.16*i,0),
+            Size=UDim2.fromOffset(175+(i*10),1),
+            BackgroundColor3=(i%2==0) and Color3.fromRGB(72,255,212) or Color3.fromRGB(87,136,255),
+            BackgroundTransparency=.968,
+            BorderSizePixel=0,
+            Rotation=(i%2==0) and -24 or 24,
+            ZIndex=0,
+            Parent=alienLayer
+        })
+
+        TweenService:Create(
+            trace,
+            TweenInfo.new(4.2+(i*.35),Enum.EasingStyle.Sine,Enum.EasingDirection.InOut,-1,true),
+            {BackgroundTransparency=.992}
+        ):Play()
+    end
+
+    -- animated alien signal nodes
     local nodePositions={
-        {.10,.20},{.25,.72},{.41,.31},{.58,.78},{.73,.18},{.88,.56}
+        {.08,.17},{.17,.55},{.27,.78},{.36,.31},{.48,.64},
+        {.61,.22},{.70,.74},{.79,.39},{.90,.20},{.92,.68}
     }
+
     for index,pos in ipairs(nodePositions) do
+        local nodeSize=(index%3==0) and 5 or 3
         local node=New("Frame",{
             AnchorPoint=Vector2.new(.5,.5),
             Position=UDim2.fromScale(pos[1],pos[2]),
-            Size=UDim2.fromOffset(index%2==0 and 5 or 4,index%2==0 and 5 or 4),
-            BackgroundColor3=index%2==0 and Color3.fromRGB(102,255,173) or Color3.fromRGB(76,182,255),
-            BackgroundTransparency=.32,
+            Size=UDim2.fromOffset(nodeSize,nodeSize),
+            BackgroundColor3=(index%2==0) and Color3.fromRGB(75,255,211) or Color3.fromRGB(88,141,255),
+            BackgroundTransparency=.28,
             BorderSizePixel=0,
             ZIndex=1,
             Parent=alienLayer
         })
         Corner(node,999)
+
+        local nodeStroke=Stroke(node,(index%2==0) and Color3.fromRGB(75,255,211) or Color3.fromRGB(88,141,255),1,.50)
+
+        TweenService:Create(
+            node,
+            TweenInfo.new(1.5+(index*.17),Enum.EasingStyle.Sine,Enum.EasingDirection.InOut,-1,true),
+            {
+                BackgroundTransparency=.78,
+                Size=UDim2.fromOffset(nodeSize+3,nodeSize+3)
+            }
+        ):Play()
+
+        TweenService:Create(
+            nodeStroke,
+            TweenInfo.new(1.6+(index*.14),Enum.EasingStyle.Sine,Enum.EasingDirection.InOut,-1,true),
+            {Transparency=.88}
+        ):Play()
     end
 
-    -- moving scanner beam
+    -- floating micro-particles
+    local particleHolder=New("Frame",{
+        Name="SciFiParticles",
+        BackgroundTransparency=1,
+        Size=UDim2.fromScale(1,1),
+        ZIndex=0,
+        Parent=alienLayer
+    })
+
+    local particleSeed={
+        {.08,.34,.018,-.025},{.15,.76,-.012,.022},{.23,.20,.024,.017},
+        {.31,.58,-.021,-.019},{.39,.85,.015,-.026},{.47,.27,-.017,.021},
+        {.55,.69,.022,-.017},{.63,.14,-.014,.026},{.71,.52,.019,.020},
+        {.78,.82,-.022,-.016},{.86,.30,.016,.025},{.92,.61,-.018,-.022}
+    }
+
+    for index,data in ipairs(particleSeed) do
+        local particleSize=(index%4==0) and 3 or 2
+        local particle=New("Frame",{
+            AnchorPoint=Vector2.new(.5,.5),
+            Position=UDim2.fromScale(data[1],data[2]),
+            Size=UDim2.fromOffset(particleSize,particleSize),
+            BackgroundColor3=(index%3==0) and Color3.fromRGB(92,146,255) or Color3.fromRGB(77,255,215),
+            BackgroundTransparency=.50,
+            BorderSizePixel=0,
+            ZIndex=1,
+            Parent=particleHolder
+        })
+        Corner(particle,999)
+
+        TweenService:Create(
+            particle,
+            TweenInfo.new(3+(index*.19),Enum.EasingStyle.Sine,Enum.EasingDirection.InOut,-1,true),
+            {
+                Position=UDim2.fromScale(
+                    math.clamp(data[1]+data[3],.03,.97),
+                    math.clamp(data[2]+data[4],.03,.97)
+                ),
+                BackgroundTransparency=.86
+            }
+        ):Play()
+    end
+
+    -- horizontal holographic scanner
     local scan=New("Frame",{
-        Name="AlienScan",
-        BackgroundColor3=Color3.fromRGB(79,255,186),
-        BackgroundTransparency=.94,
+        Name="SciFiScan",
+        BackgroundColor3=Color3.fromRGB(71,255,213),
+        BackgroundTransparency=.95,
         BorderSizePixel=0,
-        Position=UDim2.new(0,0,0,-22),
-        Size=UDim2.new(1,0,0,22),
+        Position=UDim2.new(0,0,0,-24),
+        Size=UDim2.new(1,0,0,24),
         ZIndex=1,
         Parent=alienLayer
     })
-    local scanGradient=New("UIGradient",{
+
+    New("UIGradient",{
         Color=ColorSequence.new({
-            ColorSequenceKeypoint.new(0,Color3.fromRGB(55,170,135)),
-            ColorSequenceKeypoint.new(.5,Color3.fromRGB(104,255,190)),
-            ColorSequenceKeypoint.new(1,Color3.fromRGB(55,170,135))
+            ColorSequenceKeypoint.new(0,Color3.fromRGB(35,88,99)),
+            ColorSequenceKeypoint.new(.5,Color3.fromRGB(91,255,221)),
+            ColorSequenceKeypoint.new(1,Color3.fromRGB(35,88,99))
         }),
         Transparency=NumberSequence.new({
             NumberSequenceKeypoint.new(0,1),
-            NumberSequenceKeypoint.new(.5,.72),
+            NumberSequenceKeypoint.new(.5,.68),
             NumberSequenceKeypoint.new(1,1)
         }),
         Parent=scan
     })
 
-    local scanTween=TweenService:Create(
+    TweenService:Create(
         scan,
-        TweenInfo.new(7,Enum.EasingStyle.Linear,Enum.EasingDirection.Out,-1,false,1.2),
-        {Position=UDim2.new(0,0,1,8)}
-    )
-    scanTween:Play()
+        TweenInfo.new(6.8,Enum.EasingStyle.Linear,Enum.EasingDirection.Out,-1,false,1.1),
+        {Position=UDim2.new(0,0,1,10)}
+    ):Play()
 
-    -- very slow background motion only; no per-frame loops
+    -- slow diagonal light sweep
+    local sweep=New("Frame",{
+        Name="SciFiLightSweep",
+        BackgroundColor3=Color3.fromRGB(98,145,255),
+        BackgroundTransparency=.973,
+        BorderSizePixel=0,
+        Position=UDim2.new(-.20,0,-.05,0),
+        Size=UDim2.new(0,70,1.1,0),
+        Rotation=9,
+        ZIndex=0,
+        Parent=alienLayer
+    })
+
+    New("UIGradient",{
+        Color=ColorSequence.new({
+            ColorSequenceKeypoint.new(0,Color3.fromRGB(34,51,95)),
+            ColorSequenceKeypoint.new(.5,Color3.fromRGB(104,151,255)),
+            ColorSequenceKeypoint.new(1,Color3.fromRGB(34,51,95))
+        }),
+        Transparency=NumberSequence.new({
+            NumberSequenceKeypoint.new(0,1),
+            NumberSequenceKeypoint.new(.5,.82),
+            NumberSequenceKeypoint.new(1,1)
+        }),
+        Rotation=0,
+        Parent=sweep
+    })
+
+    TweenService:Create(
+        sweep,
+        TweenInfo.new(9.5,Enum.EasingStyle.Linear,Enum.EasingDirection.Out,-1,false,.5),
+        {Position=UDim2.new(1.14,0,-.05,0)}
+    ):Play()
+
+    -- animated background energy rail
+    local bgRail=New("Frame",{
+        Name="SciFiEnergyRail",
+        BackgroundColor3=Color3.fromRGB(74,255,211),
+        BorderSizePixel=0,
+        Size=UDim2.new(1,0,0,2),
+        ZIndex=1,
+        Parent=alienLayer
+    })
+
+    local railGradient=New("UIGradient",{
+        Color=ColorSequence.new({
+            ColorSequenceKeypoint.new(0,Color3.fromRGB(91,139,255)),
+            ColorSequenceKeypoint.new(.30,Color3.fromRGB(70,255,212)),
+            ColorSequenceKeypoint.new(.68,Color3.fromRGB(166,255,188)),
+            ColorSequenceKeypoint.new(1,Color3.fromRGB(91,139,255))
+        }),
+        Parent=bgRail
+    })
+
+    TweenService:Create(
+        railGradient,
+        TweenInfo.new(6,Enum.EasingStyle.Linear,Enum.EasingDirection.Out,-1,false),
+        {Rotation=360}
+    ):Play()
+
+    -- slow ambient pulse; no RenderStepped/per-frame loops
     TweenService:Create(
         glowA,
-        TweenInfo.new(4.5,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut,-1,true),
-        {BackgroundTransparency=.965,Size=UDim2.fromOffset(330,240)}
+        TweenInfo.new(5.2,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut,-1,true),
+        {
+            Size=UDim2.fromOffset(365,270),
+            BackgroundTransparency=.972
+        }
     ):Play()
 
     TweenService:Create(
         glowB,
-        TweenInfo.new(5.5,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut,-1,true),
-        {BackgroundTransparency=.975,Size=UDim2.fromOffset(285,205)}
+        TweenInfo.new(6.4,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut,-1,true),
+        {
+            Size=UDim2.fromOffset(325,245),
+            BackgroundTransparency=.980
+        }
+    ):Play()
+
+    TweenService:Create(
+        glowC,
+        TweenInfo.new(4.9,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut,-1,true),
+        {
+            Size=UDim2.fromOffset(288,198),
+            BackgroundTransparency=.990
+        }
     ):Play()
 
     TweenService:Create(
         glowAGradient,
-        TweenInfo.new(9,Enum.EasingStyle.Linear,Enum.EasingDirection.Out,-1,false),
-        {Rotation=395}
+        TweenInfo.new(11,Enum.EasingStyle.Linear,Enum.EasingDirection.Out,-1,false),
+        {Rotation=390}
+    ):Play()
+
+    TweenService:Create(
+        glowBGradient,
+        TweenInfo.new(13,Enum.EasingStyle.Linear,Enum.EasingDirection.Out,-1,false),
+        {Rotation=-395}
+    ):Play()
+
+    TweenService:Create(
+        alienBaseGradient,
+        TweenInfo.new(18,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut,-1,true),
+        {Rotation=145}
     ):Play()
 
     local accent=New("Frame",{
@@ -962,7 +1187,7 @@ function Tab:CreateMultiDropdown(cfg)
     return api
 end
 
-VNDT.Version="5.2-nebula-alien-bg"
+VNDT.Version="5.3-nebula-scifi-bg"
 VNDT.Theme=Theme
 
 return VNDT
