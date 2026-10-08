@@ -24,9 +24,9 @@ local Theme = {
     Surface4 = Color3.fromRGB(59,63,73),
     Stroke = Color3.fromRGB(79,82,94),
     StrokeSoft = Color3.fromRGB(65,68,79),
-    Text = Color3.fromRGB(252,252,255),
-    Muted = Color3.fromRGB(198,201,212),
-    Muted2 = Color3.fromRGB(162,167,183),
+    Text = Color3.fromRGB(255,255,255),
+    Muted = Color3.fromRGB(230,233,242),
+    Muted2 = Color3.fromRGB(205,210,224),
     Accent = Color3.fromRGB(139,120,255),
     Accent2 = Color3.fromRGB(69,181,255),
     Accent3 = Color3.fromRGB(211,115,255),
@@ -94,7 +94,7 @@ local function Label(p,text,size,color,font)
         Text=text or "",
         TextColor3=color or Theme.Text,
         TextSize=size or 14,
-        Font=font or Enum.Font.Gotham,
+        Font=font or Enum.Font.GothamSemibold,
         TextXAlignment=Enum.TextXAlignment.Left,
         TextYAlignment=Enum.TextYAlignment.Center,
         Parent=p
@@ -116,6 +116,76 @@ local function GuiParent()
     end)
     if ok and res then return res end
     return Player and Player:WaitForChild("PlayerGui") or game:GetService("CoreGui")
+end
+
+
+local DEFAULT_BACKGROUND_URL = "https://raw.githubusercontent.com/ejerzhome25/ZHM2/main/assets/vndt_nebula_background.jpg"
+local CachedDefaultBackgroundAsset = nil
+
+local function ResolveCustomAsset(source, cacheDefault)
+    if type(source) ~= "string" or source == "" then
+        return ""
+    end
+
+    -- Roblox-native assets can be used directly.
+    if source:match("^rbxasset") or source:match("^rbxthumb") then
+        return source
+    end
+
+    local assetLoader = getcustomasset or getsynasset
+    if not assetLoader and syn and syn.getcustomasset then
+        assetLoader = syn.getcustomasset
+    end
+
+    -- Executor path: download the image once and turn it into a local custom asset.
+    if source:match("^https?://") and writefile and assetLoader then
+        if cacheDefault and CachedDefaultBackgroundAsset then
+            return CachedDefaultBackgroundAsset
+        end
+
+        local okHttp, bytes = pcall(function()
+            return game:HttpGet(source)
+        end)
+
+        if okHttp and type(bytes) == "string" and #bytes > 0 then
+            local fileName = "VNDT_Nebula_Background_v2.jpg"
+            local okWrite = pcall(function()
+                writefile(fileName, bytes)
+            end)
+
+            if okWrite then
+                local okAsset, asset = pcall(function()
+                    return assetLoader(fileName)
+                end)
+
+                if okAsset and type(asset) == "string" and asset ~= "" then
+                    if cacheDefault then
+                        CachedDefaultBackgroundAsset = asset
+                    end
+                    return asset
+                end
+            end
+        end
+    end
+
+    -- Allows callers to provide any other Content string supported by their environment.
+    return source
+end
+
+local function GetBackgroundAsset(cfg)
+    if cfg.DisableBackground == true then
+        return ""
+    end
+
+    if type(cfg.BackgroundImage) == "string" and cfg.BackgroundImage ~= "" then
+        return ResolveCustomAsset(cfg.BackgroundImage, false)
+    end
+
+    if CachedDefaultBackgroundAsset then
+        return CachedDefaultBackgroundAsset
+    end
+
+    return ResolveCustomAsset(DEFAULT_BACKGROUND_URL, true)
 end
 
 local function Canvas(scroll,layout,extra)
@@ -152,6 +222,7 @@ end
 local function Row(parent,height)
     local r=New("Frame",{
         BackgroundColor3=Theme.Surface,
+        BackgroundTransparency=.08,
         BorderSizePixel=0,
         Size=UDim2.new(1,0,0,height or 50),
         Parent=parent
@@ -213,6 +284,24 @@ function VNDT:CreateWindow(cfg)
     Stroke(main,Theme.Stroke,1,.04)
     Gradient(main,Theme.Background,Theme.Background2,90)
 
+    local backgroundAsset = GetBackgroundAsset(cfg)
+    if backgroundAsset ~= "" then
+        local backgroundImage = New("ImageLabel",{
+            Name="VNDT_BackgroundImage",
+            BackgroundTransparency=1,
+            BorderSizePixel=0,
+            Size=UDim2.fromScale(1,1),
+            Position=UDim2.fromScale(0,0),
+            Image=backgroundAsset,
+            ImageColor3=cfg.BackgroundImageTint or Color3.fromRGB(162,164,176),
+            ImageTransparency=cfg.BackgroundImageTransparency or .08,
+            ScaleType=Enum.ScaleType.Crop,
+            ZIndex=1,
+            Parent=main
+        })
+        Corner(backgroundImage,24)
+    end
+
     local accent=New("Frame",{
         BackgroundColor3=Theme.Accent,
         BorderSizePixel=0,
@@ -224,7 +313,9 @@ function VNDT:CreateWindow(cfg)
     local topH=mobile and 58 or 64
     local top=New("Frame",{
         BackgroundColor3=Theme.Surface,
+        BackgroundTransparency=.10,
         BorderSizePixel=0,
+        ZIndex=2,
         Size=UDim2.new(1,0,0,topH),
         Parent=main
     })
@@ -261,7 +352,9 @@ function VNDT:CreateWindow(cfg)
 
     local sidebar=New("Frame",{
         BackgroundColor3=Theme.Surface,
+        BackgroundTransparency=.10,
         BorderSizePixel=0,
+        ZIndex=2,
         Position=mobile and UDim2.fromOffset(0,topH) or UDim2.fromOffset(0,topH),
         Size=mobile and UDim2.new(1,0,0,tabH) or UDim2.new(0,sideW,1,-topH),
         Parent=main
@@ -297,6 +390,7 @@ function VNDT:CreateWindow(cfg)
 
     local pages=New("Frame",{
         BackgroundTransparency=1,
+        ZIndex=2,
         Position=mobile and UDim2.fromOffset(0,topH+tabH) or UDim2.fromOffset(sideW,topH),
         Size=mobile and UDim2.new(1,0,1,-topH-tabH) or UDim2.new(1,-sideW,1,-topH),
         ClipsDescendants=true,
@@ -392,7 +486,7 @@ function Window:CreateTab(name)
     })
     Corner(line,999); Gradient(line,Theme.Accent3,Theme.Accent2,0)
 
-    local txt=Label(b,name or "Tab",13,Theme.Muted,Enum.Font.GothamSemibold)
+    local txt=Label(b,name or "Tab",14,Theme.Muted,Enum.Font.GothamBold)
     txt.Position=UDim2.fromOffset(14,0)
     txt.Size=UDim2.new(1,-20,1,0)
     txt.TextTruncate=Enum.TextTruncate.AtEnd
@@ -486,14 +580,14 @@ function Tab:CreateSection(text)
     local l=New("Frame",{BackgroundColor3=Theme.StrokeSoft,BorderSizePixel=0,Position=UDim2.new(0,0,.5,6),Size=UDim2.new(1,0,0,1),Parent=h})
     local chip=New("Frame",{BackgroundColor3=Theme.Background,BorderSizePixel=0,Size=UDim2.fromOffset(175,22),Parent=h})
     Corner(chip,999)
-    local tx=Label(chip,string.upper(text or "SECTION"),11,Theme.Muted,Enum.Font.GothamBold)
+    local tx=Label(chip,string.upper(text or "SECTION"),12,Theme.Text,Enum.Font.GothamBold)
     tx.Size=UDim2.new(1,0,1,0)
     return h
 end
 
 function Tab:CreateLabel(text)
     local r=Row(self.Page,44)
-    local tx=Label(r,text or "Label",13,Theme.Muted,Enum.Font.GothamSemibold)
+    local tx=Label(r,text or "Label",14,Theme.Text,Enum.Font.GothamBold)
     tx.Position=UDim2.fromOffset(14,0); tx.Size=UDim2.new(1,-28,1,0)
     return {
         Set=function(_,v) tx.Text=tostring(v) end,
@@ -512,7 +606,7 @@ function Tab:CreateButton(cfg)
 
     local d
     if desc then
-        d=Label(r,cfg.Description,11,Theme.Muted,Enum.Font.GothamMedium)
+        d=Label(r,cfg.Description,11,Theme.Muted,Enum.Font.GothamSemibold)
         d.Position=UDim2.fromOffset(14,31); d.Size=UDim2.new(1,-54,0,18); d.TextTruncate=Enum.TextTruncate.AtEnd
     end
 
@@ -541,7 +635,7 @@ function Tab:CreateToggle(cfg)
 
     local d
     if desc then
-        d=Label(r,cfg.Description,11,Theme.Muted,Enum.Font.GothamMedium)
+        d=Label(r,cfg.Description,11,Theme.Muted,Enum.Font.GothamSemibold)
         d.Position=UDim2.fromOffset(14,32); d.Size=UDim2.new(1,-82,0,18); d.TextTruncate=Enum.TextTruncate.AtEnd
     end
 
@@ -639,7 +733,7 @@ function Tab:CreateInput(cfg)
 
     local boxHolder=New("Frame",{AnchorPoint=Vector2.new(1,.5),Position=UDim2.new(1,-14,.5,0),Size=UDim2.new(.58,0,0,36),BackgroundColor3=Theme.Surface2,BorderSizePixel=0,Parent=r})
     Corner(boxHolder,12); Stroke(boxHolder,Theme.Stroke,1,.22); Gradient(boxHolder,Theme.Surface3,Theme.Surface2,90)
-    local box=New("TextBox",{BackgroundTransparency=1,Position=UDim2.fromOffset(10,0),Size=UDim2.new(1,-20,1,0),ClearTextOnFocus=false,Text=tostring(cfg.Default or ""),PlaceholderText=cfg.Placeholder or "Type...",PlaceholderColor3=Theme.Muted2,TextColor3=Theme.Text,TextSize=13,Font=Enum.Font.GothamSemibold,TextXAlignment=Enum.TextXAlignment.Left,Parent=boxHolder})
+    local box=New("TextBox",{BackgroundTransparency=1,Position=UDim2.fromOffset(10,0),Size=UDim2.new(1,-20,1,0),ClearTextOnFocus=false,Text=tostring(cfg.Default or ""),PlaceholderText=cfg.Placeholder or "Type...",PlaceholderColor3=Theme.Muted2,TextColor3=Theme.Text,TextSize=13,Font=Enum.Font.GothamBold,TextXAlignment=Enum.TextXAlignment.Left,Parent=boxHolder})
     box.FocusLost:Connect(function(enter) if cfg.Callback then task.spawn(cfg.Callback,box.Text,enter) end end)
 
     return {
@@ -663,8 +757,9 @@ function Tab:CreateDropdown(cfg)
 
     local chip=New("Frame",{AnchorPoint=Vector2.new(1,.5),Position=UDim2.new(1,-38,.5,0),Size=UDim2.fromOffset(182,32),BackgroundColor3=Theme.Surface3,BorderSizePixel=0,Parent=head})
     Corner(chip,999); Stroke(chip,Theme.Stroke,1,.18); Gradient(chip,Theme.Surface4,Theme.Surface3,0)
-    local summary=Label(chip,selected and tostring(selected) or (cfg.Placeholder or "Select"),12,Theme.Muted,Enum.Font.GothamSemibold)
+    local summary=Label(chip,selected and tostring(selected) or (cfg.Placeholder or "Select"),13,Theme.Text,Enum.Font.GothamBold)
     summary.Position=UDim2.fromOffset(12,0); summary.Size=UDim2.new(1,-34,1,0); summary.TextTruncate=Enum.TextTruncate.AtEnd
+    summary.TextTransparency=0
     local arrow=Label(chip,"›",17,Theme.Accent2,Enum.Font.GothamBold); arrow.AnchorPoint=Vector2.new(1,.5); arrow.Position=UDim2.new(1,-10,.5,0); arrow.Size=UDim2.fromOffset(14,14); arrow.TextXAlignment=Enum.TextXAlignment.Center; arrow.Rotation=90
 
     local list=New("ScrollingFrame",{BackgroundTransparency=1,BorderSizePixel=0,Position=UDim2.fromOffset(10,closed),Size=UDim2.new(1,-20,0,0),CanvasSize=UDim2.new(),ScrollBarThickness=5,ScrollBarImageColor3=Theme.Accent,Parent=holder})
@@ -684,7 +779,7 @@ function Tab:CreateDropdown(cfg)
         for _,c in ipairs(list:GetChildren()) do if c:IsA("TextButton") then c:Destroy() end end
         table.clear(buttons)
         for i,opt in ipairs(options) do
-            local b=Button(list,{LayoutOrder=i,Size=UDim2.new(1,0,0,40),BackgroundColor3=Theme.Surface2,Text=tostring(opt),TextColor3=Theme.Text,TextSize=12,Font=Enum.Font.GothamSemibold,TextXAlignment=Enum.TextXAlignment.Left})
+            local b=Button(list,{LayoutOrder=i,Size=UDim2.new(1,0,0,40),BackgroundColor3=Theme.Surface2,Text=tostring(opt),TextColor3=Theme.Text,TextSize=13,Font=Enum.Font.GothamBold,TextXAlignment=Enum.TextXAlignment.Left})
             Padding(b,12,12,0,0); Corner(b,12); Gradient(b,Theme.Surface3,Theme.Surface2,90)
             buttons[opt]=b
             b.MouseButton1Click:Connect(function()
@@ -728,12 +823,12 @@ function Tab:CreateMultiDropdown(cfg)
 
     local chip=New("Frame",{AnchorPoint=Vector2.new(1,.5),Position=UDim2.new(1,-38,.5,0),Size=UDim2.fromOffset(190,32),BackgroundColor3=Theme.Surface3,BorderSizePixel=0,Parent=head})
     Corner(chip,999); Stroke(chip,Theme.Stroke,1,.18); Gradient(chip,Theme.Surface4,Theme.Surface3,0)
-    local summary=Label(chip,cfg.Placeholder or "None selected",12,Theme.Muted,Enum.Font.GothamSemibold)
+    local summary=Label(chip,cfg.Placeholder or "None selected",13,Theme.Text,Enum.Font.GothamBold)
     summary.Position=UDim2.fromOffset(12,0); summary.Size=UDim2.new(1,-34,1,0); summary.TextTruncate=Enum.TextTruncate.AtEnd
     local arrow=Label(chip,"›",17,Theme.Accent2,Enum.Font.GothamBold); arrow.AnchorPoint=Vector2.new(1,.5); arrow.Position=UDim2.new(1,-10,.5,0); arrow.Size=UDim2.fromOffset(14,14); arrow.TextXAlignment=Enum.TextXAlignment.Center; arrow.Rotation=90
 
     local body=New("Frame",{BackgroundTransparency=1,Position=UDim2.fromOffset(10,closed),Size=UDim2.new(1,-20,0,0),Parent=holder})
-    local search=New("TextBox",{BackgroundColor3=Theme.Surface2,BorderSizePixel=0,Size=UDim2.new(1,0,0,34),ClearTextOnFocus=false,Text="",PlaceholderText=cfg.SearchPlaceholder or "Search...",PlaceholderColor3=Theme.Muted2,TextColor3=Theme.Text,TextSize=12,Font=Enum.Font.GothamSemibold,TextXAlignment=Enum.TextXAlignment.Left,Parent=body})
+    local search=New("TextBox",{BackgroundColor3=Theme.Surface2,BorderSizePixel=0,Size=UDim2.new(1,0,0,34),ClearTextOnFocus=false,Text="",PlaceholderText=cfg.SearchPlaceholder or "Search...",PlaceholderColor3=Theme.Muted2,TextColor3=Theme.Text,TextSize=13,Font=Enum.Font.GothamBold,TextXAlignment=Enum.TextXAlignment.Left,Parent=body})
     Corner(search,12); Padding(search,10,10,0,0)
 
     local list=New("ScrollingFrame",{BackgroundTransparency=1,BorderSizePixel=0,Position=UDim2.fromOffset(0,40),Size=UDim2.new(1,0,0,44),CanvasSize=UDim2.new(),ScrollBarThickness=5,ScrollBarImageColor3=Theme.Accent,Parent=body})
@@ -771,7 +866,7 @@ function Tab:CreateMultiDropdown(cfg)
         table.clear(rows)
         for _,opt in ipairs(options) do
             local f=New("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,40),Parent=list})
-            local b=Button(f,{Size=UDim2.fromScale(1,1),BackgroundColor3=Theme.Surface2,Text=tostring(opt),TextColor3=Theme.Text,TextSize=12,Font=Enum.Font.GothamSemibold,TextXAlignment=Enum.TextXAlignment.Left})
+            local b=Button(f,{Size=UDim2.fromScale(1,1),BackgroundColor3=Theme.Surface2,Text=tostring(opt),TextColor3=Theme.Text,TextSize=13,Font=Enum.Font.GothamBold,TextXAlignment=Enum.TextXAlignment.Left})
             Padding(b,12,42,0,0); Corner(b,12); Gradient(b,Theme.Surface3,Theme.Surface2,90)
             local mark=Label(b,"✓",12,Color3.new(1,1,1),Enum.Font.GothamBold); mark.AnchorPoint=Vector2.new(1,.5); mark.Position=UDim2.new(1,-14,.5,0); mark.Size=UDim2.fromOffset(18,18); mark.TextXAlignment=Enum.TextXAlignment.Center
             rows[opt]={frame=f,button=b,check=mark}
@@ -812,7 +907,7 @@ function Tab:CreateMultiDropdown(cfg)
     return api
 end
 
-VNDT.Version="5.0-nebula"
+VNDT.Version="5.1-nebula-anime"
 VNDT.Theme=Theme
 
 return VNDT
