@@ -31,11 +31,16 @@ local CUSTOM = {
         WindowTitle = "VNDT Nebula | Roll a Fisherman",
         HubName = "Automation Hub",
     },
-    -- Direct wheel spin based on the working MomongaHub network path.
+    -- Normal and Golden wheel remotes from the supplied dual-wheel controller.
     AutoSpin = {
         DefaultInterval = 5,
-        MinimumInterval = 1,
+        MinimumInterval = 0.5,
         MaximumInterval = 60,
+        SliderStep = 0.5,
+        FailedRetrySeconds = 5,
+    },
+    Diagnostics = {
+        QuietConsole = true, -- suppress only this script's own print/warn output
     },
     -- Direct SellAll job, independent of Gold Rush.
     AutoSellAll = {
@@ -64,7 +69,7 @@ local CUSTOM = {
         searchable multiple-selection list (same selected fisherman IDs).
       * The VNDT GitHub library does not contain AirFlow's config manager, so
         this adds optional local save/load if executor file APIs are present.
-      * Auto Spin uses MomongaHub's direct WheelSpin remote (no events gate).
+      * Auto Spin uses the supplied Normal + Golden wheel remotes independently.
       * No feature success is asserted without testing in the live game.
 ]]
 local function MakeVNDTAdapter(VNDT)
@@ -76,10 +81,14 @@ local function MakeVNDTAdapter(VNDT)
     local HttpService = game:GetService("HttpService")
     local appName = "Roll-a-Fisherman"
 
+    local function quietWarn(...)
+        if not CUSTOM.Diagnostics.QuietConsole then warn(...) end
+    end
+
     local function safeInvoke(fn, ...)
         if type(fn) ~= "function" then return end
         local ok, result = pcall(fn, ...)
-        if not ok then warn("[VNDT callback] " .. tostring(result)) end
+        if not ok then quietWarn("[VNDT callback] " .. tostring(result)) end
         return result
     end
 
@@ -176,164 +185,172 @@ local function MakeVNDTAdapter(VNDT)
         end
     end
 
-    -- Direct Auto Spin using native VNDT widgets, with the same WheelSpin network call.
-    -- Unlike the original wheel implementation, there is NO selected-event gate.
+    -- Native VNDT Nebula dual-wheel controller, adapted from the user's working script.
+    -- Normal and Golden have separate workers; no wheel event selection is required.
     local function installAutoSpin(realTab, window)
         if window.AutoSpinInstalled then return window.AutoSpinControl end
         window.AutoSpinInstalled = true
-
         local config = CUSTOM.AutoSpin
         local state = {
-            Enabled = false,
             Interval = config.DefaultInterval,
-            NextRun = 0,
-            Busy = false,
-            WorkerStarted = false,
-            Remote = nil,
-            Attempts = 0,
-            Spins = 0,
-            Refused = 0,
-            Errors = 0,
-            LastMessage = "Ready",
+            Net = nil,
+            Modes = {
+                Normal = {
+                    Key = "Normal", RemoteName = "WheelSpin", Enabled = false,
+                    Busy = false, Remote = nil, Attempts = 0, Responses = 0, Errors = 0,
+                    Status = "Disabled", NextRun = 0,
+                },
+                Golden = {
+                    Key = "Golden", RemoteName = "GoldenSpin", Enabled = true,
+                    Busy = false, Remote = nil, Attempts = 0, Responses = 0, Errors = 0,
+                    Status = "Connecting...", NextRun = 0,
+                },
+            },
         }
         window.AutoSpin = state
 
-        local status = realTab:CreateLabel("Auto Spin: OFF")
-        local function showStatus()
+        realTab:CreateLabel("Normal and Golden wheels run independently. Available spins required.")
+        local statusLabels = {}
+        local function showStatus(mode)
             if not window.Alive then return end
-            local mode = state.Enabled and "ON" or "OFF"
-            local remain = math.max(0, state.NextRun - os.clock())
-            local text = string.format("Auto Spin: %s | spins: %d | refused: %d | errors: %d",
-                mode, state.Spins, state.Refused, state.Errors)
-            if state.Enabled then
-                text = text .. string.format(" | next: %.1fs", remain)
+            local labels = statusLabels[mode.Key]
+            if not labels then return end
+            labels.Count:Set(string.format("%s: %s | attempts %d | results %d | errors %d",
+                mode.Key, mode.Enabled and "ON" or "OFF", mode.Attempts, mode.Responses, mode.Errors))
+            if not mode.Enabled and not mode.Busy then
+                labels.Detail:Set("Disabled")
+            elseif mode.Busy then
+                labels.Detail:Set("Waiting for " .. mode.RemoteName .. " response...")
+            elseif mode.NextRun > 0 then
+                labels.Detail:Set(string.format("%s | next %.1fs", mode.Status,
+                    math.max(0, mode.NextRun - os.clock())))
+            else
+                labels.Detail:Set(mode.Status)
             end
-            if state.LastMessage and state.LastMessage ~= "Ready" then
-                text = text .. " | " .. tostring(state.LastMessage):sub(1, 72)
-            end
-            status:Set(text)
         end
 
-        local function resolveSpinRemote()
-            if state.Remote then return state.Remote end
+        -- Resolve the exact ReplicatedStorage.Modules.Util.Net/NetClient path
+        -- used by the supplied VNDT normal + golden wheel controller.
+        local function getNet()
+            if state.Net then return state.Net end
             local replicated = game:GetService("ReplicatedStorage")
-            local modules = replicated:FindFirstChild("Modules")
-            local util = modules and modules:FindFirstChild("Util")
-            local netModule = util and util:FindFirstChild("Net")
-            if not netModule or not netModule:IsA("ModuleScript") then
-                error("Waiting for Modules.Util.Net")
-            end
-            if not replicated:FindFirstChild("NetClient") then
-                error("Waiting for NetClient")
-            end
-            local net = require(netModule)
-            assert(net and type(net.Function) == "function", "Net:Function unavailable")
-            local remote = net:Function("WheelSpin")
-            assert(remote and type(remote.InvokeServer) == "function", "WheelSpin function unavailable")
-            state.Remote = remote
+            local modules = assert(replicated:WaitForChild("Modules", 12), "Missing Modules")
+            local util = assert(modules:WaitForChild("Util", 12), "Missing Modules.Util")
+            local netModule = assert(util:WaitForChild("Net", 12), "Missing Modules.Util.Net")
+            assert(replicated:WaitForChild("NetClient", 12), "Missing NetClient")
+            state.Net = require(netModule)
+            return state.Net
+        end
+
+        local function resolveRemote(mode)
+            if mode.Remote then return mode.Remote end
+            local remote = getNet():Function(mode.RemoteName)
+            assert(remote and type(remote.InvokeServer) == "function",
+                mode.RemoteName .. " is not available")
+            mode.Remote = remote
             return remote
         end
 
-        local function sendSpinRequest()
-            if not window.Alive or state.Busy then return end
-            state.Busy = true
-            state.Attempts = state.Attempts + 1
-            local ok, result = pcall(function()
-                -- Exactly MomongaHub's wheel method: net:Function("WheelSpin"):InvokeServer()
-                return resolveSpinRemote():InvokeServer()
+        -- Each wheel has one worker; simultaneous calls for the same wheel
+        -- are prevented while an InvokeServer request is pending.
+        local function spinOnce(mode)
+            if not window.Alive or mode.Busy then return end
+            mode.Busy = true
+            mode.Status = "Sending " .. mode.RemoteName
+            showStatus(mode)
+            local ok, response = pcall(function()
+                return resolveRemote(mode):InvokeServer()
             end)
-            state.Busy = false
+            mode.Busy = false
             if not window.Alive then return end
+            mode.Attempts = mode.Attempts + 1
             if not ok then
-                state.Errors = state.Errors + 1
-                state.Remote = nil -- allow fresh resolution after network failures
-                state.LastMessage = "Network error; retrying"
-                warn("[VNDT Auto Spin] " .. tostring(result))
-            elseif not result then
-                state.Refused = state.Refused + 1
-                state.LastMessage = "No spin result (possibly no spins left)"
+                mode.Errors = mode.Errors + 1
+                mode.Remote = nil -- resolve it again on a later attempt
+                state.Net = nil
+                mode.Status = "Network/server error; retrying"
+            elseif response == nil or response == false then
+                mode.Status = "No result / no spins left"
             else
-                state.Spins = state.Spins + 1
-                state.LastMessage = "Last spin accepted"
+                mode.Responses = mode.Responses + 1
+                mode.Status = "Spin result received"
             end
-            showStatus()
+            local cooldown = (not ok or response == nil or response == false)
+                and math.max(state.Interval, config.FailedRetrySeconds)
+                or state.Interval
+            mode.NextRun = os.clock() + cooldown
+            showStatus(mode)
         end
 
-        local function startWorker()
-            if state.WorkerStarted then return end
-            state.WorkerStarted = true
+        local function startModeWorker(mode)
             task.spawn(function()
-                local ok, err = pcall(function()
-                    while window.Alive do
-                        if state.Enabled then
-                            local now = os.clock()
-                            if not state.Busy and now >= state.NextRun then
-                                state.NextRun = now + state.Interval
-                                task.spawn(sendSpinRequest)
-                            end
-                        end
-                        task.wait(0.2)
-                    end
-                end)
-                state.WorkerStarted = false
-                if not ok then
-                    warn("[VNDT Auto Spin worker] " .. tostring(err))
-                    if state.Enabled and window.Alive then
-                        task.wait(1)
-                        startWorker()
+                while window.Alive do
+                    if mode.Enabled and not mode.Busy and os.clock() >= mode.NextRun then
+                        spinOnce(mode)
+                    else
+                        task.wait(0.15)
                     end
                 end
             end)
         end
 
-        local function enableAutoSpin(value)
-            state.Enabled = value == true
-            if state.Enabled then
-                -- Start immediately, including when an already-running worker is asleep.
-                state.NextRun = os.clock() + state.Interval
-                startWorker()
-                task.spawn(sendSpinRequest)
-            else
-                state.NextRun = 0
-            end
-            showStatus()
+        local function createModeUI(mode, enabledDefault)
+            realTab:CreateSection(mode.Key .. " Wheel")
+            statusLabels[mode.Key] = {
+                Count = realTab:CreateLabel(mode.Key .. ": initializing"),
+                Detail = realTab:CreateLabel("Ready"),
+            }
+            local toggle = realTab:CreateToggle({
+                Name = "Auto " .. mode.Key .. " Spin",
+                Description = "Continuously invoke " .. mode.RemoteName .. " when enabled.",
+                Default = enabledDefault,
+                Callback = function(value)
+                    mode.Enabled = value == true
+                    mode.Status = mode.Enabled and (mode.Remote and "Ready to spin" or "Connecting...") or "Disabled"
+                    mode.NextRun = 0 -- send immediately when enabled
+                    showStatus(mode)
+                end,
+            })
+            realTab:CreateButton({
+                Name = "Spin " .. mode.Key .. " Now",
+                Description = "Make one " .. mode.RemoteName .. " request, even when Auto is off.",
+                Callback = function() task.spawn(spinOnce, mode) end,
+            })
+            showStatus(mode)
+            startModeWorker(mode)
+            return toggle
         end
 
-        local toggle = realTab:CreateToggle({
-            Name = "Auto Spin",
-            Description = "Spin continuously every 5 seconds by default. No event selection required.",
-            Default = false,
-            Callback = enableAutoSpin,
-        })
-        -- Nebula v5 Toggle:Set invokes Callback itself (including config restore).
-        -- Do not call enableAutoSpin twice on a programmatic Set.
-        window.AutoSpinControl = register({Flag = "RAFAutoWheel"}, toggle)
+        local normalToggle = createModeUI(state.Modes.Normal, false)
+        local goldenToggle = createModeUI(state.Modes.Golden, true)
+        window.AutoSpinControl = register({Flag = "RAFAutoWheel"}, normalToggle)
+        register({Flag = "VNDT_GoldenAutoSpin"}, goldenToggle)
 
+        realTab:CreateSection("Spin timing")
         local slider = realTab:CreateSlider({
             Name = "Spin Interval (seconds)",
             Min = config.MinimumInterval,
             Max = config.MaximumInterval,
-            Increment = 1,
+            Increment = config.SliderStep,
             Default = config.DefaultInterval,
+            Suffix = "s",
             Callback = function(value)
-                state.Interval = math.clamp(math.floor(tonumber(value) or config.DefaultInterval),
+                state.Interval = math.clamp(tonumber(value) or config.DefaultInterval,
                     config.MinimumInterval, config.MaximumInterval)
-                if state.Enabled then state.NextRun = os.clock() + state.Interval end
-                showStatus()
+                for _, mode in pairs(state.Modes) do
+                    if mode.Enabled and not mode.Busy then
+                        mode.NextRun = os.clock() + state.Interval
+                    end
+                    showStatus(mode)
+                end
             end,
         })
-        -- Nebula v5 Slider:Set already fires its Callback and updates Interval.
         register({Flag = "VNDT_AutoSpinInterval"}, slider)
+        realTab:CreateLabel("A response is not a guarantee of a reward. Refused requests back off at least 5 seconds.")
 
-        realTab:CreateButton({
-            Name = "Spin Now",
-            Description = "Try a single WheelSpin now, even if Auto Spin is off.",
-            Callback = function() task.spawn(sendSpinRequest) end,
-        })
-        realTab:CreateLabel("A completed request still requires available wheel spins on the server.")
         task.spawn(function()
             while window.Alive do
-                if state.Enabled then showStatus() end
+                for _, mode in pairs(state.Modes) do showStatus(mode) end
                 task.wait(0.5)
             end
         end)
@@ -412,7 +429,7 @@ local function MakeVNDTAdapter(VNDT)
                 state.Errors = state.Errors + 1
                 state.Remote = nil
                 state.LastError = tostring(err)
-                warn("[VNDT Auto Sell All] " .. state.LastError)
+                quietWarn("[VNDT Auto Sell All] " .. state.LastError)
             end
             showStatus()
         end
@@ -440,7 +457,7 @@ local function MakeVNDTAdapter(VNDT)
                 state.WorkerStarted = false
                 if not ok then
                     state.LastError = "worker error: " .. tostring(err)
-                    warn("[VNDT Auto Sell All] " .. state.LastError)
+                    quietWarn("[VNDT Auto Sell All] " .. state.LastError)
                     showStatus()
                     if window.Alive and state.Enabled then
                         task.wait(1)
@@ -512,7 +529,7 @@ local function MakeVNDTAdapter(VNDT)
 
         -- Create the primary controls directly with Nebula v5's API.
         -- The legacy wheel toggle is later mapped to this same VNDT control,
-        -- so saved configs and Stop All continue to work without duplicate UI.
+        -- so saved configs and legacy Stop All can still control the normal wheel.
         local spinTab = real:CreateTab("Auto Spin")
         spinTab:CreateSection("Wheel automation")
         installAutoSpin(spinTab, window)
@@ -908,7 +925,15 @@ local function MakeVNDTAdapter(VNDT)
     return Adapter
 end
 
-local GLOBALS = (getfenv and getfenv(0)) or _G
+local BASE_GLOBALS = (getfenv and getfenv(0)) or _G
+local GLOBALS = BASE_GLOBALS
+if CUSTOM.Diagnostics.QuietConsole then
+    -- Local lookup shim for the 566 recovered functions; no global monkey-patching.
+    GLOBALS = setmetatable({
+        print = function() end,
+        warn = function() end,
+    }, {__index = BASE_GLOBALS})
+end
 local UNPACK = table.unpack or unpack
 local FUNCTIONS = {}  -- Native Luau functions, not opcode handlers.
 
