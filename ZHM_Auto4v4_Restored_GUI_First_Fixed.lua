@@ -7,6 +7,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
+local VirtualUser = game:GetService("VirtualUser")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -53,6 +54,8 @@ local eventAttempts = 0 -- calls attempted, not confirmed successful collections
 local eventLastError = nil
 local showESP = true
 local auto4v4 = true -- auto queue ON at execution
+local autoDecline = true -- automatically decline RejoinPopup when visible
+local declineAttempts = 0 -- attempt counter, not confirmed popup closures
 local playHandled = false -- one attempt per visible PLAY screen
 local lowModelHandled = false -- legacy state, retained for compatibility
 local resetMatchmakingAttempts = nil
@@ -87,7 +90,7 @@ local function make(class, props, parent)
 end
 
 local main = make("Frame", {
-    Name = "Panel", Size = UDim2.fromOffset(275, 408),
+    Name = "Panel", Size = UDim2.fromOffset(275, 505),
     Position = UDim2.new(0.5, -138, 0.3, 0),
     BackgroundColor3 = Color3.fromRGB(22, 26, 35),
     BorderSizePixel = 0,
@@ -197,6 +200,26 @@ local eventStatus = make("TextLabel", {
     TextTruncate = Enum.TextTruncate.AtEnd,
 }, main)
 
+local declineBtn = button("AUTO DECLINE REJOIN: ON", 403)
+local declineStatus = make("TextLabel", {
+    Position = UDim2.fromOffset(12, 441), Size = UDim2.new(1, -24, 0, 22),
+    BackgroundTransparency = 1, Text = "Rejoin popup: waiting",
+    TextSize = 11, Font = Enum.Font.GothamSemibold,
+    TextColor3 = Color3.fromRGB(163, 205, 249),
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+}, main)
+
+local antiAfkStatus = make("TextLabel", {
+    Position = UDim2.fromOffset(12, 467), Size = UDim2.new(1, -24, 0, 25),
+    BackgroundTransparency = 1,
+    Text = "ANTI-AFK: ALWAYS ON | Idle + 60s",
+    TextSize = 11, Font = Enum.Font.GothamBold,
+    TextColor3 = Color3.fromRGB(133, 221, 209),
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+}, main)
+
 local bubble = make("TextButton", {
     Name = "OpenButton", Size = UDim2.fromOffset(48, 48),
     Position = UDim2.new(0, 20, 0.5, 0), Visible = false,
@@ -206,6 +229,10 @@ local bubble = make("TextButton", {
 }, gui)
 make("UICorner", {CornerRadius = UDim.new(1, 0)}, bubble)
 make("UIStroke", {Color = Color3.fromRGB(84, 197, 226), Thickness = 2}, bubble)
+
+-- Start minimized on execution; tap the floating ZHM circle to reopen.
+main.Visible = false
+bubble.Visible = true
 
 -- Touch + mouse dragging from header; bubble draggable too.
 local function draggable(target, grip)
@@ -408,6 +435,34 @@ local function stopAll()
 end
 env.ZHM_EventCollect_Stop = stopAll
 
+-- Always-on Anti-AFK: simulates a minimal input on Roblox's idle signal,
+-- plus a periodic backup pulse. Does not change character position.
+-- Both this connection and the timer stop when the script is re-executed.
+local antiAfkPulses = 0
+local function antiAfkPulse()
+    if not running then return end
+    local ok = pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new(0, 0))
+    end)
+    if not running then return end
+    if ok then
+        antiAfkPulses = antiAfkPulses + 1
+        antiAfkStatus.Text = ("ANTI-AFK: ON | Pulses: %d"):format(antiAfkPulses)
+    else
+        antiAfkStatus.Text = "ANTI-AFK: VirtualUser unavailable"
+    end
+end
+
+table.insert(connections, player.Idled:Connect(antiAfkPulse))
+task.spawn(function()
+    while running do
+        task.wait(60)
+        if running then antiAfkPulse() end
+    end
+end)
+
+
 -- Both collection modes are independent and can be enabled simultaneously.
 -- "No-movement" only means this extra loop never moves the character itself;
 -- the tween collector can still move the character while both are enabled.
@@ -452,6 +507,13 @@ matchBtn.MouseButton1Click:Connect(function()
     lowModelHandled = false
     if resetMatchmakingAttempts then resetMatchmakingAttempts() end
     matchStatus.Text = auto4v4 and "4v4: GUI priority / models 1-19" or "4v4: disabled"
+end)
+declineBtn.MouseButton1Click:Connect(function()
+    autoDecline = not autoDecline
+    declineBtn.Text = "AUTO DECLINE REJOIN: " .. (autoDecline and "ON" or "OFF")
+    declineBtn.BackgroundColor3 = autoDecline and Color3.fromRGB(43, 61, 79)
+        or Color3.fromRGB(88, 49, 56)
+    if not autoDecline then declineStatus.Text = "Rejoin popup: auto decline paused" end
 end)
 espBtn.MouseButton1Click:Connect(function()
     showESP = not showESP
@@ -733,6 +795,55 @@ local function pressGuiButton(btn)
     return false
 end
 
+-- Shared priority gate: when a visible RejoinPopup Decline control exists,
+-- matchmaking must never attempt to select a mode or press PLAY.
+local function rejoinDeclineVisible()
+    if not autoDecline then return false end
+    local rejoinGui = playerGui:FindFirstChild("RejoinPopup")
+    local popup = rejoinGui and rejoinGui:FindFirstChild("Popup")
+    local declineObject = popup and popup:FindFirstChild("Decline")
+    local btn = buttonUnder(declineObject)
+    return btn ~= nil and btn.Active and shown(btn)
+end
+
+-- Auto Decline has PRIORITY over all Auto Play 4v4 attempts.
+-- Its visible popup suspends matchmaking but does not interrupt collection.
+-- Retries are spaced out if a popup remains visible after a signal is sent.
+task.spawn(function()
+    local lastDeclineTime = -math.huge
+    local lastDeclineButton = nil
+    while running do
+        if not autoDecline then
+            lastDeclineButton = nil
+        else
+            local rejoinGui = playerGui:FindFirstChild("RejoinPopup")
+            local popup = rejoinGui and rejoinGui:FindFirstChild("Popup")
+            local declineObject = popup and popup:FindFirstChild("Decline")
+            local declineButton = buttonUnder(declineObject)
+            local visible = declineButton and declineButton.Active and shown(declineButton)
+            if visible then
+                -- New popup/button gets an immediate attempt, persistent popups
+                -- get a bounded retry rather than per-frame button spam.
+                local now = os.clock()
+                if declineButton ~= lastDeclineButton or now - lastDeclineTime >= 2 then
+                    lastDeclineButton = declineButton
+                    lastDeclineTime = now
+                    if pressGuiButton(declineButton) then
+                        declineAttempts = declineAttempts + 1
+                        declineStatus.Text = ("Rejoin popup: Decline pressed (%d)"):format(declineAttempts)
+                    else
+                        declineStatus.Text = "Rejoin popup: decline handler unavailable"
+                    end
+                end
+            else
+                lastDeclineButton = nil
+                declineStatus.Text = ("Rejoin popup: waiting | attempts %d"):format(declineAttempts)
+            end
+        end
+        task.wait(0.25)
+    end
+end)
+
 local function matchmakingControls(mm)
     if not mm then return nil, nil end
     local bottom = mm:FindFirstChild("Bottom")
@@ -770,6 +881,7 @@ resetMatchmakingAttempts = function()
 end
 
 local function attemptGui(mm, modeObject)
+    if rejoinDeclineVisible() then return false, "4v4: waiting for Auto Decline" end
     local modeBtn = visible4v4Button(mm, modeObject)
     if not modeBtn then return false, "4v4: PLAY found; 4v4 button missing" end
     if not pressGuiButton(modeBtn) then
@@ -777,6 +889,7 @@ local function attemptGui(mm, modeObject)
     end
     task.wait(0.2)
     if not running or not auto4v4 then return false, "4v4: stopped" end
+    if rejoinDeclineVisible() then return false, "4v4: waiting for Auto Decline" end
     local _, newAction = matchmakingControls(mm)
     local newPlay = visiblePlayButton(mm, newAction)
     if not newPlay then return false, "4v4: PLAY disappeared after mode select" end
@@ -790,6 +903,7 @@ end
 -- fallback, not a second GUI attempt; it will never run while a visible PLAY
 -- button exists. Server may reject it or the GUI may not be loaded at all.
 local function attemptLowModels(mm, modeObject, actionObject)
+    if rejoinDeclineVisible() then return false, "4v4: waiting for Auto Decline" end
     if not mm then return false, "4v4: <20 models; matchmaking GUI not loaded" end
     local modeBtn = buttonUnder(modeObject)
     local actionBtn = buttonUnder(actionObject)
@@ -801,6 +915,7 @@ local function attemptLowModels(mm, modeObject, actionObject)
     end
     task.wait(0.2)
     if not running or not auto4v4 then return false, "4v4: stopped" end
+    if rejoinDeclineVisible() then return false, "4v4: waiting for Auto Decline" end
     local _, updatedAction = matchmakingControls(mm)
     actionBtn = buttonUnder(updatedAction)
     if actionBtn and pressGuiButton(actionBtn) then
@@ -815,6 +930,13 @@ task.spawn(function()
             matchStatus.Text = "4v4: disabled"
             playedThisAppearance = false
             lastSeenPlay = nil
+        elseif rejoinDeclineVisible() then
+            -- Highest priority: Auto Decline handles the popup; don't even try
+            -- selecting 4v4 or pressing PLAY until the rejoin dialog vanishes.
+            playedThisAppearance = false
+            lastSeenPlay = nil
+            lastMatchAttempt = -math.huge -- resume immediately after dismissal
+            matchStatus.Text = "4v4: paused -- Auto Decline priority"
         else
             local mm = playerGui:FindFirstChild("Matchmaking")
             local modeObject, actionObject = matchmakingControls(mm)
@@ -868,4 +990,4 @@ task.spawn(function()
     end
 end)
 
-print("[ZHM] Auto 4v4 restored visible PLAY behavior (GUI priority; models <20 fallback)")
+print("[ZHM] Anti-AFK always on; Auto Decline > PLAY GUI > models 1-19; both collection modes retained")
