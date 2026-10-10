@@ -7,7 +7,6 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
-local VirtualUser = game:GetService("VirtualUser")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -53,7 +52,7 @@ local eventInterval = 0.35 -- seconds, configurable 0.10 to 3.00
 local eventAttempts = 0 -- calls attempted, not confirmed successful collections
 local eventLastError = nil
 local showESP = true
-local auto4v4 = true -- auto queue ON at execution
+local auto4v4 = true -- auto queue ON at execution; supports QUEUE / QUEUE AGAIN
 local autoDecline = true -- automatically decline RejoinPopup when visible
 local declineAttempts = 0 -- attempt counter, not confirmed popup closures
 local playHandled = false -- one attempt per visible PLAY screen
@@ -90,7 +89,7 @@ local function make(class, props, parent)
 end
 
 local main = make("Frame", {
-    Name = "Panel", Size = UDim2.fromOffset(275, 505),
+    Name = "Panel", Size = UDim2.fromOffset(275, 475),
     Position = UDim2.new(0.5, -138, 0.3, 0),
     BackgroundColor3 = Color3.fromRGB(22, 26, 35),
     BorderSizePixel = 0,
@@ -184,7 +183,7 @@ local statusLabel = make("TextLabel", {
 
 local matchStatus = make("TextLabel", {
     Position = UDim2.fromOffset(12, 333), Size = UDim2.new(1, -24, 0, 26),
-    BackgroundTransparency = 1, Text = "4v4: GUI priority / models 1-19",
+    BackgroundTransparency = 1, Text = "4v4: Decline > Queue > Play > models",
     TextSize = 11, Font = Enum.Font.GothamSemibold,
     TextColor3 = Color3.fromRGB(163, 205, 249),
     TextXAlignment = Enum.TextXAlignment.Left,
@@ -206,16 +205,6 @@ local declineStatus = make("TextLabel", {
     BackgroundTransparency = 1, Text = "Rejoin popup: waiting",
     TextSize = 11, Font = Enum.Font.GothamSemibold,
     TextColor3 = Color3.fromRGB(163, 205, 249),
-    TextXAlignment = Enum.TextXAlignment.Left,
-    TextTruncate = Enum.TextTruncate.AtEnd,
-}, main)
-
-local antiAfkStatus = make("TextLabel", {
-    Position = UDim2.fromOffset(12, 467), Size = UDim2.new(1, -24, 0, 25),
-    BackgroundTransparency = 1,
-    Text = "ANTI-AFK: ALWAYS ON | Idle + 60s",
-    TextSize = 11, Font = Enum.Font.GothamBold,
-    TextColor3 = Color3.fromRGB(133, 221, 209),
     TextXAlignment = Enum.TextXAlignment.Left,
     TextTruncate = Enum.TextTruncate.AtEnd,
 }, main)
@@ -435,34 +424,6 @@ local function stopAll()
 end
 env.ZHM_EventCollect_Stop = stopAll
 
--- Always-on Anti-AFK: simulates a minimal input on Roblox's idle signal,
--- plus a periodic backup pulse. Does not change character position.
--- Both this connection and the timer stop when the script is re-executed.
-local antiAfkPulses = 0
-local function antiAfkPulse()
-    if not running then return end
-    local ok = pcall(function()
-        VirtualUser:CaptureController()
-        VirtualUser:ClickButton2(Vector2.new(0, 0))
-    end)
-    if not running then return end
-    if ok then
-        antiAfkPulses = antiAfkPulses + 1
-        antiAfkStatus.Text = ("ANTI-AFK: ON | Pulses: %d"):format(antiAfkPulses)
-    else
-        antiAfkStatus.Text = "ANTI-AFK: VirtualUser unavailable"
-    end
-end
-
-table.insert(connections, player.Idled:Connect(antiAfkPulse))
-task.spawn(function()
-    while running do
-        task.wait(60)
-        if running then antiAfkPulse() end
-    end
-end)
-
-
 -- Both collection modes are independent and can be enabled simultaneously.
 -- "No-movement" only means this extra loop never moves the character itself;
 -- the tween collector can still move the character while both are enabled.
@@ -506,7 +467,7 @@ matchBtn.MouseButton1Click:Connect(function()
     playHandled = false -- re-arm both trigger sources
     lowModelHandled = false
     if resetMatchmakingAttempts then resetMatchmakingAttempts() end
-    matchStatus.Text = auto4v4 and "4v4: GUI priority / models 1-19" or "4v4: disabled"
+    matchStatus.Text = auto4v4 and "4v4: Decline > Queue > Play > models" or "4v4: disabled"
 end)
 declineBtn.MouseButton1Click:Connect(function()
     autoDecline = not autoDecline
@@ -703,7 +664,7 @@ end)
 
 
 -- ZHM 4v4 / restored visible PLAY detection.
--- Priority: visible PLAY GUI > model count 1..19 > idle.
+-- Priority: visible DECLINE > QUEUE/QUEUE AGAIN > PLAY > model count 1..19 > idle.
 -- Visible GUI uses the original button scan and firesignal-first activation
 -- that was used in the earlier PLAY-on-GUI version.
 -- IMPORTANT: FireServer() for matchmaking is intentionally not guessed here:
@@ -870,13 +831,58 @@ local function queueActive(action)
     return false
 end
 
+-- Detect exact actionable button labels, including TextLabels nested in ImageButtons.
+-- The Action GUI was recorded in the logs; rematch remote arguments were NOT,
+-- so this feature presses the GUI rather than guessing a FireServer payload.
+local function visibleQueueButton(mm, actionObject)
+    local function exactQueue(text)
+        local clean = tostring(text or ""):gsub("<[^>]*>", "")
+        clean = clean:upper():gsub("%s+", " "):match("^%s*(.-)%s*$")
+        return clean == "QUEUE AGAIN" or clean == "QUEUE"
+    end
+    local function matches(button)
+        if not button or not button:IsA("GuiButton") or not button.Active or not shown(button) then
+            return false
+        end
+        if button:IsA("TextButton") and exactQueue(button.Text) then return true end
+        for _, label in ipairs(button:GetDescendants()) do
+            if (label:IsA("TextLabel") or label:IsA("TextButton"))
+                and shown(label) and exactQueue(label.Text) then
+                return true
+            end
+        end
+        return false
+    end
+
+    -- Try the logged matchmaking Action path first.
+    if actionObject and shown(actionObject) then
+        local btn = buttonUnder(actionObject)
+        if matches(btn) then return btn end
+    end
+
+    -- Queue Again can also appear in a post-match/rejoin screen, not Matchmaking.
+    -- Only choose actual visible, active buttons, never a status label or overlay.
+    local function search(root)
+        if not root then return nil end
+        if matches(root) then return root end
+        for _, item in ipairs(root:GetDescendants()) do
+            if item:IsA("GuiButton") and matches(item) then return item end
+        end
+        return nil
+    end
+    return search(mm) or search(playerGui)
+end
+
 local lastMatchAttempt = -math.huge
 local retrySeconds = 5
 local playedThisAppearance = false
 local lastSeenPlay = nil
+local lastSeenQueue = nil
+local queuePressAttempts = 0
 resetMatchmakingAttempts = function()
     playedThisAppearance = false
     lastSeenPlay = nil
+    lastSeenQueue = nil
     lastMatchAttempt = -math.huge
 end
 
@@ -891,6 +897,9 @@ local function attemptGui(mm, modeObject)
     if not running or not auto4v4 then return false, "4v4: stopped" end
     if rejoinDeclineVisible() then return false, "4v4: waiting for Auto Decline" end
     local _, newAction = matchmakingControls(mm)
+    if visibleQueueButton(mm, newAction) then
+        return false, "4v4: QUEUE GUI appeared; deferring PLAY"
+    end
     local newPlay = visiblePlayButton(mm, newAction)
     if not newPlay then return false, "4v4: PLAY disappeared after mode select" end
     if pressGuiButton(newPlay) then
@@ -917,6 +926,9 @@ local function attemptLowModels(mm, modeObject, actionObject)
     if not running or not auto4v4 then return false, "4v4: stopped" end
     if rejoinDeclineVisible() then return false, "4v4: waiting for Auto Decline" end
     local _, updatedAction = matchmakingControls(mm)
+    if visibleQueueButton(mm, updatedAction) then
+        return false, "4v4: QUEUE GUI appeared; deferring model trigger"
+    end
     actionBtn = buttonUnder(updatedAction)
     if actionBtn and pressGuiButton(actionBtn) then
         return true, "4v4: <20 models; hidden PLAY attempted"
@@ -930,28 +942,54 @@ task.spawn(function()
             matchStatus.Text = "4v4: disabled"
             playedThisAppearance = false
             lastSeenPlay = nil
+            lastSeenQueue = nil
         elseif rejoinDeclineVisible() then
             -- Highest priority: Auto Decline handles the popup; don't even try
             -- selecting 4v4 or pressing PLAY until the rejoin dialog vanishes.
             playedThisAppearance = false
             lastSeenPlay = nil
+            lastSeenQueue = nil
             lastMatchAttempt = -math.huge -- resume immediately after dismissal
             matchStatus.Text = "4v4: paused -- Auto Decline priority"
         else
             local mm = playerGui:FindFirstChild("Matchmaking")
             local modeObject, actionObject = matchmakingControls(mm)
+            local queueBtn = visibleQueueButton(mm, actionObject)
             local playBtn = visiblePlayButton(mm, actionObject)
             local count = liveModelCount
             local below20 = scannerReady and count >= 1 and count <= 19
             local queued = queueActive(actionObject)
             local now = os.clock()
 
-            if queued and not playBtn then
+            if queueBtn then
+                -- Queue/Queue Again has priority over PLAY and model count.
+                -- Immediately attempt when a new button appears, then throttle
+                -- retries while it remains visible (never invoke two paths).
+                playedThisAppearance = false
+                lastSeenPlay = nil
+                if lastSeenQueue ~= queueBtn then
+                    lastSeenQueue = queueBtn
+                    lastMatchAttempt = -math.huge
+                end
+                if now - lastMatchAttempt >= retrySeconds then
+                    lastMatchAttempt = now
+                    if pressGuiButton(queueBtn) then
+                        queuePressAttempts = queuePressAttempts + 1
+                        matchStatus.Text = ("4v4: QUEUE pressed (%d); awaiting change"):format(queuePressAttempts)
+                    else
+                        matchStatus.Text = "4v4: QUEUE visible; button handler unavailable"
+                    end
+                else
+                    matchStatus.Text = "4v4: QUEUE visible; waiting/retry cooldown"
+                end
+            elseif queued and not playBtn then
+                lastSeenQueue = nil
                 -- A visible PLAY control has priority over stale queue labels.
                 playedThisAppearance = true
                 matchStatus.Text = "4v4: queue already active"
             elseif playBtn then
-                -- HIGHEST PRIORITY. A visible PLAY button always overrides
+                lastSeenQueue = nil
+                -- PLAY priority whenever no visible QUEUE action exists; overrides
                 -- the model counter, including when models <20.
                 if lastSeenPlay ~= playBtn then
                     playedThisAppearance = false
@@ -968,6 +1006,7 @@ task.spawn(function()
                     matchStatus.Text = "4v4: GUI retry cooldown"
                 end
             else
+                lastSeenQueue = nil
                 -- Re-arm visible GUI next time it appears.
                 playedThisAppearance = false
                 lastSeenPlay = nil
@@ -990,4 +1029,4 @@ task.spawn(function()
     end
 end)
 
-print("[ZHM] Anti-AFK always on; Auto Decline > PLAY GUI > models 1-19; both collection modes retained")
+print("[ZHM] Priority Decline > QUEUE/QUEUE AGAIN > PLAY GUI > models 1-19; both collectors ON")
