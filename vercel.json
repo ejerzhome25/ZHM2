@@ -3,6 +3,14 @@
     {
       "source": "/loader",
       "destination": "/api/loader"
+    },
+    {
+      "source": "/getkey",
+      "destination": "/api/getkey"
+    },
+    {
+      "source": "/source",
+      "destination": "/api/source"
     }
   ]
 }
