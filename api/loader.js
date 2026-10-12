@@ -189,7 +189,7 @@ export default function handler(req, res) {
     return;
   }
 
-  const getKeyUrl = process.env.LINKVERTISE_URL || (BASE_URL + "/getkey");
+  const getKeyUrl = "https://link-center.net/10091664/9XJMMJvxrZ9a";
 
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
